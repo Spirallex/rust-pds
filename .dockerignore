@@ -1,0 +1,15 @@
+# Keep the build context small + avoid leaking local state into the image.
+/target
+**/target
+.git
+.github
+.planning
+*.md
+!Cargo.toml
+# Local deployment config + any stray DBs / secrets must never enter the image.
+rust-pds.toml
+*.db
+*.db-wal
+*.db-shm
+.stelyph.env
+.DS_Store

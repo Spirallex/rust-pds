@@ -1,0 +1,62 @@
+[package]
+name = "stelyph"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "A single static binary AT Protocol PDS (Personal Data Server) for self-hosted Bluesky federation"
+repository = "https://github.com/spirallex/stelyph"
+readme = "../README.md"
+keywords = ["atproto", "bluesky", "pds", "federation"]
+categories = ["network-programming", "web-programming"]
+
+[dependencies]
+stelyph-core = { path = "../rust-core" }
+rusqlite = { workspace = true }
+tokio-rusqlite = "0.7.0"
+deadpool-sqlite = { version = "0.12.1", features = ["rt_tokio_1"] }
+chrono = "0.4"
+argon2 = { version = "0.5.3", features = ["zeroize"] }
+aes-gcm = { version = "0.10.3", features = ["zeroize"] }
+zeroize = "1"
+rand = "0.8"
+thiserror = "2"
+tokio = { version = "1.52", features = ["full"] }
+atrium-repo = { workspace = true }
+atrium-crypto = { workspace = true }
+atrium-api = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+cid = { workspace = true }
+sha2 = { workspace = true }
+serde_ipld_dagcbor = { workspace = true }
+ipld-core = { workspace = true }
+axum = { version = "0.8.9", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors"] }
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+iroh-car = "0.5.1"
+data-encoding = "2"
+anyhow = "1"
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+serde_json = "1"
+futures = "0.3"
+bytes = "1"
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
+rustls = "0.23"
+rustls-acme = { version = "0.15", default-features = false, features = ["axum", "ring", "tls12", "webpki-roots"] }
+axum-server = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+toml = "1"
+hickory-resolver = { version = "0.26", features = ["tokio"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+rpassword = "7"
+
+[dev-dependencies]
+# Enable the core's `testing` feature for the server test suite so the in-memory
+# store + seed helpers (open_in_memory, set_takedown, insert_invite) are visible.
+stelyph-core = { path = "../rust-core", features = ["testing"] }
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

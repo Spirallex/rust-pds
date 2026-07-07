@@ -1,0 +1,23 @@
+name: Lexicon drift
+
+# Periodically checks whether the pinned `atrium-api` (our snapshot of Bluesky's
+# lexicons) has drifted behind the newest published version. A newer release can
+# mean Bluesky added/changed lexicons that bsky.app now validates against, so a
+# stale pin can silently break record rendering. This warns early instead.
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # Mondays 09:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: atrium-api drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check lexicon dependency drift
+        run: ./scripts/check-lexicon-drift.sh

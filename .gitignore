@@ -1,0 +1,20 @@
+# Build artifacts (all crates, including spikes)
+target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# Local PDS database (contains real account data + keys)
+/pds.db
+/pds.db-shm
+/pds.db-wal
+
+# Local deployment config written by `stelyph init` (machine-specific, may name your host)
+/rust-pds.toml
+
+# Internal planning docs — never published
+/.planning/

@@ -1,0 +1,96 @@
+[package]
+name = "stelyph-core"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Device-portable AT Protocol core: signed repo/MST engine, crypto, dag-cbor/CAR, and storage — no HTTP server. Compiles for aarch64-apple-ios."
+repository = "https://github.com/spirallex/stelyph"
+
+[lib]
+name = "stelyph_core"
+
+[dependencies]
+# --- atproto core (pure Rust) ---
+atrium-repo = { workspace = true }
+atrium-crypto = { workspace = true }
+atrium-api = { workspace = true }
+cid = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+serde_ipld_dagcbor = { workspace = true }
+ipld-core = { workspace = true }
+iroh-car = "0.5.1"
+data-encoding = "2"
+
+# --- storage (SQLite is C but `bundled` compiles in-tree for iOS) ---
+rusqlite = { workspace = true }
+tokio-rusqlite = "0.7.0"
+deadpool-sqlite = { version = "0.12.1", features = ["rt_tokio_1"] }
+chrono = "0.4"
+
+# --- keystore + auth crypto (pure Rust RustCrypto) ---
+argon2 = { version = "0.5.3", features = ["zeroize"] }
+aes-gcm = { version = "0.10.3", features = ["zeroize"] }
+zeroize = "1"
+rand = "0.8"
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+uuid = { version = "1", features = ["v4"] }
+
+# --- runtime + misc ---
+tokio = { version = "1.52", features = ["sync", "rt", "macros"] }
+async-trait = "0.1"
+anyhow = "1"
+thiserror = "2"
+
+# --- embedded-server feature only (minimal in-process hyper host) ---
+# Versions are pinned to what the workspace already resolves (reqwest/axum pull
+# the same hyper 1.x tree), so enabling the feature adds no new major versions.
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+bytes = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+# Only pulled in when the `testing` feature is on (in-memory store + seed helpers
+# for downstream test suites). Kept out of production/device builds.
+tempfile = { version = "3", optional = true }
+
+[features]
+# Exposes in-memory store construction and account/invite seed helpers for use
+# by downstream crates' test suites (the server enables this via dev-deps).
+testing = ["dep:tempfile"]
+
+# Lower argon2id memory cost (4 MiB vs 19 MiB) for memory-constrained device
+# hosts — an iOS Network Extension under the Jetsam per-process ceiling, where a
+# single 19 MiB hash can exceed the whole budget. Trades brute-force resistance
+# for footprint; only for single-user device builds. NOTE: changes the key-
+# encryption KDF, so a lean build and a default build are not key-compatible.
+lean-auth = []
+
+# In-process HTTP host for on-device serving (iOS Network Extension). Pulls a
+# minimal hyper 1.x stack and adds the tokio net/io features the accept loop
+# needs. Off by default: the device-portable core has no server. See
+# `src/server/mod.rs` and `examples/server_footprint.rs`.
+embedded-server = [
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:bytes",
+    "dep:serde_json",
+    "tokio/net",
+    "tokio/io-util",
+]
+
+[dev-dependencies]
+tokio = { version = "1.52", features = ["full"] }
+# Core's own tests use open_in_memory (NamedTempFile). The `testing` feature
+# re-exposes that to downstream test suites via the optional dep above; here we
+# need it unconditionally so `cargo test -p stelyph-core` compiles standalone.
+tempfile = "3"
+# phys_footprint (the exact Jetsam metric) + peak RSS for examples/server_footprint.rs.
+mach2 = "0.4"
+libc = "0.2"
+
+[[example]]
+name = "server_footprint"
+required-features = ["embedded-server"]
