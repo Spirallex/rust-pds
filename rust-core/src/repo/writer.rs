@@ -65,6 +65,26 @@ impl RepoWriter {
         }
     }
 
+    /// Like `new`, but shares an externally-supplied write_lock instead of creating a fresh one.
+    /// Used by the server's per-DID lock map so that multiple RepoWriter instances constructed
+    /// for the same DID across concurrent requests serialize their writes through one lock,
+    /// preventing two concurrent commits from forking the repo history.
+    pub fn with_lock(
+        store: Arc<SqliteStore>,
+        signing_key: Secp256k1Keypair,
+        did: Did,
+        firehose_tx: tokio::sync::broadcast::Sender<crate::firehose::FirehoseEvent>,
+        write_lock: Arc<tokio::sync::Mutex<()>>,
+    ) -> Self {
+        Self {
+            store,
+            signing_key,
+            did,
+            write_lock,
+            firehose_tx,
+        }
+    }
+
     /// Create a record, atomically persist all new blocks + the repo_seq row,
     /// and update the stored root CID. Returns (record_cid, commit_cid).
     ///
