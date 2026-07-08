@@ -98,6 +98,41 @@ pub struct InitArgs {
     /// Key passphrase (env PDS_KEY_PASSPHRASE). Prompted if absent.
     #[arg(long, env = "PDS_KEY_PASSPHRASE")]
     pub key_passphrase: Option<String>,
+
+    /// Admin password for the first account (env PDS_ADMIN_PASSWORD). Prompted if absent
+    /// and a terminal is available.
+    #[arg(long, env = "PDS_ADMIN_PASSWORD")]
+    pub password: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Password resolution (B5) — testable seam extracted out of init::run so the
+// no-TTY guard and the actionable error message can be unit-tested without
+// spawning a real prompt (which would hang/crash under `Device not configured`
+// when stdin is not a terminal, e.g. in Docker/CI/pipes).
+// ---------------------------------------------------------------------------
+
+/// Resolve the admin password: explicit `--password`/`PDS_ADMIN_PASSWORD` (clap already
+/// folds the env var into `explicit` via the `env = "PDS_ADMIN_PASSWORD"` attribute; the
+/// direct `std::env::var` read below is a defensive fallback for callers that construct
+/// `InitArgs` without going through clap, e.g. tests) wins outright — no prompt. Only when
+/// no value was supplied at all do we fall back to an interactive prompt, and only if a
+/// terminal is actually available; otherwise we fail with an actionable error instead of
+/// letting `rpassword::prompt_password` crash on a missing `/dev/tty` (`Device not
+/// configured`) under Docker/CI/pipes.
+fn resolve_password(explicit: Option<String>, is_tty: bool) -> anyhow::Result<String> {
+    match explicit.or_else(|| std::env::var("PDS_ADMIN_PASSWORD").ok()) {
+        Some(p) => Ok(p),
+        None => {
+            if !is_tty {
+                anyhow::bail!(
+                    "init requires a terminal to prompt for a password; pass --password or set \
+                     PDS_ADMIN_PASSWORD to run non-interactively"
+                );
+            }
+            Ok(rpassword::prompt_password("Admin password (min 8 chars): ")?)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -359,47 +394,54 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
     use crate::identity::plc::ReqwestPlcClient;
     use crate::storage::SqliteStore;
 
-    // Resolve config path first (used as a hostname default source).
+    // Resolve config path for READING an existing config (default stelyph.toml,
+    // falling back to a legacy rust-pds.toml if present — read-only compat, B3/T-05-02).
+    let read_config_path = crate::cmd::resolve_config_path(config.as_deref());
+
+    // Resolve config path for WRITING at the end of the wizard. Unlike the read path,
+    // this always targets the new stelyph.toml name when no explicit --config was given —
+    // a stale legacy rust-pds.toml is never silently written over with the old name.
     let config_path = config
         .clone()
-        .unwrap_or_else(|| PathBuf::from("rust-pds.toml"));
+        .unwrap_or_else(|| PathBuf::from("stelyph.toml"));
 
-    // Resolve the hostname/DNS target. DNS is first-class: always SHOW the
-    // routing target and let the operator confirm or override it, rather than
-    // silently reading env/config. Default = --hostname / PDS_HOSTNAME, else the
-    // config file's hostname. The wizard then pre-checks that the admin handle
-    // belongs to this hostname before any did:plc registration is attempted.
-    let hostname_default = match args.hostname.clone() {
-        Some(h) => Some(h),
-        None => PdsConfig::load_or_default(Some(&config_path))?.hostname,
-    };
-    let hostname = {
-        use std::io::Write;
-        match &hostname_default {
-            Some(def) => {
-                print!("PDS hostname / DNS name [{def}]: ");
-                std::io::stdout().flush()?;
-                let mut line = String::new();
-                std::io::stdin().read_line(&mut line)?;
-                let entered = line.trim();
-                if entered.is_empty() {
-                    def.clone()
-                } else {
-                    entered.to_string()
+    // Resolve the hostname/DNS target. B5: when --hostname/PDS_HOSTNAME was supplied
+    // explicitly, use it directly and SKIP the prompt entirely (no stdin read at all) —
+    // this is what lets `init` run non-interactively in Docker/CI/pipes. Only when no
+    // value was supplied do we fall back to the config file's hostname as a bracketed
+    // prompt default. The wizard then pre-checks that the admin handle belongs to this
+    // hostname before any did:plc registration is attempted.
+    let hostname = match args.hostname.clone() {
+        Some(h) => h,
+        None => {
+            let hostname_default = PdsConfig::load_or_default(Some(&read_config_path))?.hostname;
+            use std::io::Write;
+            match &hostname_default {
+                Some(def) => {
+                    print!("PDS hostname / DNS name [{def}]: ");
+                    std::io::stdout().flush()?;
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    let entered = line.trim();
+                    if entered.is_empty() {
+                        def.clone()
+                    } else {
+                        entered.to_string()
+                    }
                 }
-            }
-            None => {
-                print!("PDS hostname / DNS name (e.g. pds.example.com): ");
-                std::io::stdout().flush()?;
-                let mut line = String::new();
-                std::io::stdin().read_line(&mut line)?;
-                let entered = line.trim().to_string();
-                if entered.is_empty() {
-                    anyhow::bail!(
-                        "hostname is required: enter one at the prompt, pass --hostname <host>, or set PDS_HOSTNAME"
-                    );
+                None => {
+                    print!("PDS hostname / DNS name (e.g. pds.example.com): ");
+                    std::io::stdout().flush()?;
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    let entered = line.trim().to_string();
+                    if entered.is_empty() {
+                        anyhow::bail!(
+                            "hostname is required: enter one at the prompt, pass --hostname <host>, or set PDS_HOSTNAME"
+                        );
+                    }
+                    entered
                 }
-                entered
             }
         }
     };
@@ -450,8 +492,11 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
         }
     };
 
-    // Prompt for password (non-echoing — T-7-04-01).
-    let password = rpassword::prompt_password("Admin password (min 8 chars): ")?;
+    // Resolve password: --password/PDS_ADMIN_PASSWORD wins outright (no prompt); otherwise
+    // prompt (non-echoing — T-7-04-01) only if a terminal is available, else error
+    // actionably instead of crashing on a missing /dev/tty (B5).
+    use std::io::IsTerminal;
+    let password = resolve_password(args.password.clone(), std::io::stdin().is_terminal())?;
 
     // Resolve or generate jwt_secret.
     // If not provided, generate a cryptographically random 32-byte secret, print it ONCE.
@@ -823,5 +868,92 @@ mod tests {
         run_wizard(&state, opts, &ip_client, &dns_resolver, &relay)
             .await
             .expect("run_wizard must succeed");
+    }
+
+    // -----------------------------------------------------------------------
+    // B5: non-interactive init — password flag/env resolution + no-TTY guard
+    // -----------------------------------------------------------------------
+
+    /// Full flags supplied (password + hostname), no TTY available: resolution must
+    /// succeed WITHOUT prompting and WITHOUT crashing (`Device not configured`).
+    #[test]
+    fn init_full_flags_no_tty_succeeds() {
+        // Guard against ambient env pollution from other tests/processes.
+        std::env::remove_var("PDS_ADMIN_PASSWORD");
+
+        // Password supplied via flag — must resolve directly, no prompt, no TTY needed.
+        let result = resolve_password(Some("password123".to_string()), false);
+        assert!(
+            result.is_ok(),
+            "explicit --password with is_tty=false must resolve without prompting: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap(), "password123");
+
+        // Hostname supplied via flag must be used directly (no prompt path taken) —
+        // verified structurally: `args.hostname.clone()` short-circuits to `Some(h) => h`
+        // in init::run before any stdin read is reached (see run()'s hostname resolution).
+    }
+
+    /// No password flag/env AND no TTY: must return an actionable Err, not panic.
+    #[test]
+    fn init_no_password_no_tty_errors() {
+        std::env::remove_var("PDS_ADMIN_PASSWORD");
+
+        let result = resolve_password(None, false);
+        assert!(
+            result.is_err(),
+            "no password + no TTY must error, not panic or hang"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("run non-interactively"),
+            "error message must be actionable, got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // B3: init-writes/serve-reads config round trip
+    // -----------------------------------------------------------------------
+
+    /// A config written by `init` (via `PdsConfig::save`) at the default `stelyph.toml`
+    /// path is read back by `serve`'s config resolution (`resolve_config_path(None)` +
+    /// `PdsConfig::load_or_default`) when the process cwd is that directory.
+    #[test]
+    fn init_then_serve_reads_config() {
+        // Serialize with other cwd-mutating tests in this process (there are none today,
+        // but this guards future additions from racing on the global process cwd).
+        static CWD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = CWD_GUARD.lock().unwrap();
+
+        let original_cwd = std::env::current_dir().unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(tmp_dir.path()).unwrap();
+
+        // Ensure we always restore cwd even if an assertion below panics.
+        struct RestoreCwd(std::path::PathBuf);
+        impl Drop for RestoreCwd {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _restore = RestoreCwd(original_cwd);
+
+        let cfg = PdsConfig {
+            hostname: Some("pds.roundtrip.test".to_string()),
+            ..Default::default()
+        };
+        cfg.save(std::path::Path::new("stelyph.toml"))
+            .expect("save must succeed");
+
+        let resolved = crate::cmd::resolve_config_path(None);
+        let loaded = PdsConfig::load_or_default(resolved.exists().then_some(resolved.as_path()))
+            .expect("load_or_default must succeed");
+
+        assert_eq!(
+            loaded.hostname,
+            Some("pds.roundtrip.test".to_string()),
+            "serve's config resolution must read back the hostname init wrote"
+        );
     }
 }

@@ -48,6 +48,25 @@ pub enum AcmeEnv {
     Staging,
 }
 
+/// Resolve the config path. If the operator passed --config/PDS_CONFIG explicitly, use it
+/// verbatim (a missing explicit path is an error at load time). Otherwise default to
+/// `stelyph.toml`, falling back to a legacy `rust-pds.toml` if it exists (read-only fallback
+/// for pre-rename installs).
+pub fn resolve_config_path(explicit: Option<&std::path::Path>) -> std::path::PathBuf {
+    if let Some(p) = explicit {
+        return p.to_path_buf();
+    }
+    let new_default = std::path::PathBuf::from("stelyph.toml");
+    if new_default.exists() {
+        return new_default;
+    }
+    let old_default = std::path::PathBuf::from("rust-pds.toml");
+    if old_default.exists() {
+        return old_default;
+    }
+    new_default
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
