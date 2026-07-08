@@ -23,6 +23,17 @@ cargo install --path rust-pds
 
 The musl binaries are fully static — no glibc, no system SQLite, no runtime dependencies.
 
+**macOS direct downloads:** the release binaries aren't Apple-notarized yet, so a copy pulled
+from the Releases page (browser or `curl`) carries Gatekeeper's quarantine flag. Clear it once
+after extracting:
+
+```sh
+xattr -d com.apple.quarantine ./stelyph
+```
+
+`brew install` and `cargo install --path` builds are **not** affected — only quarantined
+downloads are.
+
 Every release artifact carries a [Sigstore build-provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations)
 proving it was built by this repository's CI:
 
