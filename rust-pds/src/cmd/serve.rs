@@ -44,6 +44,29 @@ pub struct ServeArgs {
     pub open_registration: bool,
 }
 
+/// B7/T-06-01: pure heuristic gate used as the standalone-mode ACME preflight.
+///
+/// Rejects hostnames that would make `tls::serve_standalone` place a doomed Let's
+/// Encrypt order: IP literals (no public cert for a bare IP), dotless names (no TLD),
+/// and hosts under reserved/non-public TLDs (`localhost`, `.local`, `.internal`,
+/// `.test`). No PSL crate — mirrors `firehose/crawl.rs::validate_relay_url`'s
+/// dependency-free heuristic style. Not exhaustive (does not consult the real public
+/// suffix list), but catches the common first-run misconfigurations before they burn
+/// the operator's LE rate-limit budget.
+fn looks_like_public_hostname(host: &str) -> bool {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    if !host.contains('.') {
+        return false;
+    }
+    let lower = host.to_ascii_lowercase();
+    !(lower == "localhost"
+        || lower.ends_with(".local")
+        || lower.ends_with(".internal")
+        || lower.ends_with(".test"))
+}
+
 pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()> {
     // 1. Load config file (file < env < flag precedence).
     // An explicit --config/PDS_CONFIG that doesn't exist is a hard error (B3/T-05-03);
@@ -232,6 +255,30 @@ pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()>
         super::Mode::Standalone => {
             let prod = crate::tls::acme_directory_is_production(acme_env);
 
+            // B7/T-06-01: pre-flight the hostname BEFORE any ACME order is placed.
+            // Once tls::serve_standalone constructs the AcmeState the first order is
+            // already in flight — a bad hostname here would burn the operator's real
+            // Let's Encrypt rate-limit budget across repeated retries.
+            if !looks_like_public_hostname(&hostname) {
+                eprintln!(
+                    "FATAL: '{hostname}' does not look like a public hostname (no dot, is an IP, or uses a reserved TLD like \
+                     .local/.internal/.test/localhost) — standalone mode requests a real Let's Encrypt certificate and will fail. \
+                     Use --mode proxy for local/internal hosting."
+                );
+                std::process::exit(1);
+            }
+            let dns_resolver = crate::dns::HickoryResolver::new()?;
+            if crate::dns::DnsResolver::resolve_a(&dns_resolver, &hostname)
+                .await
+                .is_err()
+            {
+                eprintln!(
+                    "FATAL: DNS lookup for '{hostname}' failed — standalone mode needs this hostname to resolve before requesting \
+                     a certificate. Fix DNS first, or use --mode proxy."
+                );
+                std::process::exit(1);
+            }
+
             // Kick off the relay handshake so the relay begins crawling this PDS (FED-03).
             // Non-fatal: relay outage must not crash the PDS.
             {
@@ -264,4 +311,27 @@ pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()>
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // B7/T-06-01: pure heuristic used as the standalone-mode ACME preflight gate.
+    // Must reject IP literals, dotless hosts, and reserved non-public TLDs; accept a
+    // plausible public hostname.
+    #[test]
+    fn acme_preflight_rejects_bad_hostnames() {
+        assert!(!looks_like_public_hostname("127.0.0.1"), "IPv4 literal must be rejected");
+        assert!(!looks_like_public_hostname("::1"), "IPv6 literal must be rejected");
+        assert!(!looks_like_public_hostname("localhost"), "localhost must be rejected");
+        assert!(!looks_like_public_hostname("nodot"), "dotless host must be rejected");
+        assert!(!looks_like_public_hostname("foo.local"), ".local must be rejected");
+        assert!(!looks_like_public_hostname("foo.internal"), ".internal must be rejected");
+        assert!(!looks_like_public_hostname("foo.test"), ".test must be rejected");
+        assert!(
+            looks_like_public_hostname("pds.example.com"),
+            "a plausible public hostname must be accepted"
+        );
+    }
 }
