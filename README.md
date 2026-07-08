@@ -1,6 +1,6 @@
 # Stelyph
 
-[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm--Noncommercial--1.0.0-blue.svg)](LICENSE)
 [![CI](https://github.com/spirallex/stelyph/actions/workflows/ci.yml/badge.svg)](https://github.com/spirallex/stelyph/actions/workflows/ci.yml)
 
 > A single static binary AT Protocol PDS — self-hosted Bluesky federation.
@@ -157,6 +157,11 @@ domain in minutes, with full federation to the real Bluesky network.
 
 Copyright © 2026 [Spirallex](https://github.com/spirallex).
 
-This program is free software: you can redistribute it and/or modify it under the terms of the
-GNU General Public License as published by the Free Software Foundation, either version 3 of
-the License, or (at your option) any later version. See [LICENSE](LICENSE).
+This software is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE):
+you may use, modify, and share it freely for **noncommercial purposes** (personal use,
+research, hobby projects, and use by charities, educational institutions, and public
+agencies).
+
+**Commercial use requires a paid license.** If you or your company want to use this
+software for a commercial purpose, contact [Spirallex](https://github.com/spirallex) at
+<zeichenjoyce@gmail.com> to arrange a commercial license.
