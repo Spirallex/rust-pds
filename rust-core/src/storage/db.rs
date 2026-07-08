@@ -13,8 +13,8 @@ use crate::storage::{schema, StorageError};
 ///
 /// The writer is a single `tokio_rusqlite::Connection` behind a `Mutex` — only
 /// one async task may hold the write lock at a time, which guarantees
-/// `BEGIN IMMEDIATE` transactions never race for the write lock from within the
-/// same process.
+/// `Immediate`-behavior transactions never race for the write lock from within
+/// the same process.
 ///
 /// The readers are a `deadpool_sqlite::Pool` — concurrent reads execute on
 /// separate connections without blocking writes (WAL mode).
@@ -446,9 +446,9 @@ impl SqliteStore {
     /// transaction (WR-02: first-account TOCTOU fix).
     ///
     /// Returns the account count BEFORE the insert, so the caller can check
-    /// whether this was the first account. The count and insert are wrapped in a
-    /// BEGIN IMMEDIATE transaction so two concurrent first-registrations cannot
-    /// both observe count == 0.
+    /// whether this was the first account. The count and insert are wrapped in an
+    /// Immediate-behavior transaction (rollback-on-drop) so two concurrent
+    /// first-registrations cannot both observe count == 0.
     pub async fn count_and_insert_account(
         &self,
         did: &str,
@@ -464,14 +464,15 @@ impl SqliteStore {
         let writer = self.writer.lock().await;
         let count_before = writer
             .call(move |conn| {
-                conn.execute("BEGIN IMMEDIATE", [])?;
-                let n: i64 = conn.query_row("SELECT count(*) FROM accounts", [], |r| r.get(0))?;
-                conn.execute(
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let n: i64 = tx.query_row("SELECT count(*) FROM accounts", [], |r| r.get(0))?;
+                tx.execute(
                     "INSERT INTO accounts (did, handle, email, password_argon2, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                     rusqlite::params![did, handle, email, phc, now],
                 )?;
-                conn.execute("COMMIT", [])?;
+                tx.commit()?;
                 Ok(n)
             })
             .await?;
@@ -556,11 +557,13 @@ impl SqliteStore {
 
     /// Atomically consume one use of an invite code for `used_by`.
     ///
-    /// This runs inside the writer mutex AND an explicit BEGIN IMMEDIATE transaction
-    /// (WR-03) so that the SELECT → INSERT → UPDATE sequence is crash-safe: if the
-    /// process dies between the INSERT and the UPDATE, SQLite rolls back both
-    /// statements on restart. Without an explicit transaction each statement is
-    /// auto-committed individually, leaving the use counter potentially inconsistent.
+    /// This runs inside the writer mutex AND an explicit Immediate-behavior
+    /// transaction (WR-03, B1) so that the SELECT → INSERT → UPDATE sequence is
+    /// crash-safe: if the process dies between the INSERT and the UPDATE, SQLite
+    /// rolls back both statements on restart. The transaction guard also rolls
+    /// back automatically on `Drop` if any early `?` returns before `tx.commit()`,
+    /// so the singleton writer connection is never left with a stuck-open
+    /// transaction after a failure.
     ///
     /// Returns `true` on success, `false` if the code is unknown, disabled,
     /// exhausted, or already used by this DID.
@@ -572,13 +575,15 @@ impl SqliteStore {
         let consumed = writer
             .call(move |conn| {
                 // WR-03: wrap in an explicit transaction so the SELECT + INSERT + UPDATE
-                // are atomic with respect to crashes.
-                conn.execute("BEGIN IMMEDIATE", [])?;
+                // are atomic with respect to crashes. The un-committed `tx` rolls back
+                // automatically on Drop if the closure returns without `tx.commit()`.
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
                 // Check invite is valid and has remaining uses.
                 let row: Option<(i64, i64)> = {
                     use rusqlite::OptionalExtension;
-                    conn.query_row(
+                    tx.query_row(
                         "SELECT available_uses, disabled FROM invites WHERE code = ?1",
                         rusqlite::params![code],
                         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
@@ -588,53 +593,47 @@ impl SqliteStore {
 
                 let (available_uses, _disabled) = match row {
                     None => {
-                        conn.execute("ROLLBACK", [])?;
                         return Ok(false); // code not found
                     }
                     Some((_, 1)) => {
-                        conn.execute("ROLLBACK", [])?;
                         return Ok(false); // disabled
                     }
                     Some((0, _)) => {
-                        conn.execute("ROLLBACK", [])?;
                         return Ok(false); // no uses left
                     }
                     Some(v) => v,
                 };
 
                 if available_uses <= 0 {
-                    conn.execute("ROLLBACK", [])?;
                     return Ok(false);
                 }
 
                 // Check if already used by this DID
-                let already_used: i64 = conn.query_row(
+                let already_used: i64 = tx.query_row(
                     "SELECT count(*) FROM invite_uses WHERE code = ?1 AND used_by = ?2",
                     rusqlite::params![code, used_by],
                     |row| row.get(0),
                 )?;
                 if already_used > 0 {
-                    conn.execute("ROLLBACK", [])?;
                     return Ok(false);
                 }
 
                 // INSERT invite_uses — the PK constraint prevents double-use
-                let inserted = conn.execute(
+                let inserted = tx.execute(
                 "INSERT OR IGNORE INTO invite_uses (code, used_by, used_at) VALUES (?1, ?2, ?3)",
                 rusqlite::params![code, used_by, now],
             )?;
                 if inserted == 0 {
-                    conn.execute("ROLLBACK", [])?;
                     return Ok(false); // PK conflict — already used
                 }
 
                 // Decrement available_uses
-                conn.execute(
+                tx.execute(
                     "UPDATE invites SET available_uses = available_uses - 1 WHERE code = ?1",
                     rusqlite::params![code],
                 )?;
 
-                conn.execute("COMMIT", [])?;
+                tx.commit()?;
                 Ok(true)
             })
             .await?;
@@ -1113,5 +1112,47 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(uses, 5);
+    }
+
+    /// B1: a forced mid-transaction failure inside `count_and_insert_account`
+    /// (duplicate `did` violates the PRIMARY KEY constraint) must NOT leave the
+    /// singleton writer connection stuck with an open transaction. A subsequent,
+    /// independent write on the same store must still succeed.
+    ///
+    /// Mirrors `block_store.rs::tests::test_atomic_rollback`'s two-phase structure:
+    /// phase 1 forces an `Err`, phase 2 proves the writer is still usable.
+    #[tokio::test]
+    async fn txn_leak_writer_stays_usable() {
+        let (store, _tmp) = SqliteStore::open_in_memory().await.expect("open failed");
+
+        // Phase 1: insert one account, then force a mid-transaction failure by
+        // inserting a SECOND account with the same `did` (PRIMARY KEY violation).
+        // With the old raw begin/commit-string implementation this would leave
+        // an open transaction on the writer connection because the early `?`
+        // error skips the commit statement with no rollback ever issued.
+        store
+            .count_and_insert_account("did:plc:dup", "first.test", None, "phc-1")
+            .await
+            .expect("first insert must succeed");
+
+        let result = store
+            .count_and_insert_account("did:plc:dup", "second.test", None, "phc-2")
+            .await;
+        assert!(
+            result.is_err(),
+            "duplicate did must violate the PRIMARY KEY constraint and return Err"
+        );
+
+        // Phase 2: an independent write on the same store (different did/handle)
+        // must still succeed — proving the writer connection was NOT left stuck
+        // with an open transaction after the phase-1 failure.
+        let count_before = store
+            .count_and_insert_account("did:plc:fresh", "fresh.test", None, "phc-3")
+            .await
+            .expect("independent write after a forced failure must still succeed");
+        assert_eq!(
+            count_before, 1,
+            "count_before should reflect the one account inserted in phase 1"
+        );
     }
 }
