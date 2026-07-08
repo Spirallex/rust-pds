@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     takedown_ref     TEXT
 ) STRICT;
 
--- Encrypted key blobs (ACCT-05)
+-- Encrypted key blobs
 CREATE TABLE IF NOT EXISTS keys (
     id          TEXT PRIMARY KEY NOT NULL,
     ciphertext  BLOB NOT NULL

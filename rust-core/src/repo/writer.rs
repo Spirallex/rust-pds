@@ -16,8 +16,9 @@ use crate::storage::SqliteStore;
 ///
 /// `write_lock` serialises the full load_repo_root → build → commit cycle so that
 /// concurrent `create_record` calls for the same DID cannot interleave and produce
-/// a forked history (WR-01). The lock is an Arc so callers can share a single
-/// `RepoWriter` across tasks while still preserving per-DID sequencing.
+/// a forked history: the write lock must be held across every await in the commit
+/// path. The lock is an Arc so callers can share a single `RepoWriter` across tasks
+/// while still preserving per-DID sequencing.
 pub struct RepoWriter {
     pub(crate) store: Arc<SqliteStore>,
     pub(crate) signing_key: Secp256k1Keypair,
@@ -232,7 +233,7 @@ impl RepoWriter {
         }
 
         // Build the CARv1 bytes in-memory BEFORE the txn (borrow &blocks before move).
-        // Root MUST be commit_cid (Pitfall 7 — relay checks the CAR root).
+        // Root MUST be commit_cid — the relay checks the CAR root.
         use iroh_car::{CarHeader, CarWriter};
         let car_header = CarHeader::new_v1(vec![commit_cid]);
         let mut car_buf: Vec<u8> = Vec::new();
@@ -311,7 +312,7 @@ impl RepoWriter {
             .await?;
 
         // Build the full frame with the real seq and publish to the broadcast channel.
-        // Err (no subscribers) is intentionally ignored — not a fault (RESEARCH line 457).
+        // Err (no subscribers) is intentionally ignored — not a fault.
         body.seq = seq;
         let frame = encode_message_frame("#commit", &body);
         let _ = self.firehose_tx.send(FirehoseEvent { seq, frame });
@@ -528,7 +529,7 @@ mod tests {
         );
     }
 
-    /// WR-01: two concurrent create_record calls for the same DID must produce a
+    /// Two concurrent create_record calls for the same DID must produce a
     /// linear commit chain — no forked history. Verified by asserting:
     ///   1. Both commits are reachable from the final repo_roots entry.
     ///   2. The repo_seq table has exactly two rows (no lost update).
@@ -606,7 +607,7 @@ mod tests {
         );
     }
 
-    /// FED-01 (stored event): the repo_seq event BLOB decodes to a #commit body
+    /// The repo_seq event BLOB decodes to a #commit body
     /// whose `commit` == the returned commit CID, `repo` == the writer DID,
     /// and `ops` path == the MST key (collection/rkey), action == "create".
     #[tokio::test]
@@ -659,11 +660,11 @@ mod tests {
         assert_eq!(
             header.roots(),
             &[commit_cid],
-            "CAR root must be commit_cid (Pitfall 7)"
+            "CAR root must be commit_cid"
         );
     }
 
-    /// FED-01 (broadcast): a subscriber created before create_record receives exactly
+    /// A subscriber created before create_record receives exactly
     /// one FirehoseEvent whose `seq` matches the seq returned by commit_blocks, and
     /// whose `frame` decodes to a #commit with the injected seq.
     #[tokio::test]

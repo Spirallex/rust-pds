@@ -172,7 +172,7 @@ pub async fn load_key(
 /// before emitting any output, so an export with the wrong passphrase fails cleanly
 /// with `StorageError::Crypto`. The passphrase itself is never written to the blob.
 ///
-/// ACCT-05 portability: this blob can be transferred to any machine and imported
+/// This blob is portable: it can be transferred to any machine and imported
 /// into a fresh database with `import_keys` using the same passphrase.
 pub async fn export_keys(
     store: &crate::storage::SqliteStore,
@@ -223,7 +223,7 @@ pub async fn export_keys(
 /// Import a key blob produced by `export_keys` into this store under `id`.
 ///
 /// Validates the passphrase before writing. Returns `StorageError::Crypto` on
-/// wrong passphrase or malformed blob — no panic (T-01-14 mitigated).
+/// wrong passphrase or malformed blob — never panics.
 ///
 /// Note: `id` overrides the id embedded in the blob, allowing re-keying a slot.
 /// Delegates to `crate::storage::backup::import_keys` (authoritative implementation).
@@ -241,7 +241,7 @@ mod tests {
     use super::*;
     use crate::storage::SqliteStore;
 
-    /// ACCT-05: the ciphertext blob stored for a key must not contain the plaintext bytes.
+    /// The ciphertext blob stored for a key must not contain the plaintext bytes.
     #[tokio::test]
     async fn test_ciphertext_not_plaintext() {
         let plaintext = b"super-secret-signing-key-32bytes";
@@ -259,7 +259,7 @@ mod tests {
         );
     }
 
-    /// ACCT-05: decrypting with the wrong passphrase returns Err, never panics.
+    /// Decrypting with the wrong passphrase returns Err, never panics.
     #[tokio::test]
     async fn test_wrong_passphrase() {
         let plaintext = b"super-secret-signing-key-32bytes";
@@ -346,10 +346,10 @@ mod tests {
         assert!(result.is_err(), "expected Err for missing key, got Ok");
     }
 
-    /// ACCT-05: export → import into a fresh DB yields the same key bytes.
+    /// Export → import into a fresh DB yields the same key bytes.
     ///
-    /// Also verifies that importing with the wrong passphrase fails cleanly (Err,
-    /// no panic), satisfying the T-01-14 panic mitigation.
+    /// Also verifies that importing with the wrong passphrase fails cleanly
+    /// (Err, no panic).
     #[tokio::test]
     async fn test_export_import_roundtrip() {
         let (store_src, _tmp_src) = SqliteStore::open_in_memory()
@@ -388,7 +388,7 @@ mod tests {
             "imported key must round-trip to the same bytes as the original"
         );
 
-        // Wrong-passphrase import case: must return Err, never panic (T-01-14).
+        // Wrong-passphrase import case: must return Err, never panic.
         let wrong_result = import_keys(&store_dst, key_id, &blob, b"wrong-passphrase").await;
         assert!(
             wrong_result.is_err(),

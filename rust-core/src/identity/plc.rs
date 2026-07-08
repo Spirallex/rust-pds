@@ -4,7 +4,7 @@
 //!   - https://web.plc.directory/spec/v0.1/did-plc
 //!   - atrium-crypto Secp256k1Keypair::sign() for low-S ECDSA
 //!
-//! CRITICAL (Pitfall 2): The DID derives from sha256(dag-cbor(SIGNED op)).
+//! CRITICAL: The DID derives from sha256(dag-cbor(SIGNED op)).
 //! Never derive from the unsigned op bytes or from the JSON representation.
 //! The POST body sent to plc.directory is JSON; dag-cbor is only used for
 //! signing and DID derivation.
