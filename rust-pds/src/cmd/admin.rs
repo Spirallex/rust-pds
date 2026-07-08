@@ -60,6 +60,13 @@ pub enum AdminCommand {
 }
 
 pub async fn run(args: AdminArgs) -> anyhow::Result<()> {
+    if !std::path::Path::new(&args.db_path).exists() {
+        anyhow::bail!(
+            "no database at {} — did you mean to point --db-path at your existing pds.db?",
+            args.db_path
+        );
+    }
+
     let store = SqliteStore::open(&args.db_path)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to open database {}: {e}", args.db_path))?;
