@@ -98,6 +98,25 @@ pub struct InitArgs {
     /// Key passphrase (env PDS_KEY_PASSPHRASE). Prompted if absent.
     #[arg(long, env = "PDS_KEY_PASSPHRASE")]
     pub key_passphrase: Option<String>,
+
+    /// Admin password for the first account (env PDS_ADMIN_PASSWORD). Prompted if absent
+    /// and a terminal is available.
+    #[arg(long, env = "PDS_ADMIN_PASSWORD")]
+    pub password: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Password resolution (B5) — testable seam extracted out of init::run so the
+// no-TTY guard and the actionable error message can be unit-tested without
+// spawning a real prompt (which would hang/crash under `Device not configured`
+// when stdin is not a terminal, e.g. in Docker/CI/pipes).
+// ---------------------------------------------------------------------------
+
+/// STUB (RED phase — B5 not yet implemented): always errors, ignoring both
+/// `explicit` and `is_tty`. Replaced with the real flag/env/TTY-guard logic
+/// in the GREEN commit.
+fn resolve_password(_explicit: Option<String>, _is_tty: bool) -> anyhow::Result<String> {
+    anyhow::bail!("resolve_password: not yet implemented (B5 stub)")
 }
 
 // ---------------------------------------------------------------------------
@@ -829,5 +848,92 @@ mod tests {
         run_wizard(&state, opts, &ip_client, &dns_resolver, &relay)
             .await
             .expect("run_wizard must succeed");
+    }
+
+    // -----------------------------------------------------------------------
+    // B5: non-interactive init — password flag/env resolution + no-TTY guard
+    // -----------------------------------------------------------------------
+
+    /// Full flags supplied (password + hostname), no TTY available: resolution must
+    /// succeed WITHOUT prompting and WITHOUT crashing (`Device not configured`).
+    #[test]
+    fn init_full_flags_no_tty_succeeds() {
+        // Guard against ambient env pollution from other tests/processes.
+        std::env::remove_var("PDS_ADMIN_PASSWORD");
+
+        // Password supplied via flag — must resolve directly, no prompt, no TTY needed.
+        let result = resolve_password(Some("password123".to_string()), false);
+        assert!(
+            result.is_ok(),
+            "explicit --password with is_tty=false must resolve without prompting: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap(), "password123");
+
+        // Hostname supplied via flag must be used directly (no prompt path taken) —
+        // verified structurally: `args.hostname.clone()` short-circuits to `Some(h) => h`
+        // in init::run before any stdin read is reached (see run()'s hostname resolution).
+    }
+
+    /// No password flag/env AND no TTY: must return an actionable Err, not panic.
+    #[test]
+    fn init_no_password_no_tty_errors() {
+        std::env::remove_var("PDS_ADMIN_PASSWORD");
+
+        let result = resolve_password(None, false);
+        assert!(
+            result.is_err(),
+            "no password + no TTY must error, not panic or hang"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("run non-interactively"),
+            "error message must be actionable, got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // B3: init-writes/serve-reads config round trip
+    // -----------------------------------------------------------------------
+
+    /// A config written by `init` (via `PdsConfig::save`) at the default `stelyph.toml`
+    /// path is read back by `serve`'s config resolution (`resolve_config_path(None)` +
+    /// `PdsConfig::load_or_default`) when the process cwd is that directory.
+    #[test]
+    fn init_then_serve_reads_config() {
+        // Serialize with other cwd-mutating tests in this process (there are none today,
+        // but this guards future additions from racing on the global process cwd).
+        static CWD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = CWD_GUARD.lock().unwrap();
+
+        let original_cwd = std::env::current_dir().unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(tmp_dir.path()).unwrap();
+
+        // Ensure we always restore cwd even if an assertion below panics.
+        struct RestoreCwd(std::path::PathBuf);
+        impl Drop for RestoreCwd {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _restore = RestoreCwd(original_cwd);
+
+        let cfg = PdsConfig {
+            hostname: Some("pds.roundtrip.test".to_string()),
+            ..Default::default()
+        };
+        cfg.save(std::path::Path::new("stelyph.toml"))
+            .expect("save must succeed");
+
+        let resolved = crate::cmd::resolve_config_path(None);
+        let loaded = PdsConfig::load_or_default(resolved.exists().then_some(resolved.as_path()))
+            .expect("load_or_default must succeed");
+
+        assert_eq!(
+            loaded.hostname,
+            Some("pds.roundtrip.test".to_string()),
+            "serve's config resolution must read back the hostname init wrote"
+        );
     }
 }
