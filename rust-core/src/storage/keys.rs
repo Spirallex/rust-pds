@@ -97,7 +97,11 @@ pub async fn store_key(
     plaintext: &[u8],
     passphrase: &[u8],
 ) -> Result<(), StorageError> {
-    let blob = encrypt_key(plaintext, passphrase)?;
+    let plaintext = plaintext.to_vec();
+    let passphrase = passphrase.to_vec();
+    let blob = tokio::task::spawn_blocking(move || encrypt_key(&plaintext, &passphrase))
+        .await
+        .map_err(|e| StorageError::Crypto(format!("blocking key-encrypt task panicked: {e}")))??;
     let id_owned = id.to_string();
     let writer = store.writer.lock().await;
     writer
@@ -143,7 +147,14 @@ pub async fn load_key(
 
     match blob {
         None => Err(StorageError::Crypto("key not found".into())),
-        Some(b) => decrypt_key(&b, passphrase),
+        Some(b) => {
+            let passphrase = passphrase.to_vec();
+            tokio::task::spawn_blocking(move || decrypt_key(&b, &passphrase))
+                .await
+                .map_err(|e| {
+                    StorageError::Crypto(format!("blocking key-decrypt task panicked: {e}"))
+                })?
+        }
     }
 }
 
