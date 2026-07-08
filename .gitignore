@@ -14,6 +14,7 @@ target/
 /pds.db-wal
 
 # Local deployment config written by `stelyph init` (machine-specific, may name your host)
+/stelyph.toml
 /rust-pds.toml
 
 # Internal planning docs — never published

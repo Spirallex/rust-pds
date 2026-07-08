@@ -2,7 +2,7 @@
 name = "stelyph"
 version = "0.1.0"
 edition = "2021"
-license = "GPL-3.0-or-later"
+license = "PolyForm-Noncommercial-1.0.0"
 description = "A single static binary AT Protocol PDS (Personal Data Server) for self-hosted Bluesky federation"
 repository = "https://github.com/spirallex/stelyph"
 readme = "../README.md"
