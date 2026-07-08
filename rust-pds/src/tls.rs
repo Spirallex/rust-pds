@@ -38,12 +38,18 @@ pub async fn serve_standalone(
         .directory_lets_encrypt(prod)
         .state();
     let acceptor = acme_state.axum_acceptor(acme_state.default_rustls_config());
-    // Pitfall 4: certs never acquire unless next() is polled in a spawned task.
+    // Certs never acquire unless next() is polled in a spawned task.
     tokio::spawn(async move {
         loop {
-            match acme_state.next().await.unwrap() {
-                Ok(ok) => eprintln!("acme: {:?}", ok),
-                Err(err) => eprintln!("acme error: {:?}", err),
+            match acme_state.next().await {
+                Some(Ok(ok)) => eprintln!("acme: {ok:?}"),
+                Some(Err(err)) => eprintln!("acme error: {err}"), // Display, not Debug
+                None => {
+                    eprintln!(
+                        "acme polling stream ended unexpectedly — certificate renewal has stopped"
+                    );
+                    break;
+                }
             }
         }
     });
