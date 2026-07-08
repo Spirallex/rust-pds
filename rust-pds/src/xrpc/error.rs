@@ -16,7 +16,7 @@ use crate::storage::StorageError;
 ///
 /// Internal errors map to HTTP 500 with a fixed message ("Internal error") and
 /// name ("InternalServerError"). The inner anyhow detail is NEVER included in the
-/// response body (T-03-01 threat mitigation).
+/// response body — it could leak internal paths, queries, or other implementation detail.
 #[derive(Debug, thiserror::Error)]
 pub enum XrpcError {
     // --- Session / Auth ---
@@ -140,7 +140,7 @@ impl IntoResponse for XrpcError {
         };
 
         // For Internal and UpstreamFailure errors, NEVER serialize the inner detail
-        // — use fixed messages. T-03-01 / T-05-02 threat mitigation.
+        // — use fixed messages, to avoid leaking implementation detail to the client.
         let message = match &self {
             XrpcError::Internal(_) => "Internal error".to_string(),
             XrpcError::UpstreamFailure(_) => "Upstream service error".to_string(),

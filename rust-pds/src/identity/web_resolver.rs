@@ -3,11 +3,10 @@
 //!
 //! This is the inverse of `stelyph_core::identity::web` (which BUILDS a did:web
 //! document for documents Stelyph itself serves). This module RESOLVES a
-//! did:web DID that some OTHER host serves — per D17-B, the AT-IOT backend
-//! serves per-device DID docs, and Stelyph's `createAccount` must confirm a
+//! did:web DID that some OTHER host serves, so `createAccount` can confirm a
 //! caller-supplied did:web DID actually resolves before persisting the account.
 //!
-//! SSRF hardening (T-05-02): `redirect::Policy::none()` (never follow a
+//! SSRF hardening: `redirect::Policy::none()` (never follow a
 //! redirect to an attacker-chosen host), a 10s timeout, and a body read capped
 //! to 256 bytes on error paths (mirrors `ReqwestPlcClient`). Plain HTTP is only
 //! ever used when `http_dev` is explicitly true (compose-network dev mode) —
@@ -35,7 +34,7 @@ impl ReqwestDidWebResolver {
     pub fn new(http_dev: bool) -> Result<Self, anyhow::Error> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
-            // T-05-02: never follow a redirect — an attacker-controlled did:web
+            // Never follow a redirect — an attacker-controlled did:web
             // host could otherwise redirect the resolver to an internal service.
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
@@ -128,7 +127,7 @@ impl DidWebResolver for ReqwestDidWebResolver {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            // WR-05 analog: cap body read to 256 bytes; never leak it to the caller.
+            // Cap body read to 256 bytes; never leak it to the caller.
             let body = resp.text().await.unwrap_or_default();
             let end = body
                 .char_indices()

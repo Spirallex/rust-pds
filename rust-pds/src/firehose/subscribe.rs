@@ -2,7 +2,8 @@
 //!
 //! State machine:
 //! 1. Validate cursor (ASVS V5 — before upgrade).
-//! 2. Subscribe to broadcast channel BEFORE backfill (Pitfall 5 — eliminates gap).
+//! 2. Subscribe to broadcast channel BEFORE backfill — eliminates the gap between the
+//!    backfill query finishing and subscription starting.
 //! 3. FutureCursor check: cursor > max_seq → error frame + close.
 //! 4. Backfill: page through repo_seq with backfill_page, inject seq, send binary frames.
 //! 5. Live: drain rx with cutover dedup (seq > last_sent_seq), handle Lagged → ConsumerTooSlow.
@@ -20,7 +21,7 @@ use bytes::Bytes;
 use crate::firehose::{encode_error_frame, encode_message_frame, CommitBody};
 use crate::xrpc::{AppState, XrpcError};
 
-/// How many repo_seq rows to fetch per backfill page (T-04-14 DoS — bounded).
+/// How many repo_seq rows to fetch per backfill page (bounded to cap per-page DoS cost).
 const BACKFILL_PAGE: i64 = 500;
 
 /// Register the subscribeRepos route.
@@ -55,7 +56,7 @@ fn parse_cursor(params: &HashMap<String, String>) -> Result<Option<i64>, XrpcErr
 
 /// GET /xrpc/com.atproto.sync.subscribeRepos — WebSocket upgrade handler.
 ///
-/// Input validation is performed BEFORE the upgrade handshake (T-04-12).
+/// Input validation is performed BEFORE the upgrade handshake.
 pub async fn subscribe_repos(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
@@ -70,7 +71,7 @@ pub async fn subscribe_repos(
 async fn handle_firehose(mut socket: WebSocket, state: AppState, cursor: Option<i64>) {
     // Step 1: Subscribe to broadcast FIRST (before backfill query) so we never
     // miss live events published between the backfill query finishing and us
-    // starting to receive from the channel (Pitfall 5).
+    // starting to receive from the channel.
     let mut rx = state.firehose_tx.subscribe();
 
     // Step 2: FutureCursor check — requires a cursor to be present.
@@ -97,7 +98,7 @@ async fn handle_firehose(mut socket: WebSocket, state: AppState, cursor: Option<
 
     // Step 4 + 5: Live stream with cutover dedup and a single backfill-recovery on Lagged.
     //
-    // WR-04: a subscriber that requested a large backfill can let the bounded broadcast
+    // A subscriber that requested a large backfill can let the bounded broadcast
     // channel overflow with live events before reaching this loop, so the first `recv()`
     // returns `Lagged` even though the client made forward progress. Rather than closing
     // such legitimate backfilling clients with `ConsumerTooSlow`, we recover ONCE by
@@ -108,7 +109,7 @@ async fn handle_firehose(mut socket: WebSocket, state: AppState, cursor: Option<
     loop {
         match rx.recv().await {
             Ok(evt) => {
-                // Dedup: skip events already sent during backfill (Pitfall 5).
+                // Dedup: skip events already sent during backfill.
                 if evt.seq <= last_sent_seq {
                     continue;
                 }
@@ -137,7 +138,7 @@ async fn handle_firehose(mut socket: WebSocket, state: AppState, cursor: Option<
                         None => return, // client disconnected or DB error
                     }
                 }
-                // Steady-state slow consumer fell behind channel capacity — close (Pitfall 6).
+                // Steady-state slow consumer fell behind channel capacity — close.
                 let frame =
                     encode_error_frame("ConsumerTooSlow", Some("Stream consumer too slow."));
                 let _ = socket.send(Message::Binary(Bytes::from(frame))).await;
@@ -178,7 +179,7 @@ async fn run_backfill(socket: &mut WebSocket, state: &AppState, after_seq: i64) 
                     continue;
                 }
             };
-            body.seq = seq; // inject seq at stream time (RESEARCH lines 282-312)
+            body.seq = seq; // inject seq at stream time (not stored on the row itself)
             let frame = encode_message_frame("#commit", &body);
             if socket
                 .send(Message::Binary(Bytes::from(frame)))

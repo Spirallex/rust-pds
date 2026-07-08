@@ -3,15 +3,14 @@
 //! Production impl: `ReqwestRelayClient` — POSTs `{"hostname": <pds_hostname>}` to
 //! `<relay_url>/xrpc/com.atproto.sync.requestCrawl`.
 //!
-//! SSRF guard (T-04-06): relay_url MUST be an `https://` URL whose host is NOT a
+//! SSRF guard: relay_url MUST be an `https://` URL whose host is NOT a
 //! loopback/link-local/private/internal address — both scheme and host are validated
 //! before any network I/O. Residual risk: DNS rebinding is not mitigated here.
 //!
-//! Timeout (T-04-08): reqwest client is built with a 10-second timeout.
+//! Timeout: reqwest client is built with a 10-second timeout.
 //!
 //! `MockRelayClient` is NOT `#[cfg(test)]`-gated: the integration test in `tests/`
-//! (plan 04-05) is a separate crate and cannot see `#[cfg(test)]` items
-//! (PATTERNS.md line 110).
+//! is a separate crate and cannot see `#[cfg(test)]` items.
 
 use std::time::Duration;
 
@@ -36,7 +35,7 @@ pub struct ReqwestRelayClient {
 }
 
 impl ReqwestRelayClient {
-    /// Build a client with a 10-second timeout (T-04-08 DoS mitigation).
+    /// Build a client with a 10-second timeout (DoS mitigation — bounds a hung relay).
     pub fn new() -> Result<Self, anyhow::Error> {
         Ok(Self {
             client: reqwest::Client::builder()
@@ -57,7 +56,7 @@ fn crawl_url(relay_url: &str) -> String {
     format!("{relay_url}/xrpc/com.atproto.sync.requestCrawl")
 }
 
-/// SSRF guard (T-04-06): validate the relay URL before any network I/O.
+/// SSRF guard: validate the relay URL before any network I/O.
 ///
 /// Enforces `https://` scheme AND rejects internal/loopback/link-local/private hosts
 /// (cloud metadata `169.254.169.254`, `127.0.0.1`, `localhost`, RFC1918 ranges, `.local`,
@@ -105,7 +104,7 @@ fn validate_relay_url(relay_url: &str) -> Result<(), XrpcError> {
 #[async_trait::async_trait]
 impl RelayClient for ReqwestRelayClient {
     async fn request_crawl(&self, relay_url: &str, pds_hostname: &str) -> Result<(), XrpcError> {
-        // SSRF guard (T-04-06): enforce https scheme AND block internal/private hosts.
+        // SSRF guard: enforce https scheme AND block internal/private hosts.
         validate_relay_url(relay_url)?;
         let url = crawl_url(relay_url);
         let body = serde_json::json!({ "hostname": pds_hostname });
@@ -193,7 +192,7 @@ mod tests {
         );
     }
 
-    /// Non-https relay URLs are rejected before any I/O (SSRF guard T-04-06).
+    /// Non-https relay URLs are rejected before any I/O (SSRF guard).
     #[tokio::test]
     async fn rejects_non_https_relay_url() {
         let client = ReqwestRelayClient::new().unwrap();

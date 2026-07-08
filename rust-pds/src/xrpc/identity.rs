@@ -1,7 +1,5 @@
 /// XRPC identity handlers: resolveHandle, /.well-known/atproto-did, /.well-known/did.json.
 ///
-/// Plan 03-03 implementation — replaces the W-4 stub body with real handler routes.
-///
 /// Route table:
 /// | Method | Path                                            | Handler             |
 /// |--------|-------------------------------------------------|---------------------|
@@ -20,11 +18,10 @@
 /// ## /.well-known/did.json behaviour for did:plc accounts
 ///
 /// The spec requires `/.well-known/did.json` only for `did:web` accounts. This server
-/// always provisions accounts with `did:plc` (Plan 03-02 decision). The did.json route
+/// defaults to provisioning accounts with `did:plc`. The did.json route
 /// therefore looks up the signing key stored under `did:web:<hostname>#signing`. If no
-/// such key exists, it returns 404. For did:web accounts seeded in tests (or in a future
-/// Phase 7 wizard where did:web is chosen at init time), the route serves the full
-/// did:web DID document. This matches the IDEN-04 success criterion.
+/// such key exists, it returns 404. For did:web accounts (seeded in tests, or created via
+/// the init wizard's did:web option), the route serves the full did:web DID document.
 use std::collections::HashMap;
 
 use atrium_crypto::keypair::Secp256k1Keypair;
@@ -115,8 +112,7 @@ pub async fn well_known_atproto_did(
 /// account has been provisioned), the route returns 404.
 ///
 /// The document is built by `identity::web::did_web_document` from the hostname,
-/// signing key, and pds_endpoint — no caller-supplied content is reflected
-/// (T-03-12 mitigation).
+/// signing key, and pds_endpoint — no caller-supplied content is reflected.
 pub async fn well_known_did_json(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, XrpcError> {
@@ -216,7 +212,7 @@ mod tests {
     // resolveHandle: known handle
     // -----------------------------------------------------------------------
 
-    /// XRPC-02 / IDEN-04: GET resolveHandle?handle=alice.pds.test → 200 + {"did":"..."}
+    /// GET resolveHandle?handle=alice.pds.test → 200 + {"did":"..."}
     #[tokio::test]
     async fn resolve_known_handle() {
         let (state, _tmp) = test_state().await;
@@ -251,7 +247,7 @@ mod tests {
     // resolveHandle: unknown handle
     // -----------------------------------------------------------------------
 
-    /// XRPC-02 / IDEN-04: GET resolveHandle?handle=nobody.pds.test → 404 + {"error":"HandleNotFound"}
+    /// GET resolveHandle?handle=nobody.pds.test → 404 + {"error":"HandleNotFound"}
     #[tokio::test]
     async fn resolve_unknown_handle() {
         let (state, _tmp) = test_state().await;
@@ -278,7 +274,7 @@ mod tests {
     // /.well-known/atproto-did
     // -----------------------------------------------------------------------
 
-    /// IDEN-04: GET /.well-known/atproto-did → 200, text/plain, bare DID string.
+    /// GET /.well-known/atproto-did → 200, text/plain, bare DID string.
     #[tokio::test]
     async fn well_known_atproto_did() {
         let (state, _tmp) = test_state().await;
@@ -324,7 +320,7 @@ mod tests {
     // /.well-known/did.json
     // -----------------------------------------------------------------------
 
-    /// IDEN-04: GET /.well-known/did.json → 200 + valid did:web DID document.
+    /// GET /.well-known/did.json → 200 + valid did:web DID document.
     ///
     /// Seeds a did:web account by storing the signing key under
     /// `did:web:pds.test#signing`. The handler builds the DID document from that

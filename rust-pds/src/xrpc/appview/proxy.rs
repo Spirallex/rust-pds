@@ -26,9 +26,9 @@ pub async fn proxy_handler(
     Path(method_suffix): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Response, XrpcError> {
-    let nsid = format!("app.bsky.{method_suffix}"); // RESEARCH Pitfall 2: full NSID
-    // Check the process-local signing-key cache before calling load_key (B4) —
-    // every proxied app.bsky.* GET is the read-path "Worst" case CONTEXT.md names.
+    let nsid = format!("app.bsky.{method_suffix}"); // lxm must be the full NSID, not the suffix
+    // Check the process-local signing-key cache before calling load_key — this is the
+    // hottest read path (every proxied app.bsky.* GET touches the signing key).
     let key_id = format!("{did}#signing");
     let signing = if let Some(cached) = state.signing_key_cache.get(&key_id) {
         Secp256k1Keypair::import(cached.as_slice())
@@ -64,7 +64,8 @@ pub async fn proxy_handler(
     Ok(resp.into_response())
 }
 
-/// Wildcard read proxy. Merge AFTER explicit routes (preferences come in Plan 03).
+/// Wildcard read proxy. Merge AFTER explicit routes (e.g. preferences) so axum
+/// selects the most specific route first.
 pub fn routes() -> Router<AppState> {
     Router::new().route("/xrpc/app.bsky.{*method}", get(proxy_handler))
 }
@@ -75,7 +76,7 @@ mod tests {
     use crate::xrpc::appview::client::{AppViewClient, MockAppViewClient};
     use crate::xrpc::appview::service_auth::mint_service_auth_jwt;
 
-    /// Guard against Pitfall 2: the lxm in the minted JWT MUST be the full NSID.
+    /// The lxm in the minted JWT MUST be the full NSID, not the route suffix.
     #[test]
     fn lxm_is_full_nsid() {
         use atrium_crypto::keypair::Secp256k1Keypair;

@@ -45,7 +45,7 @@ pub async fn get_preferences(
 /// POST /xrpc/app.bsky.actor.putPreferences
 ///
 /// Persists the preferences array for the authenticated DID. Returns 200 OK
-/// with an empty body on success (RESEARCH Pitfall 8).
+/// with an empty body on success.
 pub async fn put_preferences(
     State(state): State<AppState>,
     AccessAuth(did): AccessAuth,

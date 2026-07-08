@@ -1,17 +1,15 @@
 /// XRPC server handlers: describeServer, createSession, refreshSession, createAccount.
 ///
-/// Plan 03-02: Full implementation — AppState is wired, all four handlers are live.
-///
-/// createAccount gate (ACCT-01/02):
+/// createAccount gate:
 ///   - First account (count_accounts == 0) claims the server with no invite.
 ///   - Subsequent accounts require a valid unused invite code UNLESS
 ///     `AppState::open_registration` is true.
 ///
 /// DID method selection rule:
-///   - Default (and only mode in this plan): did:plc via the injected `PlcClient`.
-///   - did:web can be derived from `state.hostname` but is NOT automatically
-///     selected here; a future plan may add a `did_method` config field.
-///     For now, createAccount ALWAYS uses did:plc so tests work with MockPlcClient.
+///   - Default: did:plc via the injected `PlcClient`.
+///   - did:web is used when the caller supplies a did:web DID that resolves
+///     successfully (see `create_account_inner`'s did resolution step);
+///     otherwise createAccount uses did:plc so tests work with MockPlcClient.
 ///
 /// Empty-repo-init decision:
 ///   - LAZY. createAccount persists only the account row + two encrypted keys.
@@ -264,7 +262,7 @@ pub struct CreateAccountInput {
     pub email: Option<String>,
     pub password: Option<String>,
     pub invite_code: Option<String>,
-    pub did: Option<String>, // did:web DID: resolved + stored (IDEN-02); else did:plc is derived
+    pub did: Option<String>, // did:web DID: resolved + stored; else did:plc is derived
     pub recovery_key: Option<String>, // ignored — rotation key is the recovery key
 }
 
@@ -331,7 +329,7 @@ pub async fn create_account(
 /// 8. Issue access + refresh JWTs.
 ///
 /// Called by the axum handler via `create_account`, and directly by the
-/// `rust-pds init` wizard (Plan 04) to create the first account in-process.
+/// `stelyph init` wizard to create the first account in-process.
 pub async fn create_account_inner(
     state: &AppState,
     input: CreateAccountInput,
@@ -361,7 +359,7 @@ pub async fn create_account_inner(
 
     // Step 4: the invite gate.
     //
-    // WR-02: To prevent a TOCTOU race where two concurrent first registrations
+    // To prevent a TOCTOU race where two concurrent first registrations
     // both see count == 0 and skip the invite check, we determine invite need
     // using a preliminary reader count, but the ACTUAL first-account detection
     // is enforced inside `count_and_insert_account` which re-checks the count
@@ -396,12 +394,12 @@ pub async fn create_account_inner(
 
     // Step 6: register the account's DID.
     //
-    // IDEN-02: if the caller supplied a did:web DID, resolve it (the backend
-    // must serve a matching document — D17-B) and store THAT DID instead of
-    // deriving a did:plc. Resolution failure is a typed error, NEVER a silent
-    // downgrade to did:plc (T-05-03). Any other input (absent, or a non-did:web
-    // did) keeps the unchanged did:plc path so Stelyph's own accounts and
-    // existing tests are unaffected (T-05-04).
+    // If the caller supplied a did:web DID, resolve it (the target host must
+    // serve a matching document) and store THAT DID instead of deriving a
+    // did:plc. Resolution failure is a typed error, NEVER a silent downgrade
+    // to did:plc. Any other input (absent, or a non-did:web did) keeps the
+    // unchanged did:plc path so Stelyph's own accounts and existing tests are
+    // unaffected.
     let did = match input.did.as_deref() {
         Some(d) if d.starts_with("did:web:") => {
             let doc = state
@@ -431,7 +429,7 @@ pub async fn create_account_inner(
     };
 
     // Step 7: persist account + encrypted keys.
-    // WR-01: require a non-empty password of at least 8 characters. Never hash the
+    // Require a non-empty password of at least 8 characters. Never hash the
     // empty string or a trivially short credential.
     let password = input
         .password
@@ -450,7 +448,7 @@ pub async fn create_account_inner(
         .await
         .map_err(|e| XrpcError::Internal(anyhow::anyhow!("password hash task panicked: {e}")))??;
 
-    // WR-02: Use count_and_insert_account to atomically count and insert in a
+    // Use count_and_insert_account to atomically count and insert in a
     // single BEGIN IMMEDIATE writer transaction. This eliminates the TOCTOU race
     // for concurrent first-account registrations.
     let count_before = state
@@ -458,7 +456,7 @@ pub async fn create_account_inner(
         .count_and_insert_account(&did, &handle, input.email.as_deref(), &phc)
         .await?;
 
-    // WR-02: If we thought we were the first account (preliminary_n == 0) but
+    // If we thought we were the first account (preliminary_n == 0) but
     // the atomic count says there was already an account (count_before > 0), and
     // we're not in open_registration mode, we lost the race. Reject to avoid
     // inserting a second "first account" without an invite.
@@ -1075,10 +1073,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // WR-01: password validation
+    // password validation
     // -----------------------------------------------------------------------
 
-    /// WR-01: createAccount with an empty password must be rejected with InvalidRequest.
+    /// createAccount with an empty password must be rejected with InvalidRequest.
     #[tokio::test]
     async fn create_account_empty_password_rejected() {
         let (state, _tmp) = test_state().await;
@@ -1093,7 +1091,7 @@ mod tests {
         assert_eq!(json["error"], "InvalidRequest");
     }
 
-    /// WR-01: createAccount with a missing password field must be rejected with InvalidRequest.
+    /// createAccount with a missing password field must be rejected with InvalidRequest.
     #[tokio::test]
     async fn create_account_missing_password_rejected() {
         let (state, _tmp) = test_state().await;
@@ -1108,7 +1106,7 @@ mod tests {
         assert_eq!(json["error"], "InvalidRequest");
     }
 
-    /// WR-01: createAccount with a password shorter than 8 chars must be rejected.
+    /// createAccount with a password shorter than 8 chars must be rejected.
     #[tokio::test]
     async fn create_account_short_password_rejected() {
         let (state, _tmp) = test_state().await;
@@ -1124,10 +1122,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // did:web createAccount (IDEN-02)
+    // did:web createAccount
     // -----------------------------------------------------------------------
 
-    /// IDEN-02: createAccount with a caller-supplied did:web DID and a resolver
+    /// createAccount with a caller-supplied did:web DID and a resolver
     /// that succeeds must store and return THAT did:web DID, not a derived did:plc.
     #[tokio::test]
     async fn create_account_with_did_web_resolves_and_stores_it() {
@@ -1147,7 +1145,7 @@ mod tests {
         assert_eq!(json["did"], "did:web:pds.test:devices:d001");
     }
 
-    /// IDEN-02/T-05-03: createAccount with a did:web DID that fails to resolve
+    /// createAccount with a did:web DID that fails to resolve
     /// must reject with UnresolvableDid — NEVER silently fall back to did:plc.
     #[tokio::test]
     async fn create_account_with_unresolvable_did_web_is_rejected() {
@@ -1170,7 +1168,7 @@ mod tests {
         assert_eq!(json["error"], "UnresolvableDid");
     }
 
-    /// T-05-04: createAccount with no `did` field is unaffected by the did:web
+    /// createAccount with no `did` field is unaffected by the did:web
     /// branch — the existing did:plc derivation path still runs (regression guard).
     #[tokio::test]
     async fn create_account_without_did_still_derives_did_plc() {

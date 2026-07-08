@@ -1,7 +1,7 @@
 //! Production `PlcClient` implementation using `reqwest`.
 //!
 //! POSTs the signed PLC genesis op as JSON to `https://plc.directory/{did}`.
-//! Uses a 10-second timeout (Pitfall 6 mitigation — T-03-09). Server-only: kept
+//! Uses a 10-second timeout (bounds a hung or unresponsive PLC directory). Server-only: kept
 //! out of `stelyph-core` so the device build does not pull in reqwest.
 
 use stelyph_core::error::CoreError;
@@ -47,7 +47,7 @@ impl PlcClient for ReqwestPlcClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            // WR-05: cap body read to 256 bytes to prevent OOM on adversarial or
+            // Cap body read to 256 bytes to prevent OOM on adversarial or
             // malfunctioning PLC directory responses. The body is not included in
             // the error returned to the caller (Internal suppresses inner detail).
             let body = resp.text().await.unwrap_or_default();

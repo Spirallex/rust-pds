@@ -1,8 +1,7 @@
 /// XRPC repo handlers: createRecord, getRepo, listRecords.
 ///
-/// Plan 03-04: Full implementation — three lexicon endpoints wired to the Phase 2
-/// repo write path (RepoWriter) and the atrium-repo read path (Repository::export,
-/// MST entries_prefixed).
+/// Three lexicon endpoints wired to the repo write path (RepoWriter) and the
+/// atrium-repo read path (Repository::export, MST entries_prefixed).
 ///
 /// Route table:
 /// | Method | Path                                             | Handler         |
@@ -11,12 +10,12 @@
 /// | GET    | /xrpc/com.atproto.sync.getRepo                   | get_repo        |
 /// | GET    | /xrpc/com.atproto.repo.listRecords               | list_records    |
 ///
-/// ## Threat mitigations (03-04 threat model)
-/// - T-03-13 (Elevation of Privilege): createRecord asserts input.repo == authenticated DID.
+/// ## Threat mitigations
+/// - Elevation of Privilege: createRecord asserts input.repo == authenticated DID.
 ///   AccessAuth extractor enforces access scope (refresh tokens rejected → InvalidToken).
-/// - T-03-14 (Spoofing): AccessAuth extractor validates HS256 JWT and access scope.
-/// - T-03-15 (Tampering): getRepo sets explicit Content-Type: application/vnd.ipld.car.
-/// - T-03-16 (DoS): listRecords limit clamped to 1..=100 (default 50).
+/// - Spoofing: AccessAuth extractor validates HS256 JWT and access scope.
+/// - Tampering: getRepo sets explicit Content-Type: application/vnd.ipld.car.
+/// - DoS: listRecords limit clamped to 1..=100 (default 50).
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -71,25 +70,25 @@ pub struct CreateRecordOutput {
 /// Authenticated write path. The AccessAuth extractor enforces access scope —
 /// refresh tokens are rejected automatically with 401 InvalidToken.
 ///
-/// Ownership check: input.repo must equal the authenticated DID (T-03-13).
+/// Ownership check: input.repo must equal the authenticated DID.
 /// The signing key is loaded from the encrypted key store, a RepoWriter is
 /// constructed, and `create_record` is called to write the record into the
-/// account's MST-backed repo. The lazy empty-repo init (Plan 03-02 decision)
-/// fires here on the first call (RepoWriter::create_record handles the
-/// "no existing root" case via Repository::create).
+/// account's MST-backed repo. The lazy empty-repo init fires here on the first
+/// call (RepoWriter::create_record handles the "no existing root" case via
+/// Repository::create).
 pub async fn create_record(
     State(state): State<AppState>,
     AccessAuth(did): AccessAuth,
     Json(input): Json<CreateRecordInput>,
 ) -> Result<Json<CreateRecordOutput>, XrpcError> {
-    // T-03-13: only allow writing to the caller's own repo.
+    // Only allow writing to the caller's own repo.
     if input.repo != did {
         return Err(XrpcError::InvalidRequest(
             "repo must match the authenticated DID".into(),
         ));
     }
 
-    // WR-04: validate collection (NSID format) and rkey (if provided) before
+    // Validate collection (NSID format) and rkey (if provided) before
     // any key loading or expensive operations.
     validate_collection(&input.collection)?;
     if let Some(ref rkey) = input.rkey {
@@ -233,13 +232,13 @@ pub struct ApplyWritesOutput {
 /// chain stays linear and valid for federation; the only deviation from the
 /// lexicon is that a batch produces N commits rather than one.
 ///
-/// Ownership check: input.repo must equal the authenticated DID (T-03-13).
+/// Ownership check: input.repo must equal the authenticated DID.
 pub async fn apply_writes(
     State(state): State<AppState>,
     AccessAuth(did): AccessAuth,
     Json(input): Json<ApplyWritesInput>,
 ) -> Result<Json<ApplyWritesOutput>, XrpcError> {
-    // T-03-13: only allow writing to the caller's own repo.
+    // Only allow writing to the caller's own repo.
     if input.repo != did {
         return Err(XrpcError::InvalidRequest(
             "repo must match the authenticated DID".into(),
@@ -944,7 +943,8 @@ fn tid_from_micros(us: u64) -> String {
 /// GET /xrpc/com.atproto.sync.getRepo?did=<did>
 ///
 /// Export the repository as a CARv1 archive with Content-Type
-/// `application/vnd.ipld.car` (T-03-15 mitigation — Pitfall 5).
+/// `application/vnd.ipld.car` explicitly set (a generic client must not have
+/// to sniff the body to know how to parse it).
 ///
 /// Uses iroh-car 0.5.1 CarWriter (API confirmed from source):
 /// - `CarHeader::new_v1(roots)` → header
@@ -1001,7 +1001,7 @@ pub async fn get_repo(
         .await
         .map_err(|e| XrpcError::Internal(anyhow::anyhow!("CarWriter::finish failed: {e}")))?;
 
-    // Return with explicit Content-Type header (T-03-15 / Pitfall 5).
+    // Return with explicit Content-Type header.
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/vnd.ipld.car")],
         buf,
@@ -1039,7 +1039,7 @@ pub struct ListRecordsOutput {
 ///
 /// Enumerate records in a collection from the MST.
 ///
-/// - limit: clamped to 1..=100, default 50 (T-03-16 mitigation).
+/// - limit: clamped to 1..=100, default 50 (DoS mitigation — bounds page size).
 /// - cursor: lexicographic resume key. Records with key <= cursor are skipped.
 /// - A cursor is returned if a full page was returned (indicating more records may exist).
 ///
@@ -1048,7 +1048,7 @@ pub async fn list_records(
     State(state): State<AppState>,
     Query(params): Query<ListRecordsParams>,
 ) -> Result<Json<ListRecordsOutput>, XrpcError> {
-    // Clamp limit to 1..=100, default 50 (T-03-16).
+    // Clamp limit to 1..=100, default 50.
     let limit = params.limit.map(|l| l.clamp(1, 100) as usize).unwrap_or(50);
 
     let did = &params.repo;
@@ -1343,7 +1343,7 @@ mod tests {
         );
     }
 
-    /// T-03-14: createRecord with a REFRESH-scoped token is rejected with 401 InvalidToken.
+    /// createRecord with a REFRESH-scoped token is rejected with 401 InvalidToken.
     #[tokio::test]
     async fn create_record_rejects_refresh_token() {
         let (state, _tmp) = test_state().await;
@@ -1376,10 +1376,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // WR-04: rkey and collection validation
+    // rkey and collection validation
     // -----------------------------------------------------------------------
 
-    /// WR-04: createRecord with rkey containing '/' must be rejected with 400 InvalidRequest.
+    /// createRecord with rkey containing '/' must be rejected with 400 InvalidRequest.
     #[tokio::test]
     async fn create_record_rkey_with_slash_rejected() {
         let (state, _tmp) = test_state().await;
@@ -1402,7 +1402,7 @@ mod tests {
         assert_eq!(json["error"], "InvalidRequest");
     }
 
-    /// WR-04: createRecord with empty rkey must be rejected.
+    /// createRecord with empty rkey must be rejected.
     #[tokio::test]
     async fn create_record_empty_rkey_rejected() {
         let (state, _tmp) = test_state().await;
@@ -1425,7 +1425,7 @@ mod tests {
         assert_eq!(json["error"], "InvalidRequest");
     }
 
-    /// WR-04: createRecord with invalid collection (no dots) must be rejected.
+    /// createRecord with invalid collection (no dots) must be rejected.
     #[tokio::test]
     async fn create_record_invalid_collection_rejected() {
         let (state, _tmp) = test_state().await;
@@ -1447,7 +1447,7 @@ mod tests {
         assert_eq!(json["error"], "InvalidRequest");
     }
 
-    /// T-03-14: createRecord with no Authorization header is rejected with 401 AuthRequired.
+    /// createRecord with no Authorization header is rejected with 401 AuthRequired.
     #[tokio::test]
     async fn create_record_requires_auth() {
         let (state, _tmp) = test_state().await;
@@ -1521,7 +1521,7 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK, "getRepo must return 200");
 
-        // Assert Content-Type is exactly "application/vnd.ipld.car" (T-03-15).
+        // Assert Content-Type is exactly "application/vnd.ipld.car".
         let ct = resp
             .headers()
             .get("content-type")
@@ -2010,7 +2010,7 @@ mod tests {
         prev: Option<cid::Cid>,
     }
 
-    /// B2 (T-04-01): two concurrent createRecord calls for the SAME DID must not
+    /// Two concurrent createRecord calls for the SAME DID must not
     /// fork the repo history. Builds ONE shared AppState (with the did_locks map),
     /// then fires two concurrent create_record calls for the same DID — each call
     /// builds its OWN RepoWriter through AppState the way the real handler does
@@ -2144,7 +2144,7 @@ mod tests {
         );
     }
 
-    /// B4 (T-04-02/T-04-03): a signing-key-touching operation populates
+    /// A signing-key-touching operation populates
     /// `state.signing_key_cache`, and a second key-touching operation for the
     /// same DID reuses the cached entry instead of re-running the argon2id KDF.
     #[tokio::test]
