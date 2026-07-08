@@ -186,3 +186,51 @@ fn generate_invite_code() -> String {
         .to_ascii_lowercase();
     format!("stelyph-{}", &enc[..10])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B6 regression: a `--db-path` that does not exist must error with an
+    /// actionable message *before* any store is opened, and must leave no
+    /// database (or WAL/SHM) file behind. Guards against `SqliteStore::open`'s
+    /// create-if-missing behavior silently producing a decoy empty DB.
+    #[tokio::test]
+    async fn admin_missing_db_path_errors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("does-not-exist.db");
+        let db_path_str = db_path.to_str().unwrap().to_string();
+
+        assert!(
+            !db_path.exists(),
+            "precondition: db path must not exist before the call"
+        );
+
+        let args = AdminArgs {
+            db_path: db_path_str,
+            command: AdminCommand::ListAccounts,
+        };
+
+        let result = run(args).await;
+
+        assert!(result.is_err(), "expected an error for a missing db-path");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("did you mean to point --db-path"),
+            "error message did not contain the expected guidance: {err_msg}"
+        );
+
+        assert!(
+            !db_path.exists(),
+            "no database file should have been created at the missing path"
+        );
+        assert!(
+            !tmp.path().join("does-not-exist.db-wal").exists(),
+            "no WAL file should have been created at the missing path"
+        );
+        assert!(
+            !tmp.path().join("does-not-exist.db-shm").exists(),
+            "no SHM file should have been created at the missing path"
+        );
+    }
+}
