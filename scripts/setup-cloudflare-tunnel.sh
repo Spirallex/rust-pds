@@ -2,6 +2,10 @@
 #
 # Cloudflare Tunnel setup for stelyph (bring-your-own Cloudflare account via SSO).
 #
+# If `cloudflared tunnel login` fails to complete (broken local OAuth callback), use
+# scripts/setup-cloudflare-tunnel-token.sh instead — same result via a scoped API
+# token. See docs/deploy-cloudflare-tunnel-token.md.
+#
 # Stands up a named Cloudflare Tunnel in front of a locally-running stelyph so the
 # PDS is reachable at a public hostname over HTTPS with no bindable :443 — Cloudflare
 # terminates TLS and forwards to stelyph on localhost. WebSocket upgrade (the firehose)

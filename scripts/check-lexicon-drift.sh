@@ -45,7 +45,7 @@ fi
 # Newest published version from crates.io.
 newest="$(
   curl -fsSL "https://crates.io/api/v1/crates/$CRATE" \
-    -H "User-Agent: stelyph-lexicon-drift-check (https://github.com/spirallex/stelyph)" \
+    -H "User-Agent: stelyph-lexicon-drift-check (https://github.com/Spirallex/rust-pds)" \
     | python3 -c "import sys,json; print(json.load(sys.stdin)['crate']['newest_version'])"
 )"
 
