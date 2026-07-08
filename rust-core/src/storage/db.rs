@@ -1113,4 +1113,46 @@ mod tests {
             .unwrap();
         assert_eq!(uses, 5);
     }
+
+    /// B1: a forced mid-transaction failure inside `count_and_insert_account`
+    /// (duplicate `did` violates the PRIMARY KEY constraint) must NOT leave the
+    /// singleton writer connection stuck with an open transaction. A subsequent,
+    /// independent write on the same store must still succeed.
+    ///
+    /// Mirrors `block_store.rs::tests::test_atomic_rollback`'s two-phase structure:
+    /// phase 1 forces an `Err`, phase 2 proves the writer is still usable.
+    #[tokio::test]
+    async fn txn_leak_writer_stays_usable() {
+        let (store, _tmp) = SqliteStore::open_in_memory().await.expect("open failed");
+
+        // Phase 1: insert one account, then force a mid-transaction failure by
+        // inserting a SECOND account with the same `did` (PRIMARY KEY violation).
+        // With the old raw begin/commit-string implementation this would leave
+        // an open transaction on the writer connection because the early `?`
+        // error skips the commit statement with no rollback ever issued.
+        store
+            .count_and_insert_account("did:plc:dup", "first.test", None, "phc-1")
+            .await
+            .expect("first insert must succeed");
+
+        let result = store
+            .count_and_insert_account("did:plc:dup", "second.test", None, "phc-2")
+            .await;
+        assert!(
+            result.is_err(),
+            "duplicate did must violate the PRIMARY KEY constraint and return Err"
+        );
+
+        // Phase 2: an independent write on the same store (different did/handle)
+        // must still succeed — proving the writer connection was NOT left stuck
+        // with an open transaction after the phase-1 failure.
+        let count_before = store
+            .count_and_insert_account("did:plc:fresh", "fresh.test", None, "phc-3")
+            .await
+            .expect("independent write after a forced failure must still succeed");
+        assert_eq!(
+            count_before, 1,
+            "count_before should reflect the one account inserted in phase 1"
+        );
+    }
 }
