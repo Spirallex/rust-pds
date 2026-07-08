@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 description = "Device-portable AT Protocol core: signed repo/MST engine, crypto, dag-cbor/CAR, and storage — no HTTP server. Compiles for aarch64-apple-ios."
-repository = "https://github.com/spirallex/stelyph"
+repository = "https://github.com/Spirallex/rust-pds"
 
 [lib]
 name = "stelyph_core"
