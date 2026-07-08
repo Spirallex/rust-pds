@@ -20,6 +20,8 @@
 ///     at account-creation time for accounts that may never post.
 ///   - The plan's success criterion ("account created + can post") is satisfied by
 ///     the createRecord round-trip in Plan 03-04.
+use std::sync::Arc;
+
 use atrium_crypto::keypair::Secp256k1Keypair;
 use axum::extract::{Query, State};
 use axum::Json;
@@ -95,7 +97,14 @@ pub async fn create_session(
         .ok_or_else(|| XrpcError::InvalidRequest("invalid identifier or password".into()))?;
 
     // Verify password. Wrong password → same 401 (no detail leakage).
-    if !verify_password(&input.password, &phc)? {
+    // Runs off the async runtime via spawn_blocking so a burst of login attempts
+    // cannot saturate tokio worker threads with the argon2id KDF (B4).
+    let password = input.password.clone();
+    let phc_owned = phc.clone();
+    let verified = tokio::task::spawn_blocking(move || verify_password(&password, &phc_owned))
+        .await
+        .map_err(|e| XrpcError::Internal(anyhow::anyhow!("password verify task panicked: {e}")))??;
+    if !verified {
         return Err(XrpcError::InvalidRequest(
             "invalid identifier or password".into(),
         ));
@@ -210,12 +219,22 @@ pub async fn get_service_auth(
 ) -> Result<Json<GetServiceAuthOutput>, XrpcError> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    // Check the process-local signing-key cache before calling load_key (B4) —
+    // getServiceAuth is the read-path "Worst" case CONTEXT.md names explicitly.
     let key_id = format!("{did}#signing");
-    let key_bytes = load_key(&state.store, &key_id, &state.key_passphrase)
-        .await
-        .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to load signing key: {e}")))?;
-    let signing = Secp256k1Keypair::import(&key_bytes)
-        .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}")))?;
+    let signing = if let Some(cached) = state.signing_key_cache.get(&key_id) {
+        Secp256k1Keypair::import(cached.as_slice())
+            .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}")))?
+    } else {
+        let key_bytes = load_key(&state.store, &key_id, &state.key_passphrase)
+            .await
+            .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to load signing key: {e}")))?;
+        state
+            .signing_key_cache
+            .insert(key_id.clone(), Arc::new(zeroize::Zeroizing::new(key_bytes.clone())));
+        Secp256k1Keypair::import(&key_bytes)
+            .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}")))?
+    };
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -424,7 +443,12 @@ pub async fn create_account_inner(
             "password must be at least 8 characters".into(),
         ));
     }
-    let phc = hash_password(password)?;
+    // Runs off the async runtime via spawn_blocking so a burst of account creations
+    // cannot saturate tokio worker threads with the argon2id KDF (B4).
+    let password_owned = password.to_string();
+    let phc = tokio::task::spawn_blocking(move || hash_password(&password_owned))
+        .await
+        .map_err(|e| XrpcError::Internal(anyhow::anyhow!("password hash task panicked: {e}")))??;
 
     // WR-02: Use count_and_insert_account to atomically count and insert in a
     // single BEGIN IMMEDIATE writer transaction. This eliminates the TOCTOU race
