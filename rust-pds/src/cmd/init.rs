@@ -392,13 +392,10 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
     use crate::identity::plc::ReqwestPlcClient;
     use crate::storage::SqliteStore;
 
-    // Resolve config path for READING an existing config (default stelyph.toml,
-    // falling back to a legacy config file if present — read-only compat).
+    // Resolve config path for READING an existing config (default stelyph.toml).
     let read_config_path = crate::cmd::resolve_config_path(config.as_deref());
 
-    // Resolve config path for WRITING at the end of the wizard. Unlike the read path,
-    // this always targets the new stelyph.toml name when no explicit --config was given —
-    // a stale legacy config file is never silently written over with the old name.
+    // Resolve config path for WRITING at the end of the wizard (same default as the read path).
     let config_path = config
         .clone()
         .unwrap_or_else(|| PathBuf::from("stelyph.toml"));

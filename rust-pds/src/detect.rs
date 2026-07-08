@@ -5,11 +5,11 @@
 //! `Standalone`, `Proxy`, or `Tunnel` — never asserts. `--mode` always overrides upstream.
 //!
 //! `MockExternalIpClient` is NOT `#[cfg(test)]`-gated: the wizard integration test in
-//! `tests/` is a separate crate and cannot see `#[cfg(test)]` items (PATTERNS.md §detect.rs).
+//! `tests/` is a separate crate and cannot see `#[cfg(test)]` items.
 //!
 //! Security: the echo endpoint (`api.ipify.org`) is HARDCODED — not operator/user-configurable
-//! — so there is no SSRF surface (threat model T-7-02-01). The returned IP is treated as
-//! ADVISORY only (T-7-02-02): it gates no auth/access and never selects a bind target.
+//! — so there is no SSRF surface. The returned IP is treated as ADVISORY only: it gates
+//! no auth/access and never selects a bind target.
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -53,7 +53,7 @@ impl Default for ReqwestExternalIpClient {
 #[async_trait::async_trait]
 impl ExternalIpClient for ReqwestExternalIpClient {
     async fn fetch_ip(&self) -> Result<IpAddr, anyhow::Error> {
-        // HARDCODED endpoint — not operator/user-configurable → no SSRF surface (T-7-02-01).
+        // HARDCODED endpoint — not operator/user-configurable → no SSRF surface.
         let txt = self
             .client
             .get("https://api.ipify.org")
@@ -133,10 +133,10 @@ pub enum Recommendation {
     Tunnel,
 }
 
-/// ADVISORY mode detection (threat model §Pattern 4).
+/// ADVISORY mode detection.
 ///
 /// `bindable` is injected so tests do not need root (pass `can_bind_443()` in production).
-/// The echoed IP is treated as advisory only (T-7-02-02): it gates no auth/access and never
+/// The echoed IP is treated as advisory only: it gates no auth/access and never
 /// selects a bind target. `--mode` always overrides this recommendation upstream.
 ///
 /// Decision logic (fail-safe toward proxy/tunnel):

@@ -1,4 +1,4 @@
-//! `rust-pds import-keys` — import keys from a portable blob (ACCT-05 surface).
+//! `stelyph import-keys` — import keys from a portable blob.
 //!
 //! Wraps `crate::storage::keys::import_keys` with a CLI-friendly interface:
 //! - `--did`:    the DID to import keys under (required; overrides embedded id in blob)
@@ -10,7 +10,7 @@
 //! absent, only the signing slot is imported (rotation import is best-effort).
 //!
 //! # Security
-//! - Passphrase is read via `rpassword` (non-echoing) — NEVER logged (T-7-04-01).
+//! - Passphrase is read via `rpassword` (non-echoing) — NEVER logged.
 //! - Wrong passphrase → `StorageError::Crypto` propagates via `?` (non-zero exit).
 //! - The passphrase is NEVER logged or written to disk.
 
@@ -31,7 +31,7 @@ pub struct ImportKeysArgs {
 }
 
 pub async fn run(args: ImportKeysArgs) -> anyhow::Result<()> {
-    // Non-echoing passphrase prompt (T-7-04-01 — passphrase never logged).
+    // Non-echoing passphrase prompt — passphrase never logged.
     let passphrase = rpassword::prompt_password("Key passphrase: ")?;
 
     let store = crate::storage::SqliteStore::open(&args.db_path)

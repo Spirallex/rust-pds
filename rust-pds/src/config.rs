@@ -1,7 +1,7 @@
-//! PdsConfig: TOML-backed configuration for rust-pds.
+//! PdsConfig: TOML-backed configuration for stelyph.
 //!
 //! Secrets (jwt_secret, key_passphrase) are intentionally absent from this struct —
-//! they are never written to disk (T-7-01-02).
+//! they are never written to disk.
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, PartialEq)]
 pub struct PdsConfig {
@@ -19,7 +19,7 @@ pub struct PdsConfig {
     /// Compose-network plain-HTTP dev mode for the did:web resolver.
     /// NEVER set true in production — resolution must use HTTPS in prod.
     pub did_web_http_dev: Option<bool>,
-    // NO jwt_secret / key_passphrase — secrets never written to disk (T-7-01-02)
+    // NO jwt_secret / key_passphrase — secrets never written to disk
 }
 
 impl PdsConfig {
@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn load_or_default_with_absent_path_returns_default() {
         let cfg = PdsConfig::load_or_default(Some(std::path::Path::new(
-            "/nonexistent/path/rust-pds.toml",
+            "/nonexistent/path/stelyph.toml",
         )))
         .unwrap();
         assert_eq!(cfg, PdsConfig::default(), "absent file must return default");

@@ -70,8 +70,8 @@ fn looks_like_public_hostname(host: &str) -> bool {
 pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()> {
     // 1. Load config file (file < env < flag precedence).
     // An explicit --config/PDS_CONFIG that doesn't exist is a hard error;
-    // the resolved default (stelyph.toml, falling back to a legacy config file) stays
-    // non-fatal when absent so a fresh install without any config still boots on flags/env.
+    // the resolved default (stelyph.toml) stays non-fatal when absent so a fresh
+    // install without any config still boots on flags/env.
     let cfg = match config.as_deref() {
         Some(explicit) => PdsConfig::load(explicit)?,
         None => {

@@ -1,4 +1,4 @@
-//! `rust-pds export-keys` — export encrypted signing keys to a portable blob (ACCT-05 surface).
+//! `stelyph export-keys` — export encrypted signing keys to a portable blob.
 //!
 //! Wraps `crate::storage::keys::export_keys` with a CLI-friendly interface:
 //! - `--did`:    the DID whose keys to export (required)
@@ -9,7 +9,7 @@
 //! Signing slot → `--output`; rotation slot → `<output>.rotation`.
 //!
 //! # Security
-//! - Passphrase is read via `rpassword` (non-echoing) — NEVER logged (T-7-04-01).
+//! - Passphrase is read via `rpassword` (non-echoing) — NEVER logged.
 //! - A wrong passphrase causes `StorageError::Crypto` which propagates via `?` and
 //!   is printed as a human-readable error by the main dispatcher (non-zero exit).
 //! - The passphrase is NEVER written to disk or included in error messages.
@@ -30,7 +30,7 @@ pub struct ExportKeysArgs {
 }
 
 pub async fn run(args: ExportKeysArgs) -> anyhow::Result<()> {
-    // Non-echoing passphrase prompt (T-7-04-01 — passphrase never logged).
+    // Non-echoing passphrase prompt — passphrase never logged.
     let passphrase = rpassword::prompt_password("Key passphrase: ")?;
 
     let store = crate::storage::SqliteStore::open(&args.db_path)

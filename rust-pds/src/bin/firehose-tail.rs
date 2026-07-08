@@ -1,4 +1,4 @@
-//! firehose-tail — demo consumer binary for the rust-pds firehose.
+//! firehose-tail — demo consumer binary for the stelyph firehose.
 //!
 //! Connects to a `ws://` subscribeRepos endpoint, decodes #commit frames,
 //! verifies each commit's signature, and prints one human-readable line per commit.
@@ -86,7 +86,7 @@ async fn main() {
         None => url.clone(),
     };
 
-    // Connect (Pitfall 7: connect_async requires a tokio runtime — #[tokio::main] above).
+    // Connect (connect_async requires a tokio runtime — #[tokio::main] above).
     let (mut ws, _) = tokio_tungstenite::connect_async(&connect_url)
         .await
         .unwrap_or_else(|e| {
@@ -101,9 +101,9 @@ async fn main() {
         match msg {
             Ok(Message::Binary(bytes)) => {
                 match decode_commit_frame(&bytes) {
-                    // Non-#commit frames (error frames, #identity, etc.) — skip silently (T-06-05).
+                    // Non-#commit frames (error frames, #identity, etc.) — skip silently.
                     Err(TailError::NotCommit) => continue,
-                    // Malformed CBOR — print and continue, never panic (T-06-05).
+                    // Malformed CBOR — print and continue, never panic.
                     Err(e) => {
                         eprintln!("decode error: {e:?}");
                         continue;
@@ -122,7 +122,7 @@ async fn main() {
                             Err(e) => Err(format!("resolve: {e}")),
                         };
 
-                        // ✓/✗ must be unambiguous (T-06-06: ✓ only when sig_res is Ok).
+                        // ✓/✗ must be unambiguous — ✓ only when sig_res is Ok.
                         let sig_ok = sig_res.is_ok();
                         let mark = if sig_ok { "✓" } else { "✗" };
                         let mine = if Some(body.repo.as_str()) == demo_did.as_deref() {
@@ -161,7 +161,7 @@ async fn main() {
             }
             // Server closed the connection or we got a transport error — exit cleanly.
             Ok(Message::Close(_)) | Err(_) => break,
-            // Pitfall 5: tokio-tungstenite surfaces Ping/Pong/Text/Frame at the app layer;
+            // tokio-tungstenite surfaces Ping/Pong/Text/Frame at the app layer;
             // handle all of them with continue so the loop never terminates on them.
             Ok(Message::Ping(_))
             | Ok(Message::Pong(_))
@@ -182,8 +182,8 @@ async fn main() {
 ///           verificationMethod entry with id == "{did}#atproto", read publicKeyMultibase,
 ///           return "did:key:{multibase}".
 ///
-/// All network / parse failures map to Err(String) — the caller prints ✗ and continues
-/// (T-06-08: resolve_did_key must not panic on bad JSON).
+/// All network / parse failures map to Err(String) — the caller prints ✗ and continues;
+/// resolve_did_key must not panic on bad JSON.
 async fn resolve_did_key(repo: &str) -> Result<String, String> {
     if repo.starts_with("did:plc:") {
         resolve_plc(repo).await
