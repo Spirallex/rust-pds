@@ -112,11 +112,27 @@ pub struct InitArgs {
 // when stdin is not a terminal, e.g. in Docker/CI/pipes).
 // ---------------------------------------------------------------------------
 
-/// STUB (RED phase — B5 not yet implemented): always errors, ignoring both
-/// `explicit` and `is_tty`. Replaced with the real flag/env/TTY-guard logic
-/// in the GREEN commit.
-fn resolve_password(_explicit: Option<String>, _is_tty: bool) -> anyhow::Result<String> {
-    anyhow::bail!("resolve_password: not yet implemented (B5 stub)")
+/// Resolve the admin password: explicit `--password`/`PDS_ADMIN_PASSWORD` (clap already
+/// folds the env var into `explicit` via the `env = "PDS_ADMIN_PASSWORD"` attribute; the
+/// direct `std::env::var` read below is a defensive fallback for callers that construct
+/// `InitArgs` without going through clap, e.g. tests) wins outright — no prompt. Only when
+/// no value was supplied at all do we fall back to an interactive prompt, and only if a
+/// terminal is actually available; otherwise we fail with an actionable error instead of
+/// letting `rpassword::prompt_password` crash on a missing `/dev/tty` (`Device not
+/// configured`) under Docker/CI/pipes.
+fn resolve_password(explicit: Option<String>, is_tty: bool) -> anyhow::Result<String> {
+    match explicit.or_else(|| std::env::var("PDS_ADMIN_PASSWORD").ok()) {
+        Some(p) => Ok(p),
+        None => {
+            if !is_tty {
+                anyhow::bail!(
+                    "init requires a terminal to prompt for a password; pass --password or set \
+                     PDS_ADMIN_PASSWORD to run non-interactively"
+                );
+            }
+            Ok(rpassword::prompt_password("Admin password (min 8 chars): ")?)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -389,42 +405,43 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
         .clone()
         .unwrap_or_else(|| PathBuf::from("stelyph.toml"));
 
-    // Resolve the hostname/DNS target. DNS is first-class: always SHOW the
-    // routing target and let the operator confirm or override it, rather than
-    // silently reading env/config. Default = --hostname / PDS_HOSTNAME, else the
-    // config file's hostname. The wizard then pre-checks that the admin handle
-    // belongs to this hostname before any did:plc registration is attempted.
-    let hostname_default = match args.hostname.clone() {
-        Some(h) => Some(h),
-        None => PdsConfig::load_or_default(Some(&read_config_path))?.hostname,
-    };
-    let hostname = {
-        use std::io::Write;
-        match &hostname_default {
-            Some(def) => {
-                print!("PDS hostname / DNS name [{def}]: ");
-                std::io::stdout().flush()?;
-                let mut line = String::new();
-                std::io::stdin().read_line(&mut line)?;
-                let entered = line.trim();
-                if entered.is_empty() {
-                    def.clone()
-                } else {
-                    entered.to_string()
+    // Resolve the hostname/DNS target. B5: when --hostname/PDS_HOSTNAME was supplied
+    // explicitly, use it directly and SKIP the prompt entirely (no stdin read at all) —
+    // this is what lets `init` run non-interactively in Docker/CI/pipes. Only when no
+    // value was supplied do we fall back to the config file's hostname as a bracketed
+    // prompt default. The wizard then pre-checks that the admin handle belongs to this
+    // hostname before any did:plc registration is attempted.
+    let hostname = match args.hostname.clone() {
+        Some(h) => h,
+        None => {
+            let hostname_default = PdsConfig::load_or_default(Some(&read_config_path))?.hostname;
+            use std::io::Write;
+            match &hostname_default {
+                Some(def) => {
+                    print!("PDS hostname / DNS name [{def}]: ");
+                    std::io::stdout().flush()?;
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    let entered = line.trim();
+                    if entered.is_empty() {
+                        def.clone()
+                    } else {
+                        entered.to_string()
+                    }
                 }
-            }
-            None => {
-                print!("PDS hostname / DNS name (e.g. pds.example.com): ");
-                std::io::stdout().flush()?;
-                let mut line = String::new();
-                std::io::stdin().read_line(&mut line)?;
-                let entered = line.trim().to_string();
-                if entered.is_empty() {
-                    anyhow::bail!(
-                        "hostname is required: enter one at the prompt, pass --hostname <host>, or set PDS_HOSTNAME"
-                    );
+                None => {
+                    print!("PDS hostname / DNS name (e.g. pds.example.com): ");
+                    std::io::stdout().flush()?;
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    let entered = line.trim().to_string();
+                    if entered.is_empty() {
+                        anyhow::bail!(
+                            "hostname is required: enter one at the prompt, pass --hostname <host>, or set PDS_HOSTNAME"
+                        );
+                    }
+                    entered
                 }
-                entered
             }
         }
     };
@@ -475,8 +492,11 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
         }
     };
 
-    // Prompt for password (non-echoing — T-7-04-01).
-    let password = rpassword::prompt_password("Admin password (min 8 chars): ")?;
+    // Resolve password: --password/PDS_ADMIN_PASSWORD wins outright (no prompt); otherwise
+    // prompt (non-echoing — T-7-04-01) only if a terminal is available, else error
+    // actionably instead of crashing on a missing /dev/tty (B5).
+    use std::io::IsTerminal;
+    let password = resolve_password(args.password.clone(), std::io::stdin().is_terminal())?;
 
     // Resolve or generate jwt_secret.
     // If not provided, generate a cryptographically random 32-byte secret, print it ONCE.
