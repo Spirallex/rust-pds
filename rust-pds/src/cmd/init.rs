@@ -1,4 +1,4 @@
-//! `rust-pds init` — interactive narrated setup wizard (Plan 04, DOOR-04, IDEN-03).
+//! `stelyph init` — interactive narrated setup wizard.
 //!
 //! # Wizard flow (7 narrated steps)
 //!
@@ -6,21 +6,20 @@
 //! wizard start: Instant::now()
 //! [1/7] mode detection (advisory detect_mode or --mode override) + proxy snippet
 //! [2/7] DNS A-record check (warn-not-fail — never blocks on mismatch)
-//! [3/7] DID method choice (did:plc default / did:web — IDEN-03)
-//! [4/7] inline first-account via create_account_inner (no HTTP — T-7-04-05)
+//! [3/7] DID method choice (did:plc default / did:web)
+//! [4/7] inline first-account via create_account_inner (no HTTP round-trip)
 //! [5/7] requestCrawl submitted (non-blocking on relay indexing)
-//! [6/7] write rust-pds.toml (no secrets — T-7-04-01/02)
+//! [6/7] write stelyph.toml (no secrets)
 //! [7/7] 60s wall-clock elapsed with PASS / over indicator
 //! ```
 //!
 //! # Security
-//! - Password prompt is non-echoing (rpassword). Password NEVER printed/logged (T-7-04-01).
-//! - jwt_secret and key_passphrase NEVER written to rust-pds.toml (T-7-04-02).
+//! - Password prompt is non-echoing (rpassword). Password NEVER printed/logged.
+//! - jwt_secret and key_passphrase NEVER written to stelyph.toml.
 //! - WizardOpts is NOT Debug-printed to avoid leaking the password field.
-//! - DNS mismatch and lookup failure are non-fatal WARN messages (T-7-04-03).
-//! - External IP and DNS results are advisory only — no security decision derives from them
-//!   (T-7-04-04).
-//! - create_account_inner reuses the existing first-account / invite gate (T-7-04-05).
+//! - DNS mismatch and lookup failure are non-fatal WARN messages.
+//! - External IP and DNS results are advisory only — no security decision derives from them.
+//! - create_account_inner reuses the existing first-account / invite gate.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,18 +32,17 @@ use crate::identity::web::did_web;
 use crate::xrpc::{create_account_inner, AppState, CreateAccountInput};
 
 // ---------------------------------------------------------------------------
-// DID method choice (IDEN-03)
+// DID method choice
 // ---------------------------------------------------------------------------
 
-/// Operator DID method selection (IDEN-03): did:plc (default) or did:web.
+/// Operator DID method selection: did:plc (default) or did:web.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DidMethod {
     /// did:plc — the standard ATProto DID method (default).
     #[default]
     Plc,
-    /// did:web — server-derived DID from hostname. For did:web, account-creation wiring
-    /// beyond recording the method and deriving `did:web:<hostname>` is out of scope
-    /// (CONTEXT.md deferred — did:web domain-change handling).
+    /// did:web — records the method and derives `did:web:<hostname>`; automated
+    /// domain-change handling is not yet implemented.
     Web,
 }
 
@@ -58,7 +56,7 @@ pub struct InitArgs {
     #[arg(long, env = "PDS_HOSTNAME")]
     pub hostname: Option<String>,
 
-    /// DID method: plc (default) or web (IDEN-03).
+    /// DID method: plc (default) or web.
     #[arg(long, value_enum, default_value_t = DidMethod::Plc)]
     pub did_method: DidMethod,
 
@@ -66,7 +64,7 @@ pub struct InitArgs {
     #[arg(long, env = "PDS_MODE")]
     pub mode: Option<super::Mode>,
 
-    /// Path to rust-pds.db. Default: pds.db in cwd.
+    /// Path to the SQLite database. Default: pds.db in the current directory.
     #[arg(long, env = "PDS_DB_PATH", default_value = "pds.db")]
     pub db_path: String,
 
@@ -157,7 +155,7 @@ pub struct WizardOpts {
     /// Local listen port; written to config and referenced by the proxy/tunnel snippet.
     pub port: u16,
     pub acme_env: Option<String>,
-    /// Config path to write rust-pds.toml.
+    /// Path to write the config file (default stelyph.toml).
     pub config_path: PathBuf,
 }
 
@@ -240,7 +238,7 @@ pub async fn run_wizard(
     }
 
     // ------------------------------------------------------------------
-    // [2/7] DNS A-record check (warn-not-fail, T-7-04-03)
+    // [2/7] DNS A-record check (warn-not-fail)
     // ------------------------------------------------------------------
     println!("[2/7] DNS A-record check for {}...", opts.hostname);
     // Try to fetch external IP for comparison. If IP fetch fails, use 0.0.0.0 as a
@@ -259,7 +257,7 @@ pub async fn run_wizard(
             );
         }
         DnsCheck::Mismatch { resolved, expected } => {
-            // Advisory WARN — wizard continues (T-7-04-03, T-7-04-04).
+            // Advisory WARN — wizard continues (external IP / DNS results never gate registration).
             let resolved_str: Vec<String> = resolved.iter().map(|ip| ip.to_string()).collect();
             println!(
                 "  ✗ WARN: DNS mismatch for {} — resolved {:?}, expected {} — \
@@ -268,7 +266,7 @@ pub async fn run_wizard(
             );
         }
         DnsCheck::LookupFailed(msg) => {
-            // Advisory WARN — wizard continues (T-7-04-03).
+            // Advisory WARN — wizard continues.
             println!(
                 "  ✗ WARN: DNS lookup for {} failed ({}) — \
                  continuing (DNS propagation can lag)",
@@ -278,7 +276,7 @@ pub async fn run_wizard(
     }
 
     // ------------------------------------------------------------------
-    // [3/7] DID method choice (IDEN-03)
+    // [3/7] DID method choice
     // ------------------------------------------------------------------
     println!("[3/7] DID method: {:?}", opts.did_method);
     let did_method_str = match opts.did_method {
@@ -301,8 +299,8 @@ pub async fn run_wizard(
 
     // ------------------------------------------------------------------
     // [4/7] Inline first-account creation via create_account_inner
-    // (no HTTP round-trip; reuses existing first-account / invite gate — T-7-04-05)
-    // Narrate BEFORE the call so the operator sees progress during PLC latency (Pitfall 5).
+    // (no HTTP round-trip; reuses existing first-account / invite gate)
+    // Narrate BEFORE the call so the operator sees progress during PLC registration latency.
     // ------------------------------------------------------------------
     println!("[4/7] Creating first account (handle: {})...", opts.handle);
     println!("  (Registering did:plc at plc.directory — this may take a few seconds...)");
@@ -328,7 +326,7 @@ pub async fn run_wizard(
     );
 
     // ------------------------------------------------------------------
-    // [5/7] requestCrawl (awaited; relay INDEXING is async — T-7-04 / RESEARCH)
+    // [5/7] requestCrawl (awaited; relay indexing itself happens asynchronously afterward)
     // ------------------------------------------------------------------
     println!(
         "[5/7] Submitting requestCrawl to relay ({})...",
@@ -348,7 +346,7 @@ pub async fn run_wizard(
     }
 
     // ------------------------------------------------------------------
-    // [6/7] Write rust-pds.toml (NO secrets — T-7-04-01/02)
+    // [6/7] Write stelyph.toml (NO secrets)
     // ------------------------------------------------------------------
     println!("[6/7] Writing config to {}...", opts.config_path.display());
     let cfg = PdsConfig {
@@ -358,14 +356,14 @@ pub async fn run_wizard(
         db_path: Some(opts.db_path.clone()),
         port: Some(opts.port),
         acme_env: opts.acme_env.clone(),
-        // jwt_secret and key_passphrase are intentionally absent (T-7-04-02).
+        // jwt_secret and key_passphrase are intentionally absent.
         ..Default::default()
     };
     cfg.save(&opts.config_path)?;
-    println!("  ✓ config written (no secrets in file — T-7-04-02)");
+    println!("  ✓ config written (no secrets in file)");
 
     // ------------------------------------------------------------------
-    // [7/7] 60s wall-clock elapsed indicator (DOOR-04)
+    // [7/7] 60s wall-clock elapsed indicator
     // ------------------------------------------------------------------
     let elapsed_secs = started.elapsed().as_secs_f64();
     let indicator = bar_indicator(elapsed_secs);
@@ -384,7 +382,7 @@ pub async fn run_wizard(
 // Thin public entry point (builds real AppState + prompts for secrets)
 // ---------------------------------------------------------------------------
 
-/// Entry point for the `rust-pds init` subcommand.
+/// Entry point for the `stelyph init` subcommand.
 ///
 /// Builds a real `AppState` (in-memory store for wizard use — account is seeded
 /// in a newly-opened or existing DB), prompts for handle and password (rpassword,
@@ -395,12 +393,12 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
     use crate::storage::SqliteStore;
 
     // Resolve config path for READING an existing config (default stelyph.toml,
-    // falling back to a legacy rust-pds.toml if present — read-only compat, B3/T-05-02).
+    // falling back to a legacy config file if present — read-only compat).
     let read_config_path = crate::cmd::resolve_config_path(config.as_deref());
 
     // Resolve config path for WRITING at the end of the wizard. Unlike the read path,
     // this always targets the new stelyph.toml name when no explicit --config was given —
-    // a stale legacy rust-pds.toml is never silently written over with the old name.
+    // a stale legacy config file is never silently written over with the old name.
     let config_path = config
         .clone()
         .unwrap_or_else(|| PathBuf::from("stelyph.toml"));
@@ -493,7 +491,7 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
     };
 
     // Resolve password: --password/PDS_ADMIN_PASSWORD wins outright (no prompt); otherwise
-    // prompt (non-echoing — T-7-04-01) only if a terminal is available, else error
+    // prompt (non-echoing) only if a terminal is available, else error
     // actionably instead of crashing on a missing /dev/tty (B5).
     use std::io::IsTerminal;
     let password = resolve_password(args.password.clone(), std::io::stdin().is_terminal())?;
@@ -515,7 +513,7 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
         }
     };
 
-    // Resolve key_passphrase (non-echoing — T-7-04-01).
+    // Resolve key_passphrase (non-echoing).
     let key_passphrase: Vec<u8> = match args.key_passphrase {
         Some(p) => p.into_bytes(),
         None => rpassword::prompt_password("Key passphrase (for encrypting keys at rest): ")?
@@ -530,9 +528,9 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
     let plc_client = ReqwestPlcClient::with_url(&args.plc_url)
         .map_err(|e| anyhow::anyhow!("Failed to create PLC client: {e}"))?;
 
-    // IDEN-04: the wizard's inline account creation always resolves did:web
-    // over HTTPS (http_dev=false) — the compose-network plain-HTTP dev toggle
-    // is a `serve`-time config knob only, never available here.
+    // The wizard's inline account creation always resolves did:web over HTTPS
+    // (http_dev=false) — the plain-HTTP dev toggle is a `serve`-time config
+    // knob only, never available here.
     let did_web_resolver = crate::identity::web_resolver::ReqwestDidWebResolver::new(false)
         .map_err(|e| anyhow::anyhow!("Failed to create did:web resolver: {e}"))?;
 
@@ -691,8 +689,8 @@ mod tests {
         );
     }
 
-    /// The chosen listen port is persisted to rust-pds.toml so the proxy/tunnel
-    /// runbook and `serve` share one source of truth (TODOS: listen-port item).
+    /// The chosen listen port is persisted to stelyph.toml so the proxy/tunnel
+    /// runbook and `serve` share one source of truth.
     #[tokio::test]
     async fn chosen_port_is_written_to_config() {
         let (state, _tmp_db) = test_state().await;
@@ -712,7 +710,7 @@ mod tests {
         assert_eq!(
             written.port,
             Some(8088),
-            "the chosen listen port must be persisted to rust-pds.toml"
+            "the chosen listen port must be persisted to stelyph.toml"
         );
     }
 

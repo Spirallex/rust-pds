@@ -23,7 +23,7 @@
 #   ./scripts/setup-cloudflare-tunnel.sh stelyph.spirallex.com --run
 #
 # Env overrides:
-#   PDS_PORT       local port stelyph listens on (default: from rust-pds.toml, else 3000)
+#   PDS_PORT       local port stelyph listens on (default: from stelyph.toml, else 3000)
 #   TUNNEL_NAME    cloudflared tunnel name        (default: stelyph)
 #   NO_WILDCARD=1  skip the *.<hostname> wildcard route
 #
@@ -61,10 +61,10 @@ TUNNEL_NAME="${TUNNEL_NAME:-stelyph}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CF_DIR="${HOME}/.cloudflared"
 
-# Resolve the local port: PDS_PORT env > rust-pds.toml `port = N` > 3000.
+# Resolve the local port: PDS_PORT env > stelyph.toml `port = N` > 3000.
 if [[ -n "${PDS_PORT:-}" ]]; then
   PORT="$PDS_PORT"
-elif PORT_LINE=$(grep -E '^[[:space:]]*port[[:space:]]*=' "${REPO_ROOT}/rust-pds.toml" 2>/dev/null); then
+elif PORT_LINE=$(grep -E '^[[:space:]]*port[[:space:]]*=' "${REPO_ROOT}/stelyph.toml" 2>/dev/null); then
   PORT="$(sed -E 's/[^0-9]//g' <<<"$PORT_LINE")"
 fi
 PORT="${PORT:-3000}"
