@@ -47,7 +47,7 @@ Open `http://<vm-ip>:8000`, create the admin account, and register
 ## 3. Create the app
 
 In Coolify: **+ New → Resource → Public/Private Repository** →
-`https://github.com/spirallex/stelyph` (or your fork).
+`https://github.com/Spirallex/rust-pds` (or your fork).
 
 - **Build pack:** `Dockerfile` (Coolify auto-detects the root `Dockerfile`).
 - **Branch:** `main`.
