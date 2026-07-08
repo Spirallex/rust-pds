@@ -110,6 +110,8 @@ mod tests {
             appview_client: std::sync::Arc::new(MockAppViewClient::new((200, Vec::new(), None))),
             appview_url: "https://appview.test".to_string(),
             appview_did: "did:web:appview.test".to_string(),
+            did_locks: Arc::new(dashmap::DashMap::new()),
+            signing_key_cache: Arc::new(dashmap::DashMap::new()),
         };
         (state, tmp)
     }

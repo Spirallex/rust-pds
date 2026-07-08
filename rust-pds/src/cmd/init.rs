@@ -515,6 +515,8 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
         appview_client: Arc::new(appview_client),
         appview_url: "https://api.bsky.app".to_string(),
         appview_did: "did:web:api.bsky.app".to_string(),
+        did_locks: Arc::new(dashmap::DashMap::new()),
+        signing_key_cache: Arc::new(dashmap::DashMap::new()),
     };
 
     // Build live clients.
@@ -596,6 +598,8 @@ mod tests {
             ))),
             appview_url: "https://appview.test".to_string(),
             appview_did: "did:web:appview.test".to_string(),
+            did_locks: Arc::new(dashmap::DashMap::new()),
+            signing_key_cache: Arc::new(dashmap::DashMap::new()),
         };
         (state, tmp)
     }

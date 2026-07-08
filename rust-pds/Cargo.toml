@@ -52,6 +52,7 @@ toml = "1"
 hickory-resolver = { version = "0.26", features = ["tokio"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 rpassword = "7"
+dashmap = "6.2"
 
 [dev-dependencies]
 # Enable the core's `testing` feature for the server test suite so the in-memory

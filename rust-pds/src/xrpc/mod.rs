@@ -59,6 +59,16 @@ pub struct AppState {
     pub appview_url: String,
     /// AppView service DID, default "did:web:api.bsky.app" (the JWT aud).
     pub appview_did: String,
+    /// Per-DID write-serialization locks shared across per-request RepoWriter instances,
+    /// so two concurrent writes to the same DID cannot fork the repo history.
+    /// Grows by one entry per distinct DID ever written; bounded and acceptable for the
+    /// personal/small-fleet target — never evicted.
+    pub did_locks: Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// In-process cache of decrypted signing keys (keyed by "{did}#signing"), so a request
+    /// touching the signing key skips re-running the argon2id KDF. Cache is process-local:
+    /// import-keys/reset-password run as separate CLI processes and require a server restart
+    /// to be picked up. Wrapped in Zeroizing so key bytes are zeroed on drop.
+    pub signing_key_cache: Arc<dashmap::DashMap<String, Arc<zeroize::Zeroizing<Vec<u8>>>>>,
 }
 
 /// Implement `AsRef<AppState>` so the axum extractor impls in `auth::extractor`

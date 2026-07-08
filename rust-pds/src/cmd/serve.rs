@@ -185,6 +185,8 @@ pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()>
         appview_client,
         appview_url,
         appview_did,
+        did_locks: Arc::new(dashmap::DashMap::new()),
+        signing_key_cache: Arc::new(dashmap::DashMap::new()),
     };
 
     match mode {

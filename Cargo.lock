@@ -3226,6 +3226,7 @@ dependencies = [
  "chrono",
  "cid",
  "clap",
+ "dashmap",
  "data-encoding",
  "deadpool-sqlite",
  "futures",
