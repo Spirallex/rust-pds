@@ -657,11 +657,7 @@ mod tests {
             .await
             .expect("CAR blocks must be valid CARv1");
         let header = reader.header().clone();
-        assert_eq!(
-            header.roots(),
-            &[commit_cid],
-            "CAR root must be commit_cid"
-        );
+        assert_eq!(header.roots(), &[commit_cid], "CAR root must be commit_cid");
     }
 
     /// A subscriber created before create_record receives exactly

@@ -27,21 +27,24 @@ pub async fn proxy_handler(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Response, XrpcError> {
     let nsid = format!("app.bsky.{method_suffix}"); // lxm must be the full NSID, not the suffix
-    // Check the process-local signing-key cache before calling load_key — this is the
-    // hottest read path (every proxied app.bsky.* GET touches the signing key).
+                                                    // Check the process-local signing-key cache before calling load_key — this is the
+                                                    // hottest read path (every proxied app.bsky.* GET touches the signing key).
     let key_id = format!("{did}#signing");
     let signing = if let Some(cached) = state.signing_key_cache.get(&key_id) {
-        Secp256k1Keypair::import(cached.as_slice())
-            .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}")))?
+        Secp256k1Keypair::import(cached.as_slice()).map_err(|e| {
+            XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}"))
+        })?
     } else {
         let key_bytes = load_key(&state.store, &key_id, &state.key_passphrase)
             .await
             .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to load signing key: {e}")))?;
-        state
-            .signing_key_cache
-            .insert(key_id.clone(), Arc::new(zeroize::Zeroizing::new(key_bytes.clone())));
-        Secp256k1Keypair::import(&key_bytes)
-            .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}")))?
+        state.signing_key_cache.insert(
+            key_id.clone(),
+            Arc::new(zeroize::Zeroizing::new(key_bytes.clone())),
+        );
+        Secp256k1Keypair::import(&key_bytes).map_err(|e| {
+            XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}"))
+        })?
     };
     let jwt = mint_service_auth_jwt(&signing, &did, &state.appview_did, &nsid)?;
     let query = raw_query.as_deref().unwrap_or("");

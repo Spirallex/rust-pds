@@ -99,17 +99,20 @@ pub async fn create_record(
     // process-local cache first so a warm cache skips the argon2id KDF (B4).
     let key_id = format!("{did}#signing");
     let signing = if let Some(cached) = state.signing_key_cache.get(&key_id) {
-        Secp256k1Keypair::import(cached.as_slice())
-            .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}")))?
+        Secp256k1Keypair::import(cached.as_slice()).map_err(|e| {
+            XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}"))
+        })?
     } else {
         let key_bytes = load_key(&state.store, &key_id, &state.key_passphrase)
             .await
             .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to load signing key: {e}")))?;
-        state
-            .signing_key_cache
-            .insert(key_id.clone(), Arc::new(zeroize::Zeroizing::new(key_bytes.clone())));
-        Secp256k1Keypair::import(&key_bytes)
-            .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}")))?
+        state.signing_key_cache.insert(
+            key_id.clone(),
+            Arc::new(zeroize::Zeroizing::new(key_bytes.clone())),
+        );
+        Secp256k1Keypair::import(&key_bytes).map_err(|e| {
+            XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}"))
+        })?
     };
 
     let did_typed = Did::from_str(&did)
@@ -256,17 +259,20 @@ pub async fn apply_writes(
     // Check the process-local cache first so a warm cache skips the argon2id KDF (B4).
     let key_id = format!("{did}#signing");
     let signing = if let Some(cached) = state.signing_key_cache.get(&key_id) {
-        Secp256k1Keypair::import(cached.as_slice())
-            .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}")))?
+        Secp256k1Keypair::import(cached.as_slice()).map_err(|e| {
+            XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}"))
+        })?
     } else {
         let key_bytes = load_key(&state.store, &key_id, &state.key_passphrase)
             .await
             .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to load signing key: {e}")))?;
-        state
-            .signing_key_cache
-            .insert(key_id.clone(), Arc::new(zeroize::Zeroizing::new(key_bytes.clone())));
-        Secp256k1Keypair::import(&key_bytes)
-            .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}")))?
+        state.signing_key_cache.insert(
+            key_id.clone(),
+            Arc::new(zeroize::Zeroizing::new(key_bytes.clone())),
+        );
+        Secp256k1Keypair::import(&key_bytes).map_err(|e| {
+            XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}"))
+        })?
     };
     let did_typed = Did::from_str(&did)
         .map_err(|e| XrpcError::Internal(anyhow::anyhow!("invalid DID: {e}")))?;
@@ -380,17 +386,20 @@ pub async fn apply_writes(
 async fn build_writer(state: &AppState, did: &str) -> Result<RepoWriter, XrpcError> {
     let key_id = format!("{did}#signing");
     let signing = if let Some(cached) = state.signing_key_cache.get(&key_id) {
-        Secp256k1Keypair::import(cached.as_slice())
-            .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}")))?
+        Secp256k1Keypair::import(cached.as_slice()).map_err(|e| {
+            XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}"))
+        })?
     } else {
         let key_bytes = load_key(&state.store, &key_id, &state.key_passphrase)
             .await
             .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to load signing key: {e}")))?;
-        state
-            .signing_key_cache
-            .insert(key_id.clone(), Arc::new(zeroize::Zeroizing::new(key_bytes.clone())));
-        Secp256k1Keypair::import(&key_bytes)
-            .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}")))?
+        state.signing_key_cache.insert(
+            key_id.clone(),
+            Arc::new(zeroize::Zeroizing::new(key_bytes.clone())),
+        );
+        Secp256k1Keypair::import(&key_bytes).map_err(|e| {
+            XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}"))
+        })?
     };
     let did_typed =
         Did::from_str(did).map_err(|e| XrpcError::Internal(anyhow::anyhow!("invalid DID: {e}")))?;
@@ -706,17 +715,20 @@ async fn build_did_doc(
 ) -> Result<DidDocument, XrpcError> {
     let key_id = format!("{did}#signing");
     let signing = if let Some(cached) = state.signing_key_cache.get(&key_id) {
-        Secp256k1Keypair::import(cached.as_slice())
-            .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}")))?
+        Secp256k1Keypair::import(cached.as_slice()).map_err(|e| {
+            XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}"))
+        })?
     } else {
         let key_bytes = load_key(&state.store, &key_id, &state.key_passphrase)
             .await
             .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to load signing key: {e}")))?;
-        state
-            .signing_key_cache
-            .insert(key_id.clone(), Arc::new(zeroize::Zeroizing::new(key_bytes.clone())));
-        Secp256k1Keypair::import(&key_bytes)
-            .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}")))?
+        state.signing_key_cache.insert(
+            key_id.clone(),
+            Arc::new(zeroize::Zeroizing::new(key_bytes.clone())),
+        );
+        Secp256k1Keypair::import(&key_bytes).map_err(|e| {
+            XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}"))
+        })?
     };
     let key_did = signing.did();
     let public_key_multibase = key_did

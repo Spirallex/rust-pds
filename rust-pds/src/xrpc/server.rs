@@ -101,7 +101,9 @@ pub async fn create_session(
     let phc_owned = phc.clone();
     let verified = tokio::task::spawn_blocking(move || verify_password(&password, &phc_owned))
         .await
-        .map_err(|e| XrpcError::Internal(anyhow::anyhow!("password verify task panicked: {e}")))??;
+        .map_err(|e| {
+            XrpcError::Internal(anyhow::anyhow!("password verify task panicked: {e}"))
+        })??;
     if !verified {
         return Err(XrpcError::InvalidRequest(
             "invalid identifier or password".into(),
@@ -221,17 +223,20 @@ pub async fn get_service_auth(
     // getServiceAuth is the read-path "Worst" case CONTEXT.md names explicitly.
     let key_id = format!("{did}#signing");
     let signing = if let Some(cached) = state.signing_key_cache.get(&key_id) {
-        Secp256k1Keypair::import(cached.as_slice())
-            .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}")))?
+        Secp256k1Keypair::import(cached.as_slice()).map_err(|e| {
+            XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}"))
+        })?
     } else {
         let key_bytes = load_key(&state.store, &key_id, &state.key_passphrase)
             .await
             .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to load signing key: {e}")))?;
-        state
-            .signing_key_cache
-            .insert(key_id.clone(), Arc::new(zeroize::Zeroizing::new(key_bytes.clone())));
-        Secp256k1Keypair::import(&key_bytes)
-            .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}")))?
+        state.signing_key_cache.insert(
+            key_id.clone(),
+            Arc::new(zeroize::Zeroizing::new(key_bytes.clone())),
+        );
+        Secp256k1Keypair::import(&key_bytes).map_err(|e| {
+            XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}"))
+        })?
     };
 
     let now = SystemTime::now()

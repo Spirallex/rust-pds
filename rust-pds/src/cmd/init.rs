@@ -128,7 +128,9 @@ fn resolve_password(explicit: Option<String>, is_tty: bool) -> anyhow::Result<St
                      PDS_ADMIN_PASSWORD to run non-interactively"
                 );
             }
-            Ok(rpassword::prompt_password("Admin password (min 8 chars): ")?)
+            Ok(rpassword::prompt_password(
+                "Admin password (min 8 chars): ",
+            )?)
         }
     }
 }
