@@ -46,11 +46,20 @@ pub struct ServeArgs {
 
 pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()> {
     // 1. Load config file (file < env < flag precedence).
-    let cfg = PdsConfig::load_or_default(config.as_deref())?;
+    // An explicit --config/PDS_CONFIG that doesn't exist is a hard error (B3/T-05-03);
+    // the resolved default (stelyph.toml, falling back to legacy rust-pds.toml) stays
+    // non-fatal when absent so a fresh install without any config still boots on flags/env.
+    let cfg = match config.as_deref() {
+        Some(explicit) => PdsConfig::load(explicit)?,
+        None => {
+            let resolved = crate::cmd::resolve_config_path(None);
+            PdsConfig::load_or_default(resolved.exists().then_some(resolved.as_path()))?
+        }
+    };
 
     // 2. Resolve effective values: flag/env (already folded by clap) > file > default.
     let hostname = args.hostname.or(cfg.hostname).unwrap_or_else(|| {
-        eprintln!("FATAL: PDS_HOSTNAME is required (set via env, flag, or rust-pds.toml)");
+        eprintln!("FATAL: PDS_HOSTNAME is required (set via env, flag, or stelyph.toml)");
         std::process::exit(1);
     });
 

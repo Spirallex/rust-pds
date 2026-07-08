@@ -359,10 +359,16 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
     use crate::identity::plc::ReqwestPlcClient;
     use crate::storage::SqliteStore;
 
-    // Resolve config path first (used as a hostname default source).
+    // Resolve config path for READING an existing config (default stelyph.toml,
+    // falling back to a legacy rust-pds.toml if present — read-only compat, B3/T-05-02).
+    let read_config_path = crate::cmd::resolve_config_path(config.as_deref());
+
+    // Resolve config path for WRITING at the end of the wizard. Unlike the read path,
+    // this always targets the new stelyph.toml name when no explicit --config was given —
+    // a stale legacy rust-pds.toml is never silently written over with the old name.
     let config_path = config
         .clone()
-        .unwrap_or_else(|| PathBuf::from("rust-pds.toml"));
+        .unwrap_or_else(|| PathBuf::from("stelyph.toml"));
 
     // Resolve the hostname/DNS target. DNS is first-class: always SHOW the
     // routing target and let the operator confirm or override it, rather than
@@ -371,7 +377,7 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
     // belongs to this hostname before any did:plc registration is attempted.
     let hostname_default = match args.hostname.clone() {
         Some(h) => Some(h),
-        None => PdsConfig::load_or_default(Some(&config_path))?.hostname,
+        None => PdsConfig::load_or_default(Some(&read_config_path))?.hostname,
     };
     let hostname = {
         use std::io::Write;
