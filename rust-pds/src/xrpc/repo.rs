@@ -1138,6 +1138,8 @@ mod tests {
             ),
             appview_url: "https://appview.test".to_string(),
             appview_did: "did:web:appview.test".to_string(),
+            did_locks: Arc::new(dashmap::DashMap::new()),
+            signing_key_cache: Arc::new(dashmap::DashMap::new()),
         };
         (state, tmp)
     }

@@ -67,6 +67,8 @@ async fn spawn_server() -> (SocketAddr, AppState, tempfile::NamedTempFile) {
         ))),
         appview_url: "https://appview.test".to_string(),
         appview_did: "did:web:appview.test".to_string(),
+        did_locks: Arc::new(dashmap::DashMap::new()),
+        signing_key_cache: Arc::new(dashmap::DashMap::new()),
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
