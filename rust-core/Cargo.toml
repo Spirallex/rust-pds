@@ -87,9 +87,15 @@ tokio = { version = "1.52", features = ["full"] }
 # re-exposes that to downstream test suites via the optional dep above; here we
 # need it unconditionally so `cargo test -p stelyph-core` compiles standalone.
 tempfile = "3"
-# phys_footprint (the exact Jetsam metric) + peak RSS for examples/server_footprint.rs.
-mach2 = "0.4"
+# peak RSS for examples/server_footprint.rs (getrusage; compiles everywhere).
 libc = "0.2"
+
+# phys_footprint (the exact iOS Jetsam metric) for examples/server_footprint.rs is a
+# macOS/iOS-only mach API. Gate the dep to Apple targets so `cargo test --workspace`
+# builds on Linux CI — mach2 fails to compile off Apple. (The example itself is
+# `required-features = ["embedded-server"]`, so it isn't built in the default test run.)
+[target.'cfg(target_vendor = "apple")'.dev-dependencies]
+mach2 = "0.4"
 
 [[example]]
 name = "server_footprint"
