@@ -150,7 +150,7 @@ pub async fn run(args: AdminArgs) -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("no account with handle '{identifier}'"))?
             };
 
-            // Non-echoing prompt + confirmation (T-7-04-01 — never logged).
+            // Non-echoing prompt + confirmation — password never logged.
             let pw = rpassword::prompt_password("New password (min 8 chars): ")?;
             if pw.len() < 8 {
                 anyhow::bail!("password must be at least 8 characters");

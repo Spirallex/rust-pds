@@ -1,9 +1,10 @@
 //! firehose::tail — decode + CAR-extract + signature-verify for firehose #commit frames.
 //!
-//! This module is the shared core consumed by both the demo binary (Plan 02) and the
-//! FED-04 E2E integration test. Every primitive it uses already exists and is tested
-//! elsewhere in the crate: two-object CBOR streaming (frame.rs), CAR walking
-//! (xrpc/repo.rs), and commit signature verification (repo/writer.rs).
+//! This module is the shared core consumed by both the demo binary and the
+//! end-to-end signature-verification integration test. Every primitive it uses
+//! already exists and is tested elsewhere in the crate: two-object CBOR streaming
+//! (frame.rs), CAR walking (xrpc/repo.rs), and commit signature verification
+//! (repo/writer.rs).
 
 use crate::firehose::CommitBody; // reuse — do NOT redefine
 use atrium_api::types::string::{Did, Tid};
@@ -87,7 +88,7 @@ pub fn decode_commit_frame(frame_bytes: &[u8]) -> Result<CommitBody, TailError> 
         return Err(TailError::NotCommit);
     }
 
-    // Decode body as the typed CommitBody (body.commit is a real Cid — Pitfall 3).
+    // Decode body as the typed CommitBody (body.commit is a real Cid).
     let body: CommitBody = serde_ipld_dagcbor::de::from_reader_once(&mut reader)
         .map_err(|e| TailError::Decode(format!("body: {e}")))?;
 
@@ -142,7 +143,7 @@ async fn extract_commit_block(car_bytes: &[u8], expected: Cid) -> Result<Vec<u8>
 
 /// Local mirror of the wire-format signed commit block.
 ///
-/// Field order is LOAD-BEARING for CBOR round-trips (Pitfall 2):
+/// Field order is LOAD-BEARING for CBOR round-trips:
 /// `did, version, data, rev, prev` then `sig` last.
 #[derive(Deserialize)]
 struct SignedCommit {
@@ -178,13 +179,13 @@ fn reconstruct_unsigned_commit_bytes(signed: &SignedCommit) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// verify_commit_sig (the load-bearing FED-04 assertion)
+// verify_commit_sig (the load-bearing signature-verification assertion)
 // ---------------------------------------------------------------------------
 
 /// Verify the commit signature in a [`CommitBody`] against `signer_did_key`.
 ///
 /// `signer_did_key` must be the signing did:key (e.g. `"did:key:zQ3sh..."`),
-/// NOT the account DID in `body.repo` (Pitfall 6 / T-06-04).
+/// NOT the account DID in `body.repo`.
 ///
 /// Async because `extract_commit_block` (CAR walk) is async; the
 /// `verify_signature` crypto call itself is synchronous.
@@ -298,11 +299,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // verify_commit_sig_tampered  (✗ load-bearing tamper proof for T-06-03)
+    // verify_commit_sig_tampered  (✗ load-bearing tamper proof)
     // -----------------------------------------------------------------------
 
     /// Flipping a byte of the sig field in the commit block causes verification to fail.
-    /// This is the load-bearing tamper proof for FED-04.
+    /// This is the load-bearing tamper proof for the signature-verification path.
     #[tokio::test]
     async fn verify_commit_sig_tampered() {
         let (frame, did_key, _other) = make_signed_commit_frame().await;

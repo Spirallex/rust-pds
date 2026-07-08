@@ -4,7 +4,7 @@
 //! + a tunnel pointer. The generated text is intended for the operator to paste into their
 //!   reverse-proxy config.
 //!
-//! Security (T-7-02-04): the nginx block sets ONLY the three required headers explicitly
+//! Security: the nginx block sets ONLY the three required headers explicitly
 //! (Upgrade, Connection "upgrade", Host $host). No raw client-header pass-through is emitted
 //! that could enable Host/Upgrade smuggling. The Caddy `reverse_proxy` directive passes Host
 //! and WS upgrade headers by default — no additional header directives are needed.
@@ -13,7 +13,7 @@
 /// proxy must satisfy to work with this PDS.
 pub fn requirements_block(upstream_port: u16) -> String {
     format!(
-        "# rust-pds reverse-proxy requirements (any proxy must satisfy all three):\n\
+        "# stelyph reverse-proxy requirements (any proxy must satisfy all three):\n\
          # 1. Forward upstream → this PDS on localhost:{upstream_port}\n\
          # 2. Pass WebSocket Upgrade + Connection headers through (firehose subscribeRepos)\n\
          # 3. Pass the Host header through unchanged\n"
@@ -38,7 +38,7 @@ pub fn caddy_snippet(hostname: &str, upstream_port: u16) -> String {
 /// Returns an nginx snippet (secondary) for the given hostname and upstream port.
 ///
 /// Sets only the three required headers (Upgrade, Connection "upgrade", Host $host).
-/// No raw client-header pass-through is emitted (T-7-02-04 — smuggling-safe defaults).
+/// No raw client-header pass-through is emitted (smuggling-safe defaults).
 pub fn nginx_snippet(hostname: &str, upstream_port: u16) -> String {
     format!(
         "# nginx (secondary):\n\

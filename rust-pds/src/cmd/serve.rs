@@ -1,7 +1,7 @@
-//! `rust-pds serve` — start the PDS server.
+//! `stelyph serve` — start the PDS server.
 //!
 //! Proxy mode (default): binds a plain TcpListener and serves the existing axum router.
-//! Standalone mode: TLS via rustls-acme (ACME TLS-ALPN-01). Wired in Plan 03.
+//! Standalone mode: TLS via rustls-acme (ACME TLS-ALPN-01).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -44,7 +44,7 @@ pub struct ServeArgs {
     pub open_registration: bool,
 }
 
-/// B7/T-06-01: pure heuristic gate used as the standalone-mode ACME preflight.
+/// Pure heuristic gate used as the standalone-mode ACME preflight.
 ///
 /// Rejects hostnames that would make `tls::serve_standalone` place a doomed Let's
 /// Encrypt order: IP literals (no public cert for a bare IP), dotless names (no TLD),
@@ -69,9 +69,9 @@ fn looks_like_public_hostname(host: &str) -> bool {
 
 pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()> {
     // 1. Load config file (file < env < flag precedence).
-    // An explicit --config/PDS_CONFIG that doesn't exist is a hard error (B3/T-05-03);
-    // the resolved default (stelyph.toml, falling back to legacy rust-pds.toml) stays
-    // non-fatal when absent so a fresh install without any config still boots on flags/env.
+    // An explicit --config/PDS_CONFIG that doesn't exist is a hard error;
+    // the resolved default (stelyph.toml) stays non-fatal when absent so a fresh
+    // install without any config still boots on flags/env.
     let cfg = match config.as_deref() {
         Some(explicit) => PdsConfig::load(explicit)?,
         None => {
@@ -86,8 +86,8 @@ pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()>
         std::process::exit(1);
     });
 
-    // T-7-01-02/T-7-01-03: jwt_secret and key_passphrase are never in config file.
-    // T-7-01-03: Only the byte LENGTH is printed, never the value itself.
+    // jwt_secret and key_passphrase are never read from the config file — env/flag only.
+    // Only the byte LENGTH is printed on error, never the value itself.
     let jwt_secret = args
         .jwt_secret
         .unwrap_or_else(|| {
@@ -137,7 +137,7 @@ pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()>
         .appview_did
         .or(cfg.appview_did)
         .unwrap_or_else(|| "did:web:api.bsky.app".to_string());
-    // IDEN-04: compose-network plain-HTTP dev mode for the did:web resolver.
+    // Plain-HTTP dev mode for the did:web resolver (for local multi-container test networks).
     // Defaults false (HTTPS) — NEVER set true in production.
     let did_web_http_dev = cfg.did_web_http_dev.unwrap_or(false);
     let pds_endpoint = format!("https://{hostname}");
@@ -154,7 +154,7 @@ pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()>
         })
         .unwrap_or(super::Mode::Proxy);
 
-    // 3a. Determine ACME environment (DOOR-05: production is the default).
+    // 3a. Determine ACME environment (production is the default).
     let acme_env = args
         .acme
         .or_else(|| {
@@ -226,13 +226,13 @@ pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()>
             // PROXY branch: today's code (main.rs lines 93–119) reproduced verbatim.
             let router = app(state);
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
-            println!("rust-pds listening on {addr} (hostname={hostname}, open_registration={open_registration})");
+            println!("stelyph listening on {addr} (hostname={hostname}, open_registration={open_registration})");
 
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .map_err(|e| anyhow::anyhow!("FATAL: Failed to bind to {addr}: {e}"))?;
 
-            // Kick off the relay handshake so the relay begins crawling this PDS (FED-03).
+            // Kick off the relay handshake so the relay begins crawling this PDS.
             // Non-fatal: relay outage must not crash the PDS.
             {
                 let relay_client_startup = Arc::clone(&relay_client);
@@ -255,7 +255,7 @@ pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()>
         super::Mode::Standalone => {
             let prod = crate::tls::acme_directory_is_production(acme_env);
 
-            // B7/T-06-01: pre-flight the hostname BEFORE any ACME order is placed.
+            // Pre-flight the hostname BEFORE any ACME order is placed.
             // Once tls::serve_standalone constructs the AcmeState the first order is
             // already in flight — a bad hostname here would burn the operator's real
             // Let's Encrypt rate-limit budget across repeated retries.
@@ -279,7 +279,7 @@ pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()>
                 std::process::exit(1);
             }
 
-            // Kick off the relay handshake so the relay begins crawling this PDS (FED-03).
+            // Kick off the relay handshake so the relay begins crawling this PDS.
             // Non-fatal: relay outage must not crash the PDS.
             {
                 let relay_client_startup = Arc::clone(&relay_client);
@@ -298,12 +298,12 @@ pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()>
             if let Err(e) =
                 crate::tls::serve_standalone(state, hostname.clone(), acme_cache_dir, prod).await
             {
-                // Pitfall 6: a :443 PermissionDenied surfaces here.
+                // Binding port 443 without elevated privileges surfaces as a PermissionDenied here.
                 eprintln!(
                     "FATAL: standalone serve failed: {e}\n\
                      If this is a port-443 permission error, either run behind a reverse proxy \
                      (--mode proxy) or grant the bind capability:\n  \
-                     sudo setcap 'cap_net_bind_service=+ep' <path-to-rust-pds>"
+                     sudo setcap 'cap_net_bind_service=+ep' <path-to-stelyph-binary>"
                 );
                 std::process::exit(1);
             }
@@ -317,7 +317,7 @@ pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()>
 mod tests {
     use super::*;
 
-    // B7/T-06-01: pure heuristic used as the standalone-mode ACME preflight gate.
+    // Pure heuristic used as the standalone-mode ACME preflight gate.
     // Must reject IP literals, dotless hosts, and reserved non-public TLDs; accept a
     // plausible public hostname.
     #[test]

@@ -6,7 +6,7 @@ use tokio_stream::StreamExt;
 
 use crate::xrpc::AppState;
 
-/// DOOR-05: map ACME environment to the rustls-acme directory flag.
+/// Maps the operator's chosen ACME environment to the rustls-acme directory flag.
 /// true = Let's Encrypt PRODUCTION; false = STAGING (rehearsal, no rate limits).
 pub fn acme_directory_is_production(env: crate::cmd::AcmeEnv) -> bool {
     matches!(env, crate::cmd::AcmeEnv::Production)
@@ -23,8 +23,8 @@ fn ensure_cache_dir(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// DOOR-01: serve the router over TLS via rustls-acme (TLS-ALPN-01) on :443.
-/// `prod` selects production vs staging (DOOR-05). CryptoProvider is installed in main() (Plan 01).
+/// Serve the router over TLS via rustls-acme (TLS-ALPN-01) on :443.
+/// `prod` selects production vs staging. The rustls CryptoProvider is installed once in main().
 pub async fn serve_standalone(
     app_state: AppState,
     hostname: String,
@@ -67,7 +67,7 @@ mod tests {
     use super::*;
     use crate::cmd::AcmeEnv;
 
-    // DOOR-05: production mapping is deterministic
+    // Production mapping is deterministic
     #[test]
     fn production_env_maps_to_true() {
         assert!(
@@ -76,7 +76,7 @@ mod tests {
         );
     }
 
-    // DOOR-05: staging mapping is deterministic
+    // Staging mapping is deterministic
     #[test]
     fn staging_env_maps_to_false() {
         assert!(
@@ -85,7 +85,7 @@ mod tests {
         );
     }
 
-    // Threat T-7-03-01: cache dir created with owner-only permissions
+    // Cache dir must be created with owner-only permissions (account key is sensitive)
     #[test]
     fn ensure_cache_dir_creates_with_0700() {
         let tmp = tempfile::tempdir().expect("tmpdir");

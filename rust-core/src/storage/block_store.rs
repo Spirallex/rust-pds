@@ -91,7 +91,7 @@ impl SqliteStore {
         event_body: Vec<u8>,
     ) -> Result<i64, StorageError> {
         // Compute the ISO 8601 timestamp BEFORE entering the blocking closure —
-        // no async calls are allowed inside `call()` (RESEARCH Pitfall 2).
+        // no async calls are allowed inside `call()`.
         let now_iso = chrono::Utc::now().to_rfc3339();
         let did = did.to_string();
         let root_str = new_root.to_string();
@@ -157,7 +157,7 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert(
             "text".to_string(),
-            Ipld::String("hello from rust-pds".into()),
+            Ipld::String("hello from stelyph".into()),
         );
         let bytes = serde_ipld_dagcbor::to_vec(&Ipld::Map(m)).expect("dag-cbor encode");
 
@@ -310,7 +310,7 @@ mod tests {
         );
     }
 
-    /// FED-01: commit_blocks stores the passed event_body bytes, returns a positive seq,
+    /// commit_blocks stores the passed event_body bytes, returns a positive seq,
     /// and the stored event BLOB equals what was passed in.
     #[tokio::test]
     async fn commit_blocks_stores_event_blob() {
@@ -354,7 +354,7 @@ mod tests {
         );
     }
 
-    /// FED-01: two sequential commit_blocks calls return strictly increasing seq values.
+    /// Two sequential commit_blocks calls return strictly increasing seq values.
     #[tokio::test]
     async fn commit_blocks_seq_increments() {
         let (store, _tmp) = SqliteStore::open_in_memory().await.expect("open failed");

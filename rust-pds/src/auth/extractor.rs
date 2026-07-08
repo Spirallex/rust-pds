@@ -1,12 +1,12 @@
 //! Bearer JWT extractor functions + axum FromRequestParts extractors.
 //!
 //! Plain functions (authenticate_access / authenticate_refresh) are free of
-//! AppState so Plan 03-01 tests pass without circular deps.
+//! AppState so they can be unit-tested without circular deps.
 //!
-//! Plan 03-02 adds the axum extractors (AccessAuth / RefreshAuth) that pull the
-//! JWT secret from AppState and delegate to the plain functions.
+//! The axum extractors (AccessAuth / RefreshAuth) pull the JWT secret from
+//! AppState and delegate to the plain functions.
 //!
-//! T-03-03 mitigation: access path rejects refresh-scoped tokens.
+//! Security: the access path rejects refresh-scoped tokens.
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
@@ -32,11 +32,11 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, XrpcError> {
 ///
 /// Reads the `Authorization: Bearer <token>` header, decodes the JWT, and
 /// asserts that `scope == "com.atproto.access"`. Refresh-scoped tokens are
-/// rejected with `XrpcError::InvalidToken` (Pitfall 3 / T-03-03).
+/// rejected with `XrpcError::InvalidToken`.
 ///
 /// Returns the DID (`claims.sub`) on success.
 ///
-/// Plan 03-02 wraps this in an axum extractor: `AccessAuth(pub String)`.
+/// Wrapped by the axum extractor `AccessAuth(pub String)`.
 pub fn authenticate_access(headers: &HeaderMap, secret: &[u8]) -> Result<String, XrpcError> {
     let token = bearer_token(headers)?;
     let claims = decode_jwt(token, secret)?;

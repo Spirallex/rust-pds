@@ -358,10 +358,11 @@ impl SqliteStore {
     /// not invalidated, in ascending seq order, capped at `limit`.
     /// Returns `(seq, event_blob)` pairs. Uses the reader pool — does not block the writer.
     ///
-    /// Recommended call-site limit is 500 rows per page (see RESEARCH §Cursor Semantics SQL).
-    /// The cursor integer is bound as a parameterized query value — no string interpolation
-    /// (T-04-03: prevents SQL injection from untrusted subscriber cursors).
-    /// The LIMIT cap prevents loading the full table into memory (T-04-04: DoS mitigation).
+    /// Recommended call-site limit is 500 rows per page. The cursor is the last emitted
+    /// seq; replay resumes at cursor+1. The cursor integer is bound as a parameterized
+    /// query value — no string interpolation (prevents SQL injection from untrusted
+    /// subscriber cursors). The LIMIT cap prevents loading the full table into memory
+    /// (DoS mitigation).
     pub async fn backfill_page(
         &self,
         after_seq: i64,
@@ -443,7 +444,7 @@ impl SqliteStore {
     }
 
     /// Atomically count existing accounts and insert a new one in a single writer
-    /// transaction (WR-02: first-account TOCTOU fix).
+    /// transaction (closes the first-account TOCTOU race).
     ///
     /// Returns the account count BEFORE the insert, so the caller can check
     /// whether this was the first account. The count and insert are wrapped in an
@@ -558,7 +559,7 @@ impl SqliteStore {
     /// Atomically consume one use of an invite code for `used_by`.
     ///
     /// This runs inside the writer mutex AND an explicit Immediate-behavior
-    /// transaction (WR-03, B1) so that the SELECT → INSERT → UPDATE sequence is
+    /// transaction so that the SELECT → INSERT → UPDATE sequence is
     /// crash-safe: if the process dies between the INSERT and the UPDATE, SQLite
     /// rolls back both statements on restart. The transaction guard also rolls
     /// back automatically on `Drop` if any early `?` returns before `tx.commit()`,
@@ -574,7 +575,7 @@ impl SqliteStore {
         let writer = self.writer.lock().await;
         let consumed = writer
             .call(move |conn| {
-                // WR-03: wrap in an explicit transaction so the SELECT + INSERT + UPDATE
+                // Wrap in an explicit transaction so the SELECT + INSERT + UPDATE
                 // are atomic with respect to crashes. The un-committed `tx` rolls back
                 // automatically on Drop if the closure returns without `tx.commit()`.
                 let tx =
@@ -820,7 +821,7 @@ mod tests {
         );
     }
 
-    /// FED-02: max_seq returns 0 on an empty repo_seq table.
+    /// max_seq returns 0 on an empty repo_seq table.
     #[tokio::test]
     async fn max_seq_empty_is_zero() {
         let (store, _tmp) = SqliteStore::open_in_memory().await.expect("open failed");
@@ -828,7 +829,7 @@ mod tests {
         assert_eq!(seq, 0, "max_seq on empty table must return 0");
     }
 
-    /// FED-02: max_seq returns the committed seq after one commit.
+    /// max_seq returns the committed seq after one commit.
     #[tokio::test]
     async fn max_seq_after_commit() {
         use atrium_repo::blockstore::DAG_CBOR;
@@ -861,7 +862,7 @@ mod tests {
         );
     }
 
-    /// FED-02: backfill_page returns all rows in ascending seq order, carrying
+    /// backfill_page returns all rows in ascending seq order, carrying
     /// the correct event bytes for each row.
     #[tokio::test]
     async fn backfill_returns_rows_in_order() {
@@ -953,7 +954,7 @@ mod tests {
         );
     }
 
-    /// FED-02: backfill_page respects the limit and cursor for paging.
+    /// backfill_page respects the limit and cursor for paging.
     #[tokio::test]
     async fn backfill_paging() {
         use atrium_repo::blockstore::DAG_CBOR;

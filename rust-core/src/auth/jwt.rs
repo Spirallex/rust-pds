@@ -115,7 +115,7 @@ pub fn encode_refresh_jwt(did: &str, secret: &[u8]) -> Result<String, CoreError>
 }
 
 /// Decode and verify a JWT.
-/// - `ErrorKind::ExpiredSignature` → `CoreError::ExpiredToken` (T-03-02)
+/// - `ErrorKind::ExpiredSignature` → `CoreError::ExpiredToken`
 /// - All other decode errors → `CoreError::InvalidToken`
 pub fn decode_jwt(token: &str, secret: &[u8]) -> Result<AuthClaims, CoreError> {
     let mut v = Validation::new(JwtAlgorithm::HS256);

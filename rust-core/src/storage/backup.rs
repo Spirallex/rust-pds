@@ -18,8 +18,7 @@ pub async fn export_keys(
 ///
 /// Parses the portable layout, validates the passphrase by attempting decryption,
 /// then writes the ciphertext via `INSERT OR REPLACE INTO keys`. Returns
-/// `StorageError::Crypto` on wrong passphrase or malformed blob — no panic
-/// (T-01-14 mitigated).
+/// `StorageError::Crypto` on wrong passphrase or malformed blob — never panics.
 ///
 /// Portable layout (same as `export_keys` output):
 /// ```text
@@ -93,7 +92,7 @@ pub async fn backup_to_path(
         .call(move |src_conn| {
             let mut dest = rusqlite::Connection::open(&dest_path)?;
             let backup = rusqlite::backup::Backup::new(src_conn, &mut dest)?;
-            // TODO(phase-4): for large DBs the backup should step with periodic
+            // TODO: for large DBs the backup should step with periodic
             // mutex release so live firehose writes are not stalled for minutes.
             // Replace run_to_completion with a manual step loop that releases and
             // re-acquires the writer mutex between steps.

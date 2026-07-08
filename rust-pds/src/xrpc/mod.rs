@@ -40,8 +40,8 @@ pub struct AppState {
     /// `ReqwestPlcClient` which POSTs to https://plc.directory/{did}.
     pub plc_client: Arc<dyn PlcClient>,
     /// Injectable did:web resolver. Tests supply a mock; production supplies
-    /// `ReqwestDidWebResolver`, which GETs a backend-served /.well-known/did.json
-    /// (IDEN-04). Used by `createAccount` when the caller supplies a did:web DID.
+    /// `ReqwestDidWebResolver`, which GETs a backend-served /.well-known/did.json.
+    /// Used by `createAccount` when the caller supplies a did:web DID.
     pub did_web_resolver: Arc<dyn DidWebResolver>,
     /// Passphrase used to encrypt/decrypt per-account signing and rotation keys
     /// at rest (AES-256-GCM + argon2id KDF).

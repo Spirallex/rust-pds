@@ -41,7 +41,7 @@ The wizard walks through:
 4. `requestCrawl` to connect your PDS to the live relay
 
 It detects your network (public `:443` vs. behind a proxy/tunnel) and writes the
-recommended mode to `rust-pds.toml`. It also generates a `PDS_JWT_SECRET` and
+recommended mode to `stelyph.toml`. It also generates a `PDS_JWT_SECRET` and
 prints it **once** — save it now; secrets are deliberately never written to the
 config file.
 
@@ -106,7 +106,7 @@ In both cases set your handle/DID to the tunnel hostname (e.g. `pds.example.com`
 
 ## Configuration
 
-`stelyph init` persists non-secret settings to `rust-pds.toml` (override the path with
+`stelyph init` persists non-secret settings to `stelyph.toml` (override the path with
 `--config` / `PDS_CONFIG`). Everything is also settable per-run; precedence is
 flag > env > config file > default.
 

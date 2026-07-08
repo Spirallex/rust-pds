@@ -3,7 +3,7 @@
 //! Mirrors the `RelayClient` seam in `firehose/crawl.rs`: a trait, a production
 //! Hickory-backed implementation, and a test-double `MockDnsResolver`.
 //!
-//! Security (T-7-04-03/04): DNS results are advisory only — `check_a_record` returns a
+//! Security: DNS results are advisory only — `check_a_record` returns a
 //! typed enum (`DnsCheck`) so the caller WARNS but NEVER hard-fails on mismatch or
 //! lookup failure. DNS propagation lag is a normal operational condition.
 //!
@@ -91,7 +91,7 @@ impl DnsResolver for MockDnsResolver {
 
 /// The outcome of `check_a_record`. All variants are non-error — the caller always
 /// continues (warn-but-allow). Hard-failing on DNS mismatch is explicitly rejected
-/// by the threat model (T-7-04-03) because DNS propagation can lag.
+/// because DNS propagation can lag.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DnsCheck {
     /// The expected IP was found in the resolved A records. All good.
@@ -114,7 +114,7 @@ pub enum DnsCheck {
 /// Returns `DnsCheck::LookupFailed` when the resolver returns an error.
 ///
 /// NEVER returns `Err` — mismatch and lookup failures are non-fatal variants
-/// (DNS propagation lag is a normal operational condition, T-7-04-03).
+/// (DNS propagation lag is a normal operational condition).
 pub async fn check_a_record(
     resolver: &dyn DnsResolver,
     hostname: &str,
