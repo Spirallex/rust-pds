@@ -169,4 +169,4 @@ agencies).
 
 **Commercial use requires a paid license.** If you or your company want to use this
 software for a commercial purpose, contact [Spirallex](https://github.com/spirallex) at
-<zeichenjoyce@gmail.com> to arrange a commercial license.
+<joey@spirallex.com> to arrange a commercial license.
