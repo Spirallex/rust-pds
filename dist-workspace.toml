@@ -8,15 +8,19 @@ cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
-installers = ["shell"]
+installers = ["shell", "homebrew"]
+# Homebrew tap to publish the formula to on each release. The repo must be named
+# `homebrew-tap`; users then run `brew install spirallex/tap/stelyph`.
+tap = "spirallex/homebrew-tap"
+publish-jobs = ["homebrew"]
 # Sigstore build-provenance attestations — verify with:
 #   gh attestation verify <artifact> --repo <owner>/<repo>
 github-attestations = true
 # Target platforms to build apps for (Rust target-triple syntax)
-# Linux-only static musl targets — darwin out of scope (PROJECT.md drop-first)
 targets = [
   "x86_64-unknown-linux-musl",
   "aarch64-unknown-linux-musl",
+  "aarch64-apple-darwin",
 ]
 
 # Native arm64 runner — avoids ring v0.17 aarch64-musl cross-compile failure (Pitfall 1)
@@ -28,3 +32,8 @@ aarch64-unknown-linux-musl = "ubuntu-24.04-arm"
 [dist.dependencies.apt]
 musl-tools = { version = "*", targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] }
 musl-dev = { version = "*", targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] }
+
+# aws-lc-sys (TLS stack) needs cmake to build. macOS runners usually ship it, but
+# pin it explicitly so a runner-image change can't break the darwin release build.
+[dist.dependencies.homebrew]
+cmake = { version = "*", targets = ["aarch64-apple-darwin"] }

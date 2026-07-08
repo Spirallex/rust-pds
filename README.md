@@ -1,7 +1,7 @@
 # Stelyph
 
 [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm--Noncommercial--1.0.0-blue.svg)](LICENSE)
-[![CI](https://github.com/spirallex/stelyph/actions/workflows/ci.yml/badge.svg)](https://github.com/spirallex/stelyph/actions/workflows/ci.yml)
+[![CI](https://github.com/Spirallex/rust-pds/actions/workflows/ci.yml/badge.svg)](https://github.com/Spirallex/rust-pds/actions/workflows/ci.yml)
 
 > A single static binary AT Protocol PDS — self-hosted Bluesky federation.
 > No Docker. No Node. No bundled proxy. One binary, two commands.
@@ -9,12 +9,15 @@
 ## Install
 
 ```sh
+# macOS (Apple Silicon) via Homebrew:
+brew install spirallex/tap/stelyph
+
 # Pre-built static musl binary (Linux x86_64 / aarch64, no toolchain needed):
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/spirallex/stelyph/releases/latest/download/stelyph-installer.sh | sh
+  https://github.com/Spirallex/rust-pds/releases/latest/download/stelyph-installer.sh | sh
 
 # Or build from source (Rust toolchain required):
-git clone https://github.com/spirallex/stelyph && cd stelyph
+git clone https://github.com/Spirallex/rust-pds && cd rust-pds
 cargo install --path rust-pds
 ```
 
@@ -24,7 +27,7 @@ Every release artifact carries a [Sigstore build-provenance attestation](https:/
 proving it was built by this repository's CI:
 
 ```sh
-gh attestation verify stelyph-x86_64-unknown-linux-musl.tar.gz --repo spirallex/stelyph
+gh attestation verify stelyph-x86_64-unknown-linux-musl.tar.gz --repo Spirallex/rust-pds
 ```
 
 ## Quickstart
@@ -70,7 +73,9 @@ Pick any local port with `--port` (default `3000`); the tunnel must forward to t
 port. The examples below use `8080`.
 
 **Cloudflare Tunnel** (`cloudflared`) — or use the interactive helper
-[`scripts/setup-cloudflare-tunnel.sh`](scripts/setup-cloudflare-tunnel.sh):
+[`scripts/setup-cloudflare-tunnel.sh`](scripts/setup-cloudflare-tunnel.sh) (SSO login;
+if that browser flow fails for you, see the
+[API-token fallback](docs/deploy-cloudflare-tunnel-token.md) instead):
 
 ```sh
 stelyph serve --mode proxy --port 8080     # Stelyph listens on :8080; Cloudflare terminates TLS
