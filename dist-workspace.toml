@@ -13,9 +13,11 @@ installers = ["shell", "homebrew"]
 # `homebrew-tap`; users then run `brew install spirallex/tap/stelyph`.
 tap = "spirallex/homebrew-tap"
 publish-jobs = ["homebrew"]
-# Sigstore build-provenance attestations — verify with:
-#   gh attestation verify <artifact> --repo <owner>/<repo>
-github-attestations = true
+# Sigstore build-provenance attestations. Disabled while the repo is PRIVATE on a
+# free org plan — GitHub's attestation API rejects it ("upgrade the billing plan, or
+# make this repository public"). Re-enable (set true, re-run `dist generate`) when the
+# repo goes public; verify with: gh attestation verify <artifact> --repo <owner>/<repo>
+github-attestations = false
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = [
   "x86_64-unknown-linux-musl",
