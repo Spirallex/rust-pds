@@ -265,3 +265,26 @@ pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()>
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // B7/T-06-01: pure heuristic used as the standalone-mode ACME preflight gate.
+    // Must reject IP literals, dotless hosts, and reserved non-public TLDs; accept a
+    // plausible public hostname.
+    #[test]
+    fn acme_preflight_rejects_bad_hostnames() {
+        assert!(!looks_like_public_hostname("127.0.0.1"), "IPv4 literal must be rejected");
+        assert!(!looks_like_public_hostname("::1"), "IPv6 literal must be rejected");
+        assert!(!looks_like_public_hostname("localhost"), "localhost must be rejected");
+        assert!(!looks_like_public_hostname("nodot"), "dotless host must be rejected");
+        assert!(!looks_like_public_hostname("foo.local"), ".local must be rejected");
+        assert!(!looks_like_public_hostname("foo.internal"), ".internal must be rejected");
+        assert!(!looks_like_public_hostname("foo.test"), ".test must be rejected");
+        assert!(
+            looks_like_public_hostname("pds.example.com"),
+            "a plausible public hostname must be accepted"
+        );
+    }
+}
