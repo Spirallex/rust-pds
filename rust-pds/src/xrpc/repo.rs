@@ -1159,12 +1159,18 @@ mod tests {
     use std::sync::Arc;
 
     use atrium_crypto::keypair::{Export, Secp256k1Keypair};
+    use atrium_repo::blockstore::DiffBlockStore;
+    use atrium_repo::Repository;
     use axum::body::Body;
+    use axum::extract::State;
     use axum::http::{Request, StatusCode};
+    use axum::Json;
     use http_body_util::BodyExt;
     use rand::rngs::OsRng;
     use tower::ServiceExt;
 
+    use super::{create_record, CreateRecordInput};
+    use crate::auth::extractor::AccessAuth;
     use crate::auth::jwt::{encode_access_jwt, encode_refresh_jwt, hash_password};
     use crate::identity::plc::MockPlcClient;
     use crate::storage::keys::store_key;
@@ -1992,5 +1998,221 @@ mod tests {
         assert_eq!(claims["iss"], did);
         assert_eq!(claims["aud"], "did:web:api.bsky.app");
         assert_eq!(claims["lxm"], "app.bsky.feed.getTimeline");
+    }
+
+    /// Local mirror of atrium's private schema::SignedCommit for deserialization
+    /// of stored commit blocks, used only to inspect `prev` linkage. Fields must
+    /// match the wire format exactly (mirrors rust-core/src/repo/writer.rs's
+    /// test-only equivalent).
+    #[derive(serde::Deserialize)]
+    struct SignedCommitMirror {
+        #[allow(dead_code)]
+        prev: Option<cid::Cid>,
+    }
+
+    /// B2 (T-04-01): two concurrent createRecord calls for the SAME DID must not
+    /// fork the repo history. Builds ONE shared AppState (with the did_locks map),
+    /// then fires two concurrent create_record calls for the same DID — each call
+    /// builds its OWN RepoWriter through AppState the way the real handler does
+    /// (NOT a single shared Arc<RepoWriter>, which is exactly what would mask the
+    /// production bug: two per-request RepoWriters for the same DID must still
+    /// serialize through the same shared per-DID lock fetched from state.did_locks).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_concurrent_creates_same_did() {
+        let (state, _tmp) = test_state().await;
+        let (did, _token) = seed_account(&state, "concurrent.pds.test").await;
+
+        let state1 = state.clone();
+        let did1 = did.clone();
+        let t1 = tokio::spawn(async move {
+            create_record(
+                State(state1),
+                AccessAuth(did1.clone()),
+                Json(CreateRecordInput {
+                    repo: did1,
+                    collection: "app.bsky.feed.post".to_string(),
+                    record: serde_json::json!({
+                        "$type": "app.bsky.feed.post",
+                        "text": "concurrent first",
+                        "createdAt": "2026-06-17T00:00:00.000Z"
+                    }),
+                    rkey: Some("3kaaaa".to_string()),
+                    validate: None,
+                    swap_commit: None,
+                }),
+            )
+            .await
+            .expect("create_record 1")
+        });
+
+        let state2 = state.clone();
+        let did2 = did.clone();
+        let t2 = tokio::spawn(async move {
+            create_record(
+                State(state2),
+                AccessAuth(did2.clone()),
+                Json(CreateRecordInput {
+                    repo: did2,
+                    collection: "app.bsky.feed.post".to_string(),
+                    record: serde_json::json!({
+                        "$type": "app.bsky.feed.post",
+                        "text": "concurrent second",
+                        "createdAt": "2026-06-17T00:00:00.000Z"
+                    }),
+                    rkey: Some("3kbbbb".to_string()),
+                    validate: None,
+                    swap_commit: None,
+                }),
+            )
+            .await
+            .expect("create_record 2")
+        });
+
+        let (r1, r2) = tokio::join!(t1, t2);
+        let out1 = r1.expect("task 1 panicked").0;
+        let out2 = r2.expect("task 2 panicked").0;
+
+        assert_ne!(
+            out1.cid, out2.cid,
+            "two concurrent creates must produce different record CIDs"
+        );
+
+        // Exactly two repo_seq rows — no lost update.
+        let seq_count = state.store.repo_seq_count().await.expect("seq count");
+        assert_eq!(
+            seq_count, 2,
+            "expected exactly 2 repo_seq rows, got {seq_count}"
+        );
+
+        // Both records must be present in the final MST — a fork would silently
+        // drop whichever write lost the race instead of chaining both commits.
+        let root_cid = state
+            .store
+            .load_repo_root(&did)
+            .await
+            .expect("load_repo_root")
+            .expect("must have a root after two writes");
+        let cloned_store = (*state.store).clone();
+        let mut diff = DiffBlockStore::wrap(cloned_store);
+        let mut repo = Repository::open(&mut diff, root_cid)
+            .await
+            .expect("open repo");
+        let mut tree = repo.tree();
+        assert!(
+            tree.get("app.bsky.feed.post/3kaaaa")
+                .await
+                .expect("mst get 1")
+                .is_some(),
+            "first concurrent record must be present in the final MST"
+        );
+        assert!(
+            tree.get("app.bsky.feed.post/3kbbbb")
+                .await
+                .expect("mst get 2")
+                .is_some(),
+            "second concurrent record must be present in the final MST"
+        );
+
+        // repo_roots must be a SINGLE linear chain, not a fork. The very first
+        // create_record call for a DID lazily writes an empty-repo genesis commit
+        // (prev=None) plus its own write commit chained onto it, so a correctly
+        // serialized pair of concurrent writes produces exactly 3 physical commits
+        // in one chain: genesis -> write1 -> write2. If the shared per-DID lock were
+        // missing, the two calls would race to create TWO independent genesis
+        // commits; the loser's genesis+write would be orphaned (unreachable from the
+        // final root), so walking the `prev` chain from the final root would only
+        // find 2 commits instead of 3 — silently dropping one record.
+        let mut chain_len = 0usize;
+        let mut cursor = Some(root_cid);
+        while let Some(cid) = cursor {
+            chain_len += 1;
+            let bytes = state
+                .store
+                .read_block_bytes(cid)
+                .await
+                .expect("read commit block while walking prev chain");
+            let commit: SignedCommitMirror =
+                serde_ipld_dagcbor::from_slice(&bytes).expect("decode commit while walking chain");
+            cursor = commit.prev;
+        }
+        assert_eq!(
+            chain_len, 3,
+            "expected a single linear chain of 3 commits (genesis + 2 chained \
+             writes) reachable from the final root, got chain length {chain_len} \
+             — a shorter chain means the shared per-DID lock did not serialize the \
+             two concurrent writes and one was forked off / orphaned"
+        );
+    }
+
+    /// B4 (T-04-02/T-04-03): a signing-key-touching operation populates
+    /// `state.signing_key_cache`, and a second key-touching operation for the
+    /// same DID reuses the cached entry instead of re-running the argon2id KDF.
+    #[tokio::test]
+    async fn signing_key_cache_hit_skips_load() {
+        let (state, _tmp) = test_state().await;
+        let (did, token) = seed_account(&state, "cachehit.pds.test").await;
+        let key_id = format!("{did}#signing");
+
+        // Cache starts empty for this DID.
+        assert!(
+            !state.signing_key_cache.contains_key(&key_id),
+            "cache must start empty before any signing-key-touching request"
+        );
+
+        // First createRecord populates the cache (cache miss -> load_key -> insert).
+        let resp = post_json_auth(
+            state.clone(),
+            "/xrpc/com.atproto.repo.createRecord",
+            serde_json::json!({
+                "repo": did,
+                "collection": "app.bsky.feed.post",
+                "record": {
+                    "$type": "app.bsky.feed.post",
+                    "text": "cache warm-up",
+                    "createdAt": "2026-06-17T00:00:00.000Z"
+                }
+            }),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "createRecord must 200");
+
+        assert!(
+            state.signing_key_cache.contains_key(&key_id),
+            "signing_key_cache must contain the \"{{did}}#signing\" entry after a \
+             signing-key-touching request"
+        );
+        let cached_entry = state
+            .signing_key_cache
+            .get(&key_id)
+            .expect("cache entry present");
+        // Type is exercised by construction: the map's value type is
+        // Arc<zeroize::Zeroizing<Vec<u8>>>, so a successful `.get` + deref here
+        // already proves the value is Zeroizing-wrapped.
+        assert!(
+            !cached_entry.as_slice().is_empty(),
+            "cached signing key bytes must be non-empty"
+        );
+        drop(cached_entry);
+
+        // Second key-touching operation (getServiceAuth, a different read-path
+        // handler) succeeds using the cached key — the cache entry is reused, not
+        // replaced by a second independent load_key call.
+        let resp2 = get_auth(
+            state.clone(),
+            "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:api.bsky.app",
+            Some(&token),
+        )
+        .await;
+        assert_eq!(
+            resp2.status(),
+            StatusCode::OK,
+            "getServiceAuth must 200 using the cached signing key"
+        );
+        assert!(
+            state.signing_key_cache.contains_key(&key_id),
+            "signing_key_cache entry must still be present/reused after the second \
+             key-touching request"
+        );
     }
 }

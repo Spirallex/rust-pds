@@ -318,7 +318,7 @@ impl SqliteStore {
     }
 
     /// Count the number of rows in repo_seq. Used in tests to verify atomicity.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub async fn repo_seq_count(&self) -> Result<i64, StorageError> {
         let conn = self
             .readers
