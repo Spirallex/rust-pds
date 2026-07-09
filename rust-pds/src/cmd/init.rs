@@ -135,6 +135,38 @@ fn resolve_password(explicit: Option<String>, is_tty: bool) -> anyhow::Result<St
     }
 }
 
+/// Interactively choose the serving mode, defaulting to the detected recommendation.
+///
+/// 防呆: loops on invalid input instead of silently picking a mode — a wrong guess
+/// here is costly (standalone binds :443 and spends Let's Encrypt attempts; proxy
+/// serves plain HTTP when the operator expected TLS). Only called when stdin is a TTY
+/// and no `--mode`/`PDS_MODE` was given; non-interactive callers keep the advisory
+/// auto-detection inside `run_wizard` (the B5 contract).
+fn prompt_mode(recommended: Recommendation, reason: &str) -> anyhow::Result<super::Mode> {
+    use std::io::Write;
+    let (rec_mode, rec_num, rec_label) = match recommended {
+        Recommendation::Standalone => (super::Mode::Standalone, "1", "standalone"),
+        // Tunnel folds into proxy (plain HTTP behind something that terminates TLS).
+        _ => (super::Mode::Proxy, "2", "proxy"),
+    };
+    println!("Serving mode — detected recommendation: {rec_label} ({reason})");
+    println!("  1) standalone — this host binds :443 and gets its own Let's Encrypt cert");
+    println!("  2) proxy      — plain HTTP behind a reverse proxy / tunnel that terminates TLS");
+    loop {
+        print!("Choose [1/2] (Enter = {rec_num}, {rec_label}): ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        // EOF (Ctrl-D / closed stdin) reads 0 bytes → empty line → falls to the default.
+        std::io::stdin().read_line(&mut line)?;
+        match line.trim() {
+            "" => return Ok(rec_mode),
+            "1" => return Ok(super::Mode::Standalone),
+            "2" => return Ok(super::Mode::Proxy),
+            other => eprintln!("  please enter 1 (standalone) or 2 (proxy) — got '{other}'"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wizard seam types
 // ---------------------------------------------------------------------------
@@ -215,11 +247,8 @@ pub async fn run_wizard(
     // ------------------------------------------------------------------
     println!("[1/7] Detecting network mode...");
     let (recommendation, reason) = match opts.mode_override {
-        Some(super::Mode::Standalone) => (
-            Recommendation::Standalone,
-            "mode override: standalone".to_string(),
-        ),
-        Some(super::Mode::Proxy) => (Recommendation::Proxy, "mode override: proxy".to_string()),
+        Some(super::Mode::Standalone) => (Recommendation::Standalone, "selected".to_string()),
+        Some(super::Mode::Proxy) => (Recommendation::Proxy, "selected".to_string()),
         None => detect::detect_mode(detect::can_bind_443(), ip_client).await,
     };
     let mode_str = match recommendation {
@@ -402,6 +431,50 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
         .clone()
         .unwrap_or_else(|| PathBuf::from("stelyph.toml"));
 
+    // 防呆 pre-flight: never re-bootstrap a database that already has an account.
+    // `stelyph init` creates the FIRST account. If the target DB already holds one,
+    // continuing would either dead-end deep in the wizard on the invite gate (the
+    // confusing `InvalidInviteCode` an operator hit here) or mint a fresh did:plc that
+    // orphans the existing identity. Detect it up front — before any prompt, secret, or
+    // network call — and hand over the exact next command for each intent. We refuse
+    // rather than auto-delete: wiping the DB orphans a live DID on plc.directory.
+    {
+        let existing = SqliteStore::open(&args.db_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to open database {}: {e}", args.db_path))?;
+        let accounts = existing.list_accounts().await?;
+        if !accounts.is_empty() {
+            eprintln!(
+                "Database {} already has {} account(s) — `init` bootstraps the FIRST account only:",
+                args.db_path,
+                accounts.len()
+            );
+            for a in &accounts {
+                eprintln!(
+                    "    {}  ({})",
+                    a.handle.as_deref().unwrap_or("<no handle>"),
+                    a.did
+                );
+            }
+            eprintln!();
+            eprintln!("What did you want to do?");
+            eprintln!("  • Run this existing PDS       →  stelyph serve");
+            eprintln!("  • Add another account         →  stelyph admin create-invite  (then register with the code)");
+            eprintln!("  • Set up a SEPARATE instance  →  stelyph init --db-path <other-file>");
+            eprintln!(
+                "  • Start over (DELETES the account above and ORPHANS its DID on plc.directory)"
+            );
+            eprintln!(
+                "                                →  rm {0} {0}-wal {0}-shm  &&  stelyph init",
+                args.db_path
+            );
+            anyhow::bail!(
+                "refusing to re-initialize {} — it already has accounts (see options above)",
+                args.db_path
+            );
+        }
+    }
+
     // Resolve the hostname/DNS target. B5: when --hostname/PDS_HOSTNAME was supplied
     // explicitly, use it directly and SKIP the prompt entirely (no stdin read at all) —
     // this is what lets `init` run non-interactively in Docker/CI/pipes. Only when no
@@ -489,10 +562,30 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
         }
     };
 
+    // Resolve the serving mode. `--mode`/`PDS_MODE` wins outright (the non-interactive
+    // path). Otherwise, if we have a terminal, detect the recommended default and let the
+    // operator CHOOSE (they asked to pick standalone vs proxy, not have it forced). With no
+    // terminal and no flag we pass None and `run_wizard` keeps advisory auto-detection —
+    // the B5 non-interactive contract. `ip_client` is built here (used for detection now
+    // and passed to the wizard's DNS step below).
+    use std::io::IsTerminal;
+    let ip_client = detect::ReqwestExternalIpClient::new()
+        .map_err(|e| anyhow::anyhow!("Failed to create IP client: {e}"))?;
+    let mode_override: Option<super::Mode> = match args.mode {
+        Some(m) => Some(m),
+        None => {
+            if std::io::stdin().is_terminal() {
+                let (rec, reason) = detect::detect_mode(detect::can_bind_443(), &ip_client).await;
+                Some(prompt_mode(rec, &reason)?)
+            } else {
+                None
+            }
+        }
+    };
+
     // Resolve password: --password/PDS_ADMIN_PASSWORD wins outright (no prompt); otherwise
     // prompt (non-echoing) only if a terminal is available, else error
     // actionably instead of crashing on a missing /dev/tty (B5).
-    use std::io::IsTerminal;
     let password = resolve_password(args.password.clone(), std::io::stdin().is_terminal())?;
 
     // Resolve or generate jwt_secret.
@@ -561,9 +654,7 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
         signing_key_cache: Arc::new(dashmap::DashMap::new()),
     };
 
-    // Build live clients.
-    let ip_client = detect::ReqwestExternalIpClient::new()
-        .map_err(|e| anyhow::anyhow!("Failed to create IP client: {e}"))?;
+    // Build the remaining live clients (ip_client was created earlier for mode detection).
     let dns_resolver = dns::HickoryResolver::new()
         .map_err(|e| anyhow::anyhow!("Failed to create DNS resolver: {e}"))?;
 
@@ -586,7 +677,7 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
         handle,
         password,
         key_passphrase,
-        mode_override: args.mode,
+        mode_override,
         relay_url: args.relay_url,
         db_path: args.db_path,
         port,
