@@ -800,6 +800,7 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
     // save them to the Keychain after the account is created — see end of run().
     let jwt_for_keychain = String::from_utf8_lossy(&jwt_secret_bytes).to_string();
     let passphrase_for_keychain = String::from_utf8_lossy(&key_passphrase).to_string();
+    let hostname_for_keychain = hostname.clone();
 
     let state = AppState {
         store: Arc::new(store),
@@ -857,17 +858,23 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
     // export or separate `keychain set`. Non-fatal: a failure just means the operator
     // uses env / `keychain set` instead. No-op on non-macOS.
     if crate::keychain::SUPPORTED {
-        let saved = crate::keychain::set(&hostname, crate::keychain::JWT_SECRET, &jwt_for_keychain)
-            .and_then(|()| {
-                crate::keychain::set(
-                    &hostname,
-                    crate::keychain::KEY_PASSPHRASE,
-                    &passphrase_for_keychain,
-                )
-            });
+        let saved = crate::keychain::set(
+            &hostname_for_keychain,
+            crate::keychain::JWT_SECRET,
+            &jwt_for_keychain,
+        )
+        .and_then(|()| {
+            crate::keychain::set(
+                &hostname_for_keychain,
+                crate::keychain::KEY_PASSPHRASE,
+                &passphrase_for_keychain,
+            )
+        });
         match saved {
             Ok(()) => {
-                println!("  ✓ secrets saved to your macOS Keychain — `stelyph serve` needs no export.");
+                println!(
+                    "  ✓ secrets saved to your macOS Keychain — `stelyph serve` needs no export."
+                );
             }
             Err(e) => {
                 eprintln!("  note: could not save secrets to the Keychain ({e}); use env vars or `stelyph keychain set`.");
