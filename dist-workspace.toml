@@ -13,6 +13,12 @@ installers = ["shell", "homebrew"]
 # `homebrew-tap`; users then run `brew install spirallex/tap/stelyph`.
 tap = "spirallex/homebrew-tap"
 publish-jobs = ["homebrew"]
+# Also publish the formula on PRERELEASE tags (0.1.0-alpha.N). We only ship
+# prereleases right now, so without this the tap would never update. Requires a
+# HOMEBREW_TAP_TOKEN repo secret (a PAT with write to spirallex/homebrew-tap; the
+# default GITHUB_TOKEN can't push to a different repo). Reconsider once a STABLE
+# release exists — you may then want the public tap to track stable, not alphas.
+publish-prereleases = true
 # Sigstore build-provenance attestations (repo is public — attestation API available).
 # Verify with: gh attestation verify <artifact> --repo Spirallex/rust-pds
 github-attestations = true
