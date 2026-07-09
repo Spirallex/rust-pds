@@ -12,12 +12,17 @@
 
 ```sh
 # Homebrew:
+brew trust spirallex/tap      # newer Homebrew requires trusting third-party taps first
 brew install spirallex/tap/stelyph
 
 # …or the install script:
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/Spirallex/rust-pds/releases/latest/download/stelyph-installer.sh | sh
 ```
+
+> If `brew` errors with *"Refusing to load formula … from untrusted tap"*, run the
+> `brew trust spirallex/tap` line above (or `HOMEBREW_NO_REQUIRE_TAP_TRUST=1`) — it's
+> Homebrew's third-party-tap safety check, not a problem with the formula.
 
 **Linux, or Intel macOS** — build from source (Rust toolchain required):
 
