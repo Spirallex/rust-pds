@@ -17,5 +17,8 @@ target/
 /stelyph.toml
 /rust-pds.toml
 
+# Live PDS instance dir (real account data + encrypted signing keys) — never commit
+/test/
+
 # Internal planning docs — never published
 /.planning/
