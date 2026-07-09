@@ -611,12 +611,20 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
     let handle = match args.handle.clone() {
         Some(h) => h,
         None => {
-            print!("Admin handle (e.g. admin.{}): ", hostname);
+            // Blank (Enter) defaults to the hostname itself — the common single-user
+            // case where the account handle IS the PDS domain. Avoids the confusing
+            // "handle '' does not belong to hostname" error on an empty entry.
+            print!("Admin handle [{hostname}]: ");
             use std::io::Write;
             std::io::stdout().flush()?;
             let mut line = String::new();
             std::io::stdin().read_line(&mut line)?;
-            line.trim().to_string()
+            let entered = line.trim();
+            if entered.is_empty() {
+                hostname.clone()
+            } else {
+                entered.to_string()
+            }
         }
     };
 
