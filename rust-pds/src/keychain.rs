@@ -14,6 +14,7 @@
 //! Secret-Service / dbus stack and callers transparently fall back to env + prompt.
 
 /// Keychain "service" name shared by all stelyph entries.
+#[cfg(target_os = "macos")]
 const SERVICE: &str = "stelyph";
 
 /// Logical secret names (the account half of the Keychain entry).
