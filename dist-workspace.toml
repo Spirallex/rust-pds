@@ -16,14 +16,22 @@ publish-jobs = ["homebrew"]
 # Sigstore build-provenance attestations (repo is public — attestation API available).
 # Verify with: gh attestation verify <artifact> --repo Spirallex/rust-pds
 github-attestations = true
-# Target platforms to build apps for (Rust target-triple syntax).
-# macOS (Apple Silicon) only for now — Linux is build-from-source. To distribute
-# Linux binaries again, re-add the musl targets plus their arm64 runner and apt
-# deps (see git history for the removed [dist.github-custom-runners] /
-# [dist.dependencies.apt] blocks).
+# Target platforms to build apps for (Rust target-triple syntax)
 targets = [
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
   "aarch64-apple-darwin",
 ]
+
+# Native arm64 runner — avoids ring v0.17 aarch64-musl cross-compile failure (Pitfall 1)
+# ring's build.rs requires aarch64-linux-musl-ar; not present when cross-compiling from x86_64
+[dist.github-custom-runners]
+aarch64-unknown-linux-musl = "ubuntu-24.04-arm"
+
+# musl-tools + musl-dev installed per-target on each runner (native arch tools)
+[dist.dependencies.apt]
+musl-tools = { version = "*", targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] }
+musl-dev = { version = "*", targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] }
 
 # aws-lc-sys (TLS stack) needs cmake to build. macOS runners usually ship it, but
 # pin it explicitly so a runner-image change can't break the darwin release build.
