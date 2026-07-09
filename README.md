@@ -8,20 +8,27 @@
 
 ## Install
 
+**macOS (Apple Silicon)** — prebuilt:
+
 ```sh
-# macOS (Apple Silicon) via Homebrew:
+# Homebrew:
 brew install spirallex/tap/stelyph
 
-# Pre-built static musl binary (Linux x86_64 / aarch64, no toolchain needed):
+# …or the install script:
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/Spirallex/rust-pds/releases/latest/download/stelyph-installer.sh | sh
+```
 
-# Or build from source (Rust toolchain required):
+**Linux, or Intel macOS** — build from source (Rust toolchain required):
+
+```sh
 git clone https://github.com/Spirallex/rust-pds && cd rust-pds
 cargo install --path rust-pds
 ```
 
-The musl binaries are fully static — no glibc, no system SQLite, no runtime dependencies.
+> Prebuilt binaries are macOS / Apple Silicon only for now. Linux is fully supported
+> from source — plus the [Docker](Dockerfile) and [Coolify](docs/deploy-coolify.md)
+> deploy paths — and prebuilt Linux (musl) binaries will return in a later release.
 
 **macOS direct downloads:** the release binaries aren't Apple-notarized yet, so a copy pulled
 from the Releases page (browser or `curl`) carries Gatekeeper's quarantine flag. Clear it once
@@ -38,7 +45,7 @@ Release artifacts (after `v0.1.0-alpha.1`) carry a [Sigstore build-provenance at
 proving they were built by this repository's CI:
 
 ```sh
-gh attestation verify stelyph-x86_64-unknown-linux-musl.tar.gz --repo Spirallex/rust-pds
+gh attestation verify stelyph-aarch64-apple-darwin.tar.xz --repo Spirallex/rust-pds
 ```
 
 ## Quickstart
