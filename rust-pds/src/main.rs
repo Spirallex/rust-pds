@@ -29,5 +29,6 @@ async fn main() -> anyhow::Result<()> {
         Command::ExportKeys(args) => stelyph::cmd::export_keys::run(args).await,
         Command::ImportKeys(args) => stelyph::cmd::import_keys::run(args).await,
         Command::Admin(args) => stelyph::cmd::admin::run(args).await,
+        Command::Keychain(args) => stelyph::cmd::keychain::run(args, cli.config).await,
     }
 }

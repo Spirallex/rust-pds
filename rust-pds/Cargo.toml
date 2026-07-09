@@ -55,6 +55,13 @@ tokio-stream = { version = "0.1", features = ["net"] }
 rpassword = "7"
 dashmap = "6.2"
 
+# macOS Keychain storage for serve secrets (so PDS_JWT_SECRET / PDS_KEY_PASSPHRASE
+# need not be exported each run). macOS-only: gated to keep the fully-static Linux
+# musl build free of the Secret-Service / dbus stack. Linux/Windows fall back to
+# env + interactive prompt (see src/keychain.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
 [dev-dependencies]
 # Enable the core's `testing` feature for the server test suite so the in-memory
 # store + seed helpers (open_in_memory, set_takedown, insert_invite) are visible.

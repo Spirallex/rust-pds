@@ -2,6 +2,7 @@ pub mod admin;
 pub mod export_keys;
 pub mod import_keys;
 pub mod init;
+pub mod keychain;
 pub mod serve;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -33,6 +34,8 @@ pub enum Command {
     ImportKeys(import_keys::ImportKeysArgs),
     /// Local admin tooling (invites, accounts, takedown, password reset)
     Admin(admin::AdminArgs),
+    /// Store serve secrets in the macOS Keychain (so `serve` needs no env export)
+    Keychain(keychain::KeychainArgs),
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]

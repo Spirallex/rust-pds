@@ -5,6 +5,7 @@ pub mod detect;
 pub mod dns;
 pub mod firehose;
 pub mod identity;
+pub mod keychain;
 pub mod proxy_snippet;
 pub mod tls;
 pub mod xrpc;

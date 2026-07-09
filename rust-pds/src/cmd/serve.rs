@@ -80,15 +80,21 @@ fn looks_like_public_hostname(host: &str) -> bool {
 ///
 /// Extracted as a testable seam: the no-TTY error and length-validation paths are unit-tested
 /// without spawning a real prompt (which would crash on a missing /dev/tty).
-fn resolve_jwt_secret(explicit: Option<String>, allow_prompt: bool) -> anyhow::Result<Vec<u8>> {
-    let raw = match explicit {
+fn resolve_jwt_secret(
+    explicit: Option<String>,
+    hostname: &str,
+    allow_prompt: bool,
+) -> anyhow::Result<Vec<u8>> {
+    // Precedence: explicit env/flag > Keychain (macOS) > interactive prompt.
+    let raw = match explicit.or_else(|| crate::keychain::get(hostname, crate::keychain::JWT_SECRET))
+    {
         Some(s) => s,
         None => {
             if !allow_prompt {
                 anyhow::bail!(
                     "PDS_JWT_SECRET is required (it signs session tokens). Set it and restart:\n  \
                      export PDS_JWT_SECRET=\"$(openssl rand -base64 32)\"\n\
-                     Reuse the same value across restarts to keep login sessions valid."
+                     Or save it once so serve reads it automatically:  stelyph keychain set"
                 );
             }
             let entered = rpassword::prompt_password(
@@ -123,15 +129,23 @@ fn resolve_jwt_secret(explicit: Option<String>, allow_prompt: bool) -> anyhow::R
 /// prompts (non-echoing). It MUST match the passphrase set at `stelyph init` — it decrypts
 /// the signing keys at rest, so a different value fails to load existing accounts. Non-
 /// interactively a missing value is a fail-fast error, never a hang on a prompt.
-fn resolve_key_passphrase(explicit: Option<String>, allow_prompt: bool) -> anyhow::Result<Vec<u8>> {
-    let raw = match explicit {
+fn resolve_key_passphrase(
+    explicit: Option<String>,
+    hostname: &str,
+    allow_prompt: bool,
+) -> anyhow::Result<Vec<u8>> {
+    // Precedence: explicit env/flag > Keychain (macOS) > interactive prompt.
+    let raw = match explicit
+        .or_else(|| crate::keychain::get(hostname, crate::keychain::KEY_PASSPHRASE))
+    {
         Some(p) => p,
         None => {
             if !allow_prompt {
                 anyhow::bail!(
                     "PDS_KEY_PASSPHRASE is required (it decrypts your signing keys — must match \
                      the passphrase you set at `stelyph init`). Set it and restart:\n  \
-                     export PDS_KEY_PASSPHRASE=\"...\""
+                     export PDS_KEY_PASSPHRASE=\"...\"\n\
+                     Or save it once so serve reads it automatically:  stelyph keychain set"
                 );
             }
             rpassword::prompt_password("PDS_KEY_PASSPHRASE (the passphrase you set at init): ")?
@@ -172,8 +186,8 @@ pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()>
     // secret can never hang the service waiting on a prompt.
     use std::io::IsTerminal;
     let allow_prompt = std::io::stdin().is_terminal() && !args.non_interactive;
-    let jwt_secret = resolve_jwt_secret(args.jwt_secret, allow_prompt)?;
-    let key_passphrase = resolve_key_passphrase(args.key_passphrase, allow_prompt)?;
+    let jwt_secret = resolve_jwt_secret(args.jwt_secret, &hostname, allow_prompt)?;
+    let key_passphrase = resolve_key_passphrase(args.key_passphrase, &hostname, allow_prompt)?;
 
     let db_path = args
         .db_path
@@ -422,15 +436,18 @@ mod tests {
     #[test]
     fn jwt_secret_explicit_is_honored_and_length_checked() {
         // 32+ bytes explicit → ok, even with no TTY.
-        let ok = resolve_jwt_secret(Some("x".repeat(32)), false).expect("32 bytes ok");
+        let ok = resolve_jwt_secret(Some("x".repeat(32)), "no-such-host.invalid", false)
+            .expect("32 bytes ok");
         assert_eq!(ok.len(), 32);
         // Too short → error.
-        assert!(resolve_jwt_secret(Some("short".into()), true).is_err());
+        assert!(resolve_jwt_secret(Some("short".into()), "no-such-host.invalid", true).is_err());
     }
 
     #[test]
     fn jwt_secret_missing_no_tty_errors_actionably() {
-        let err = resolve_jwt_secret(None, false).unwrap_err().to_string();
+        let err = resolve_jwt_secret(None, "no-such-host.invalid", false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("PDS_JWT_SECRET is required"));
         assert!(
             err.contains("openssl rand"),
@@ -441,18 +458,21 @@ mod tests {
     #[test]
     fn key_passphrase_explicit_and_empty_rules() {
         assert_eq!(
-            resolve_key_passphrase(Some("pw".into()), false).expect("explicit ok"),
+            resolve_key_passphrase(Some("pw".into()), "no-such-host.invalid", false)
+                .expect("explicit ok"),
             b"pw".to_vec()
         );
         assert!(
-            resolve_key_passphrase(Some(String::new()), true).is_err(),
+            resolve_key_passphrase(Some(String::new()), "no-such-host.invalid", true).is_err(),
             "empty passphrase must be rejected"
         );
     }
 
     #[test]
     fn key_passphrase_missing_no_tty_errors_actionably() {
-        let err = resolve_key_passphrase(None, false).unwrap_err().to_string();
+        let err = resolve_key_passphrase(None, "no-such-host.invalid", false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("PDS_KEY_PASSPHRASE is required"));
         assert!(err.contains("stelyph init"), "error must reference init");
     }
