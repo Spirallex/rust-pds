@@ -1,6 +1,6 @@
 [package]
 name = "stelyph"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 description = "A single static binary AT Protocol PDS (Personal Data Server) for self-hosted Bluesky federation"
