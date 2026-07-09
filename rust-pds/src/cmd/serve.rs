@@ -42,6 +42,11 @@ pub struct ServeArgs {
     pub appview_did: Option<String>,
     #[arg(long)]
     pub open_registration: bool,
+    /// Never prompt for missing secrets — fail fast instead. Set this for
+    /// Docker/systemd/CI, where a `-t` pseudo-TTY could otherwise make `serve`
+    /// wait on an interactive prompt and hang the service.
+    #[arg(long, env = "PDS_NON_INTERACTIVE")]
+    pub non_interactive: bool,
 }
 
 /// Pure heuristic gate used as the standalone-mode ACME preflight.
@@ -67,6 +72,77 @@ fn looks_like_public_hostname(host: &str) -> bool {
         || lower.ends_with(".test"))
 }
 
+/// Resolve `PDS_JWT_SECRET` for `serve`. Explicit env/flag wins. Interactively (TTY) it
+/// prompts (non-echoing); an empty entry generates a fresh 32-byte secret and prints it
+/// once with a persistence nudge — a JWT secret that changes between restarts invalidates
+/// existing login sessions. Non-interactively (no TTY: Docker/systemd/CI) a missing secret
+/// is a fail-fast error with the exact command, never a hang on a prompt. Enforces ≥32 bytes.
+///
+/// Extracted as a testable seam: the no-TTY error and length-validation paths are unit-tested
+/// without spawning a real prompt (which would crash on a missing /dev/tty).
+fn resolve_jwt_secret(explicit: Option<String>, allow_prompt: bool) -> anyhow::Result<Vec<u8>> {
+    let raw = match explicit {
+        Some(s) => s,
+        None => {
+            if !allow_prompt {
+                anyhow::bail!(
+                    "PDS_JWT_SECRET is required (it signs session tokens). Set it and restart:\n  \
+                     export PDS_JWT_SECRET=\"$(openssl rand -base64 32)\"\n\
+                     Reuse the same value across restarts to keep login sessions valid."
+                );
+            }
+            let entered = rpassword::prompt_password(
+                "PDS_JWT_SECRET (paste the one from init, or leave blank to generate): ",
+            )?;
+            if entered.trim().is_empty() {
+                use rand::RngCore;
+                let mut bytes = vec![0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut bytes);
+                let encoded = data_encoding::BASE64URL_NOPAD.encode(&bytes);
+                println!("Generated PDS_JWT_SECRET={encoded}");
+                println!(
+                    "  Save it and set PDS_JWT_SECRET to keep login sessions valid across restarts."
+                );
+                return Ok(encoded.into_bytes());
+            }
+            entered
+        }
+    };
+    let bytes = raw.into_bytes();
+    if bytes.len() < 32 {
+        anyhow::bail!(
+            "PDS_JWT_SECRET must be at least 32 bytes (got {}). Generate a strong one:\n  \
+             export PDS_JWT_SECRET=\"$(openssl rand -base64 32)\"",
+            bytes.len()
+        );
+    }
+    Ok(bytes)
+}
+
+/// Resolve `PDS_KEY_PASSPHRASE` for `serve`. Explicit env/flag wins. Interactively (TTY) it
+/// prompts (non-echoing). It MUST match the passphrase set at `stelyph init` — it decrypts
+/// the signing keys at rest, so a different value fails to load existing accounts. Non-
+/// interactively a missing value is a fail-fast error, never a hang on a prompt.
+fn resolve_key_passphrase(explicit: Option<String>, allow_prompt: bool) -> anyhow::Result<Vec<u8>> {
+    let raw = match explicit {
+        Some(p) => p,
+        None => {
+            if !allow_prompt {
+                anyhow::bail!(
+                    "PDS_KEY_PASSPHRASE is required (it decrypts your signing keys — must match \
+                     the passphrase you set at `stelyph init`). Set it and restart:\n  \
+                     export PDS_KEY_PASSPHRASE=\"...\""
+                );
+            }
+            rpassword::prompt_password("PDS_KEY_PASSPHRASE (the passphrase you set at init): ")?
+        }
+    };
+    if raw.is_empty() {
+        anyhow::bail!("PDS_KEY_PASSPHRASE must not be empty.");
+    }
+    Ok(raw.into_bytes())
+}
+
 pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()> {
     // 1. Load config file (file < env < flag precedence).
     // An explicit --config/PDS_CONFIG that doesn't exist is a hard error;
@@ -81,40 +157,23 @@ pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()>
     };
 
     // 2. Resolve effective values: flag/env (already folded by clap) > file > default.
-    let hostname = args.hostname.or(cfg.hostname).unwrap_or_else(|| {
-        eprintln!("FATAL: PDS_HOSTNAME is required (set via env, flag, or stelyph.toml)");
-        std::process::exit(1);
-    });
+    let hostname = match args.hostname.or(cfg.hostname) {
+        Some(h) => h,
+        None => anyhow::bail!(
+            "PDS_HOSTNAME is required. `stelyph init` writes it to stelyph.toml; \
+             otherwise set PDS_HOSTNAME or pass --hostname."
+        ),
+    };
 
-    // jwt_secret and key_passphrase are never read from the config file — env/flag only.
-    // Only the byte LENGTH is printed on error, never the value itself.
-    let jwt_secret = args
-        .jwt_secret
-        .unwrap_or_else(|| {
-            eprintln!("FATAL: PDS_JWT_SECRET is required");
-            std::process::exit(1);
-        })
-        .into_bytes();
-    if jwt_secret.len() < 32 {
-        eprintln!(
-            "FATAL: PDS_JWT_SECRET must be at least 32 bytes (got {}). \
-             Set a strong secret before starting the server.",
-            jwt_secret.len()
-        );
-        std::process::exit(1);
-    }
-
-    let key_passphrase = args
-        .key_passphrase
-        .unwrap_or_else(|| {
-            eprintln!("FATAL: PDS_KEY_PASSPHRASE is required");
-            std::process::exit(1);
-        })
-        .into_bytes();
-    if key_passphrase.is_empty() {
-        eprintln!("FATAL: PDS_KEY_PASSPHRASE must not be empty.");
-        std::process::exit(1);
-    }
+    // jwt_secret and key_passphrase are never read from the config file — env/flag only,
+    // or prompted interactively. We may prompt only when stdin is a real terminal AND
+    // --non-interactive/PDS_NON_INTERACTIVE was not set. The explicit flag lets a
+    // Docker/systemd service force fail-fast even under a `-t` pseudo-TTY, so a missing
+    // secret can never hang the service waiting on a prompt.
+    use std::io::IsTerminal;
+    let allow_prompt = std::io::stdin().is_terminal() && !args.non_interactive;
+    let jwt_secret = resolve_jwt_secret(args.jwt_secret, allow_prompt)?;
+    let key_passphrase = resolve_key_passphrase(args.key_passphrase, allow_prompt)?;
 
     let db_path = args
         .db_path
@@ -354,5 +413,47 @@ mod tests {
             looks_like_public_hostname("pds.example.com"),
             "a plausible public hostname must be accepted"
         );
+    }
+
+    // Secret resolution: explicit env/flag values are honored regardless of TTY; a
+    // missing secret with no TTY is a fail-fast error (never a prompt/hang); the ≥32-byte
+    // and non-empty validations hold. The interactive prompt branch (is_tty=true, None)
+    // is not unit-tested here — it opens /dev/tty — but is exercised by manual run.
+    #[test]
+    fn jwt_secret_explicit_is_honored_and_length_checked() {
+        // 32+ bytes explicit → ok, even with no TTY.
+        let ok = resolve_jwt_secret(Some("x".repeat(32)), false).expect("32 bytes ok");
+        assert_eq!(ok.len(), 32);
+        // Too short → error.
+        assert!(resolve_jwt_secret(Some("short".into()), true).is_err());
+    }
+
+    #[test]
+    fn jwt_secret_missing_no_tty_errors_actionably() {
+        let err = resolve_jwt_secret(None, false).unwrap_err().to_string();
+        assert!(err.contains("PDS_JWT_SECRET is required"));
+        assert!(
+            err.contains("openssl rand"),
+            "error must show how to set it"
+        );
+    }
+
+    #[test]
+    fn key_passphrase_explicit_and_empty_rules() {
+        assert_eq!(
+            resolve_key_passphrase(Some("pw".into()), false).expect("explicit ok"),
+            b"pw".to_vec()
+        );
+        assert!(
+            resolve_key_passphrase(Some(String::new()), true).is_err(),
+            "empty passphrase must be rejected"
+        );
+    }
+
+    #[test]
+    fn key_passphrase_missing_no_tty_errors_actionably() {
+        let err = resolve_key_passphrase(None, false).unwrap_err().to_string();
+        assert!(err.contains("PDS_KEY_PASSPHRASE is required"));
+        assert!(err.contains("stelyph init"), "error must reference init");
     }
 }
