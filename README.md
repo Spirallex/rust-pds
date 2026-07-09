@@ -34,8 +34,8 @@ xattr -d com.apple.quarantine ./stelyph
 `brew install` and `cargo install --path` builds are **not** affected — only quarantined
 downloads are.
 
-Every release artifact carries a [Sigstore build-provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations)
-proving it was built by this repository's CI:
+Release artifacts (after `v0.1.0-alpha.1`) carry a [Sigstore build-provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations)
+proving they were built by this repository's CI:
 
 ```sh
 gh attestation verify stelyph-x86_64-unknown-linux-musl.tar.gz --repo Spirallex/rust-pds
