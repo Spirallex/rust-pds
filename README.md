@@ -32,8 +32,8 @@ cargo install --path rust-pds
 ```
 
 > Prebuilt binaries are macOS / Apple Silicon only for now. Linux is fully supported
-> from source — plus the [Docker](Dockerfile) and [Coolify](docs/deploy-coolify.md)
-> deploy paths — and prebuilt Linux (musl) binaries will return in a later release.
+> from source — plus the [Docker](Dockerfile) deploy path — and prebuilt Linux (musl)
+> binaries will return in a later release.
 
 **macOS direct downloads:** the release binaries aren't Apple-notarized yet, so a copy pulled
 from the Releases page (browser or `curl`) carries Gatekeeper's quarantine flag. Clear it once
