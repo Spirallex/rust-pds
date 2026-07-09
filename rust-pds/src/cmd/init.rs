@@ -167,6 +167,141 @@ fn prompt_mode(recommended: Recommendation, reason: &str) -> anyhow::Result<supe
     }
 }
 
+/// Prompt whether to add another account to an already-initialized database, or skip.
+///
+/// 防呆: default (Enter / EOF) is SKIP — never create an account by accident — and it
+/// loops on invalid input rather than guessing.
+fn prompt_add_or_skip(handle: &str) -> anyhow::Result<bool> {
+    use std::io::Write;
+    println!("This database is already set up. You can:");
+    println!("  a) add another account ('{handle}') to it");
+    println!("  s) skip — make no changes");
+    loop {
+        print!("Choose [a/s] (Enter = skip): ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        match line.trim().to_ascii_lowercase().as_str() {
+            "" | "s" | "skip" | "n" | "no" => return Ok(false),
+            "a" | "add" | "y" | "yes" => return Ok(true),
+            other => eprintln!("  please enter 'a' (add) or 's' (skip) — got '{other}'"),
+        }
+    }
+}
+
+/// Add an additional account to an already-initialized database.
+///
+/// Differs from first-account bootstrap in two ways: it mints and consumes an invite
+/// (the second-account path through the same gate), and — critically — it VERIFIES the
+/// entered key passphrase against an existing account's key *before* writing anything.
+/// Every signing key in a database is encrypted with the SAME passphrase; a mismatched
+/// one here would silently produce a key that `stelyph serve` cannot decrypt, breaking
+/// the new account at runtime. So we probe-decrypt an existing key first and refuse on
+/// mismatch (防呆).
+async fn add_user(
+    args: &InitArgs,
+    hostname: &str,
+    handle: &str,
+    probe_did: &str,
+    store: crate::storage::SqliteStore,
+) -> anyhow::Result<()> {
+    use crate::identity::plc::ReqwestPlcClient;
+    use crate::storage::keys::load_key;
+    use std::io::IsTerminal;
+
+    // Password: --password/PDS_ADMIN_PASSWORD wins, else prompt (TTY-guarded, as B5).
+    let password = resolve_password(args.password.clone(), std::io::stdin().is_terminal())?;
+    if password.len() < 8 {
+        anyhow::bail!("password must be at least 8 characters");
+    }
+
+    // Key passphrase — MUST match the one this PDS was created with.
+    let passphrase: Vec<u8> = match args.key_passphrase.clone() {
+        Some(p) => p.into_bytes(),
+        None => {
+            rpassword::prompt_password("Key passphrase (must match this PDS's existing keys): ")?
+                .into_bytes()
+        }
+    };
+
+    // 防呆: verify the passphrase by decrypting an existing account's signing key.
+    // A wrong passphrase makes this fail here instead of corrupting the new account.
+    let probe_key_id = format!("{probe_did}#signing");
+    load_key(&store, &probe_key_id, &passphrase)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "that key passphrase does not match this PDS — it must be the SAME passphrase \
+                 used when the PDS was first created (the one `stelyph serve` decrypts keys with)"
+            )
+        })?;
+    println!("  ✓ passphrase verified against existing keys");
+
+    // Minimal AppState around the existing store. The JWT secret only signs the
+    // access/refresh tokens create_account_inner returns, which we discard here (the new
+    // user logs in via the running server), so a throwaway secret is fine.
+    let mut jwt = vec![0u8; 32];
+    {
+        use rand::RngCore;
+        rand::rngs::OsRng.fill_bytes(&mut jwt);
+    }
+    let plc_client = ReqwestPlcClient::with_url(&args.plc_url)
+        .map_err(|e| anyhow::anyhow!("Failed to create PLC client: {e}"))?;
+    let did_web_resolver = crate::identity::web_resolver::ReqwestDidWebResolver::new(false)
+        .map_err(|e| anyhow::anyhow!("Failed to create did:web resolver: {e}"))?;
+    let relay_client = crate::firehose::ReqwestRelayClient::new()
+        .map_err(|e| anyhow::anyhow!("Failed to create relay client: {e}"))?;
+    let appview_client = crate::xrpc::appview::client::ReqwestAppViewClient::new()
+        .map_err(|e| anyhow::anyhow!("Failed to create AppView client: {e}"))?;
+    let state = AppState {
+        store: Arc::new(store),
+        jwt_secret: Arc::new(jwt),
+        hostname: hostname.to_string(),
+        pds_endpoint: format!("https://{hostname}"),
+        open_registration: false,
+        plc_client: Arc::new(plc_client),
+        did_web_resolver: Arc::new(did_web_resolver),
+        key_passphrase: Arc::new(passphrase),
+        firehose_tx: tokio::sync::broadcast::channel(16).0,
+        relay_client: Arc::new(relay_client),
+        relay_url: args.relay_url.clone(),
+        appview_client: Arc::new(appview_client),
+        appview_url: "https://api.bsky.app".to_string(),
+        appview_did: "did:web:api.bsky.app".to_string(),
+        did_locks: Arc::new(dashmap::DashMap::new()),
+        signing_key_cache: Arc::new(dashmap::DashMap::new()),
+    };
+
+    // Mint a single-use invite, then create the account through the normal gated path.
+    let code = crate::cmd::admin::generate_invite_code();
+    state.store.insert_invite(&code, 1, "admin").await?;
+
+    println!("Creating account (handle: {handle}) — registering did:plc at plc.directory...");
+    let resp = create_account_inner(
+        &state,
+        CreateAccountInput {
+            handle: handle.to_string(),
+            email: None,
+            password: Some(password),
+            invite_code: Some(code),
+            did: None,
+            recovery_key: None,
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("account creation failed: {:?}", e))?;
+
+    println!("  ✓ account created: {}", resp.did);
+    println!();
+    println!(
+        "Stored in {}. A running `stelyph serve` picks it up on the next request; \
+         otherwise start it:",
+        args.db_path
+    );
+    println!("  stelyph serve");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Wizard seam types
 // ---------------------------------------------------------------------------
@@ -431,50 +566,6 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
         .clone()
         .unwrap_or_else(|| PathBuf::from("stelyph.toml"));
 
-    // 防呆 pre-flight: never re-bootstrap a database that already has an account.
-    // `stelyph init` creates the FIRST account. If the target DB already holds one,
-    // continuing would either dead-end deep in the wizard on the invite gate (the
-    // confusing `InvalidInviteCode` an operator hit here) or mint a fresh did:plc that
-    // orphans the existing identity. Detect it up front — before any prompt, secret, or
-    // network call — and hand over the exact next command for each intent. We refuse
-    // rather than auto-delete: wiping the DB orphans a live DID on plc.directory.
-    {
-        let existing = SqliteStore::open(&args.db_path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to open database {}: {e}", args.db_path))?;
-        let accounts = existing.list_accounts().await?;
-        if !accounts.is_empty() {
-            eprintln!(
-                "Database {} already has {} account(s) — `init` bootstraps the FIRST account only:",
-                args.db_path,
-                accounts.len()
-            );
-            for a in &accounts {
-                eprintln!(
-                    "    {}  ({})",
-                    a.handle.as_deref().unwrap_or("<no handle>"),
-                    a.did
-                );
-            }
-            eprintln!();
-            eprintln!("What did you want to do?");
-            eprintln!("  • Run this existing PDS       →  stelyph serve");
-            eprintln!("  • Add another account         →  stelyph admin create-invite  (then register with the code)");
-            eprintln!("  • Set up a SEPARATE instance  →  stelyph init --db-path <other-file>");
-            eprintln!(
-                "  • Start over (DELETES the account above and ORPHANS its DID on plc.directory)"
-            );
-            eprintln!(
-                "                                →  rm {0} {0}-wal {0}-shm  &&  stelyph init",
-                args.db_path
-            );
-            anyhow::bail!(
-                "refusing to re-initialize {} — it already has accounts (see options above)",
-                args.db_path
-            );
-        }
-    }
-
     // Resolve the hostname/DNS target. B5: when --hostname/PDS_HOSTNAME was supplied
     // explicitly, use it directly and SKIP the prompt entirely (no stdin read at all) —
     // this is what lets `init` run non-interactively in Docker/CI/pipes. Only when no
@@ -517,7 +608,7 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
     };
 
     // Prompt for handle (non-secret — plain stdin read is fine, but prompt clearly).
-    let handle = match args.handle {
+    let handle = match args.handle.clone() {
         Some(h) => h,
         None => {
             print!("Admin handle (e.g. admin.{}): ", hostname);
@@ -538,6 +629,69 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
             "admin handle '{handle}' does not belong to hostname '{hostname}' — \
              it must be '{hostname}' or a subdomain like 'admin.{hostname}'"
         );
+    }
+
+    // ── Existing-database check (防呆 + add-user).
+    // `init` bootstraps the FIRST account. If the target DB already has accounts,
+    // blindly continuing would dead-end on the invite gate (the confusing
+    // `InvalidInviteCode` an operator hit) or mint a fresh did:plc that orphans the
+    // existing identity. So: detect it up front, show what's there, and either add
+    // another account into THIS database or skip — never wipe (that orphans a live DID).
+    {
+        let existing_store = SqliteStore::open(&args.db_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to open database {}: {e}", args.db_path))?;
+        let accounts = existing_store.list_accounts().await?;
+        if !accounts.is_empty() {
+            println!(
+                "Database {} already has {} account(s):",
+                args.db_path,
+                accounts.len()
+            );
+            for a in &accounts {
+                println!(
+                    "    {}  ({})",
+                    a.handle.as_deref().unwrap_or("<no handle>"),
+                    a.did
+                );
+            }
+            println!();
+
+            // Non-interactive (no TTY): we can't prompt for the add/skip choice, so
+            // print the exact command for each intent and stop. Never guess.
+            use std::io::IsTerminal;
+            if !std::io::stdin().is_terminal() {
+                eprintln!("`init` bootstraps the first account only. To, non-interactively:");
+                eprintln!("  • run this PDS               →  stelyph serve");
+                eprintln!("  • add another account        →  stelyph admin create-invite  (register with the code)");
+                eprintln!("  • use a separate database    →  stelyph init --db-path <other-file>");
+                anyhow::bail!(
+                    "{} already has accounts; refusing to re-bootstrap non-interactively",
+                    args.db_path
+                );
+            }
+
+            // Interactive: add another account into this DB, or skip. Default = skip
+            // (safe: never create an account by accident). Loops on invalid input.
+            let add = prompt_add_or_skip(&handle)?;
+            if !add {
+                println!("No changes made. To run the existing PDS: stelyph serve");
+                return Ok(());
+            }
+
+            // Guard: the entered handle must not already exist.
+            if accounts
+                .iter()
+                .any(|a| a.handle.as_deref() == Some(handle.as_str()))
+            {
+                anyhow::bail!(
+                    "handle '{handle}' is already registered in {}",
+                    args.db_path
+                );
+            }
+
+            return add_user(&args, &hostname, &handle, &accounts[0].did, existing_store).await;
+        }
     }
 
     // Prompt for the local listen port (default 3000). This is the port the PDS

@@ -177,7 +177,7 @@ pub async fn run(args: AdminArgs) -> anyhow::Result<()> {
 
 /// Generate an opaque invite code: `stelyph-` + 10 lowercase base32 chars from
 /// 50 random bits. Vary by entropy, not time, so it is unguessable.
-fn generate_invite_code() -> String {
+pub(crate) fn generate_invite_code() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 8];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
