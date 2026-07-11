@@ -70,6 +70,14 @@ fn json_response(status: StatusCode, body: String) -> Response<Full<Bytes>> {
         .expect("static response builder never fails")
 }
 
+fn text_response(status: StatusCode, body: String) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/plain")
+        .body(Full::new(Bytes::from(body)))
+        .expect("static response builder never fails")
+}
+
 /// XRPC error envelope: `{"error": "...", "message": "..."}`.
 fn xrpc_error(status: StatusCode, error: &str, message: &str) -> Response<Full<Bytes>> {
     json_response(
@@ -396,6 +404,19 @@ async fn route(state: AppState, req: Request<Incoming>) -> Response<Full<Bytes>>
             .to_string(),
         ),
 
+        // .well-known/atproto-did — HTTPS handle resolution. In the device model
+        // the single account's handle IS the PDS hostname, so a client resolving
+        // `https://<hostname>/.well-known/atproto-did` gets that account's DID as
+        // plain text. This avoids a `_atproto` DNS TXT record: the hostname sits
+        // within the wildcard TLS cert, unlike a deeper `user.<hostname>` handle.
+        (&Method::GET, "/.well-known/atproto-did") => {
+            match state.store.get_did_by_handle(&state.config.hostname).await {
+                Ok(Some(did)) => text_response(StatusCode::OK, did),
+                Ok(None) => text_response(StatusCode::NOT_FOUND, "no account for this host".into()),
+                Err(_) => text_response(StatusCode::INTERNAL_SERVER_ERROR, "store error".into()),
+            }
+        }
+
         // com.atproto.identity.resolveHandle — reads the real account store.
         (&Method::GET, "/xrpc/com.atproto.identity.resolveHandle") => {
             match query_param(&query, "handle") {
@@ -638,6 +659,31 @@ mod tests {
         let (status, json) = get(addr, "/xrpc/com.atproto.repo.createRecord").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(json["error"], "MethodNotImplemented");
+    }
+
+    #[tokio::test]
+    async fn wellknown_atproto_did_returns_hostname_account_did() {
+        let (addr, store) = boot().await;
+        // The single account's handle is the PDS hostname itself (boot: pds.test).
+        store
+            .insert_account("did:plc:selfhost", "pds.test", None, "x")
+            .await
+            .unwrap();
+
+        let (status, text) = request(addr, "GET", "/.well-known/atproto-did").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(text
+            .to_ascii_lowercase()
+            .contains("content-type: text/plain"));
+        let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert_eq!(body, "did:plc:selfhost");
+    }
+
+    #[tokio::test]
+    async fn wellknown_atproto_did_404_without_account() {
+        let (addr, _store) = boot().await;
+        let (status, _text) = request(addr, "GET", "/.well-known/atproto-did").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
