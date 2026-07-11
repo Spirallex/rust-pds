@@ -124,6 +124,7 @@ async fn main() {
             ServerConfig {
                 hostname: "pds.test".into(),
                 open_registration: false,
+                jwt_secret: b"footprint-example-jwt-secret".to_vec(),
             },
         )
         .await;
