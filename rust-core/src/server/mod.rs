@@ -22,7 +22,10 @@
 //! measured before the Network Extension target exists — see
 //! `examples/server_footprint.rs`.
 
+mod appview;
 mod repo;
+
+pub use appview::{OutboundProxy, ProxyResponse};
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -64,6 +67,9 @@ pub struct ServerConfig {
     /// (createRecord & co.) and describeRepo's DID document; with a wrong or
     /// empty passphrase those return InternalError while reads keep working.
     pub key_passphrase: Vec<u8>,
+    /// Service DID of the AppView that `app.bsky.*` reads are forwarded to —
+    /// the `aud` of minted service-auth tokens (e.g. `did:web:api.bsky.app`).
+    pub appview_did: String,
 }
 
 /// Per-DID write locks: concurrent writes to one DID serialize through one
@@ -85,6 +91,9 @@ struct AppState {
     firehose_tx: tokio::sync::broadcast::Sender<crate::firehose::FirehoseEvent>,
     did_locks: DidLocks,
     signing_key_cache: SigningKeyCache,
+    /// Embedder-provided outbound client for the AppView proxy (None → any
+    /// unhandled app.bsky.* read returns MethodNotImplemented).
+    proxy: Option<Arc<dyn OutboundProxy>>,
 }
 
 fn json_response(status: StatusCode, body: String) -> Response<Full<Bytes>> {
@@ -597,6 +606,18 @@ async fn route(state: AppState, req: Request<Incoming>) -> Response<Full<Bytes>>
         (&Method::GET, "/xrpc/com.atproto.sync.getBlob") => repo::get_blob(&state, &query).await,
         (&Method::GET, "/xrpc/com.atproto.sync.getRepo") => repo::get_repo(&state, &query).await,
 
+        // com.atproto.server.getServiceAuth — inter-service token minting.
+        (&Method::GET, "/xrpc/com.atproto.server.getServiceAuth") => {
+            appview::get_service_auth(&state, auth_header, &query).await
+        }
+
+        // app.bsky.* read fallback — forwarded to the AppView via the
+        // embedder-provided outbound client. Explicit arms above (e.g. the
+        // preferences endpoints) win because match arms are ordered.
+        (&Method::GET, p) if p.starts_with("/xrpc/app.bsky.") => {
+            appview::forward(&state, auth_header, p, &query).await
+        }
+
         _ => xrpc_error(
             StatusCode::NOT_FOUND,
             "MethodNotImplemented",
@@ -618,6 +639,7 @@ pub async fn serve(
     listener: TcpListener,
     store: Arc<SqliteStore>,
     config: ServerConfig,
+    proxy: Option<Arc<dyn OutboundProxy>>,
 ) -> std::io::Result<()> {
     let state = AppState {
         store,
@@ -625,6 +647,7 @@ pub async fn serve(
         firehose_tx: tokio::sync::broadcast::channel(16).0,
         did_locks: Arc::new(StdMutex::new(HashMap::new())),
         signing_key_cache: Arc::new(StdMutex::new(HashMap::new())),
+        proxy,
     };
     loop {
         let (stream, _peer) = listener.accept().await?;
@@ -668,6 +691,12 @@ mod tests {
     }
 
     async fn boot() -> (SocketAddr, Arc<SqliteStore>) {
+        boot_with_proxy(None).await
+    }
+
+    async fn boot_with_proxy(
+        proxy: Option<Arc<dyn OutboundProxy>>,
+    ) -> (SocketAddr, Arc<SqliteStore>) {
         let (store, tmp) = SqliteStore::open_in_memory().await.unwrap();
         // Leak the temp file so the on-disk DB outlives the test server.
         std::mem::forget(tmp);
@@ -684,7 +713,9 @@ mod tests {
                     open_registration: false,
                     jwt_secret: b"test-embedded-jwt-secret".to_vec(),
                     key_passphrase: b"test-embedded-key-passphrase".to_vec(),
+                    appview_did: "did:web:appview.test".into(),
                 },
+                proxy,
             )
             .await;
         });
@@ -1327,5 +1358,140 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert!(raw_text.contains("content-type: application/vnd.ipld.car"));
+    }
+
+    /// Records forward() calls and returns a canned upstream response.
+    struct MockProxy {
+        calls: StdMutex<Vec<(String, String, String)>>,
+        response: (u16, Option<String>, Vec<u8>),
+    }
+
+    #[async_trait::async_trait]
+    impl OutboundProxy for MockProxy {
+        async fn forward(
+            &self,
+            nsid: String,
+            query: String,
+            service_jwt: String,
+        ) -> Result<ProxyResponse, String> {
+            self.calls.lock().unwrap().push((nsid, query, service_jwt));
+            let (status, content_type, body) = self.response.clone();
+            Ok(ProxyResponse {
+                status,
+                content_type,
+                body,
+            })
+        }
+    }
+
+    /// Without a configured forwarder, app.bsky.* reads stay MethodNotImplemented.
+    #[tokio::test]
+    async fn appview_fallback_without_proxy_is_not_implemented() {
+        let (addr, store) = boot().await;
+        let did = "did:plc:noproxy";
+        let access = seed_and_login(addr, &store, did).await;
+        let (status, json) = send(
+            addr,
+            "GET",
+            "/xrpc/app.bsky.feed.getTimeline?limit=5",
+            Some(&access),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["error"], "MethodNotImplemented");
+    }
+
+    /// With a forwarder: session validated, service-auth JWT minted with the
+    /// full NSID as lxm and the configured AppView DID as aud, upstream
+    /// response relayed verbatim. Unauthenticated requests never reach it.
+    #[tokio::test]
+    async fn appview_fallback_forwards_with_service_auth() {
+        let mock = Arc::new(MockProxy {
+            calls: StdMutex::new(Vec::new()),
+            response: (
+                200,
+                Some("application/json".into()),
+                b"{\"feed\":[]}".to_vec(),
+            ),
+        });
+        let (addr, store) = boot_with_proxy(Some(mock.clone())).await;
+        let did = "did:plc:proxied";
+        let access = seed_and_login(addr, &store, did).await;
+
+        // Unauthenticated → 401, proxy untouched.
+        let (status, _) = get(addr, "/xrpc/app.bsky.feed.getTimeline?limit=5").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(mock.calls.lock().unwrap().is_empty());
+
+        // Authenticated → forwarded and relayed.
+        let (status, json) = send(
+            addr,
+            "GET",
+            "/xrpc/app.bsky.feed.getTimeline?limit=5",
+            Some(&access),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["feed"], serde_json::json!([]));
+
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (nsid, query, jwt) = &calls[0];
+        assert_eq!(nsid, "app.bsky.feed.getTimeline");
+        assert_eq!(query, "limit=5");
+        // The service JWT carries the full NSID as lxm and the AppView DID as aud.
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        let claims: serde_json::Value = serde_json::from_slice(
+            &data_encoding::BASE64URL_NOPAD
+                .decode(parts[1].as_bytes())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claims["iss"], did);
+        assert_eq!(claims["aud"], "did:web:appview.test");
+        assert_eq!(claims["lxm"], "app.bsky.feed.getTimeline");
+    }
+
+    /// getServiceAuth mints an account-signed token; aud is mandatory.
+    #[tokio::test]
+    async fn get_service_auth_mints_token() {
+        let (addr, store) = boot().await;
+        let did = "did:plc:svcauth";
+        let access = seed_and_login(addr, &store, did).await;
+
+        let (status, json) = send(
+            addr,
+            "GET",
+            "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:video.bsky.app&lxm=app.bsky.video.getUploadLimits",
+            Some(&access),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "getServiceAuth: {json}");
+        let token = json["token"].as_str().expect("token");
+        let parts: Vec<&str> = token.split('.').collect();
+        let claims: serde_json::Value = serde_json::from_slice(
+            &data_encoding::BASE64URL_NOPAD
+                .decode(parts[1].as_bytes())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claims["aud"], "did:web:video.bsky.app");
+        assert_eq!(claims["lxm"], "app.bsky.video.getUploadLimits");
+
+        // aud missing → InvalidRequest.
+        let (status, json) = send(
+            addr,
+            "GET",
+            "/xrpc/com.atproto.server.getServiceAuth",
+            Some(&access),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "InvalidRequest");
     }
 }

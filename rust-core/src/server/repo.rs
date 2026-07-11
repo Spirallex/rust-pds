@@ -46,13 +46,13 @@ fn now_micros() -> u64 {
         .as_micros() as u64
 }
 
-/// Build a `RepoWriter` for `did`, loading and importing its signing key.
-///
-/// Checks the process-local signing-key cache before `load_key` (skips the
-/// argon2id KDF on a warm cache), and fetches the shared per-DID write lock so
-/// concurrent writes serialize instead of forking repo history — the same two
-/// protections the production server applies.
-async fn build_writer(state: &AppState, did: &str) -> Result<RepoWriter, Response<Full<Bytes>>> {
+/// Load and import `did`'s signing key, going through the process-local cache
+/// so a warm path skips the argon2id KDF. Shared by the write path, the DID
+/// document, service-auth minting, and the AppView proxy.
+pub(super) async fn load_signing_key(
+    state: &AppState,
+    did: &str,
+) -> Result<Secp256k1Keypair, Response<Full<Bytes>>> {
     let key_id = format!("{did}#signing");
 
     let cached = state
@@ -61,9 +61,9 @@ async fn build_writer(state: &AppState, did: &str) -> Result<RepoWriter, Respons
         .expect("signing-key cache lock poisoned")
         .get(&key_id)
         .cloned();
-    let signing = match cached {
+    match cached {
         Some(bytes) => Secp256k1Keypair::import(bytes.as_slice())
-            .map_err(|_| internal("failed to import signing key"))?,
+            .map_err(|_| internal("failed to import signing key")),
         None => {
             let key_bytes = load_key(&state.store, &key_id, &state.config.key_passphrase)
                 .await
@@ -75,10 +75,17 @@ async fn build_writer(state: &AppState, did: &str) -> Result<RepoWriter, Respons
                 .lock()
                 .expect("signing-key cache lock poisoned")
                 .insert(key_id, Arc::new(zeroize::Zeroizing::new(key_bytes)));
-            signing
+            Ok(signing)
         }
-    };
+    }
+}
 
+/// Build a `RepoWriter` for `did`, loading and importing its signing key.
+///
+/// Fetches the shared per-DID write lock so concurrent writes serialize
+/// instead of forking repo history — same protection as production.
+async fn build_writer(state: &AppState, did: &str) -> Result<RepoWriter, Response<Full<Bytes>>> {
+    let signing = load_signing_key(state, did).await?;
     let did_typed = Did::from_str(did).map_err(|_| internal("invalid DID"))?;
 
     let lock = state
@@ -642,14 +649,9 @@ pub(super) async fn describe_repo(state: &AppState, query: &str) -> Response<Ful
     }
 
     // The account's public signing key for the DID document.
-    let key_id = format!("{did}#signing");
-    let key_bytes = match load_key(&state.store, &key_id, &state.config.key_passphrase).await {
-        Ok(b) => b,
-        Err(_) => return internal("failed to load signing key"),
-    };
-    let signing = match Secp256k1Keypair::import(&key_bytes) {
+    let signing = match load_signing_key(state, &did).await {
         Ok(k) => k,
-        Err(_) => return internal("failed to import signing key"),
+        Err(resp) => return resp,
     };
     let key_did = signing.did();
     let public_key_multibase = key_did.strip_prefix("did:key:").unwrap_or(&key_did);
