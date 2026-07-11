@@ -22,6 +22,7 @@ use stelyph_core::storage::SqliteStore;
 // `task_vm_info`, laid out (per <mach/task_info.h>) through `phys_footprint` —
 // the exact field iOS Jetsam meters. The count we pass covers just these bytes;
 // the kernel fills up to that and ignores trailing rev3+ ledger fields.
+#[cfg(target_vendor = "apple")]
 #[repr(C)]
 #[derive(Default)]
 struct TaskVmInfo {
@@ -47,6 +48,7 @@ struct TaskVmInfo {
     phys_footprint: u64,
 }
 
+#[cfg(target_vendor = "apple")]
 fn phys_footprint_mb() -> f64 {
     use mach2::task::task_info;
     use mach2::task_info::{task_info_t, TASK_VM_INFO};
@@ -65,6 +67,14 @@ fn phys_footprint_mb() -> f64 {
         }
         vm.phys_footprint as f64 / (1024.0 * 1024.0)
     }
+}
+
+/// phys_footprint is a mach (Apple) ledger; elsewhere report 0 and rely on
+/// peak RSS. The example exists to be run on Apple hosts — this stub only
+/// keeps it compiling in cross-platform CI.
+#[cfg(not(target_vendor = "apple"))]
+fn phys_footprint_mb() -> f64 {
+    0.0
 }
 
 fn peak_rss_mb() -> f64 {
