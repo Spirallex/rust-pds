@@ -2,3 +2,4 @@
 //! mint/verify. The axum request extractors live in the server crate.
 
 pub mod jwt;
+pub mod service_auth;

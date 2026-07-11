@@ -136,7 +136,9 @@ async fn main() {
                 open_registration: false,
                 jwt_secret: b"footprint-example-jwt-secret".to_vec(),
                 key_passphrase: b"footprint-example-passphrase".to_vec(),
+                appview_did: "did:web:api.bsky.app".into(),
             },
+            None,
         )
         .await;
     });
