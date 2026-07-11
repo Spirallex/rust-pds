@@ -28,7 +28,10 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
-      - run: cargo clippy --workspace -- -D warnings
+      # The embedded (on-device) server is feature-gated off by default, so the
+      # workspace run above never compiles or tests it — gate it explicitly.
+      - run: cargo test -p stelyph-core --features embedded-server
+      - run: cargo clippy --workspace --all-features -- -D warnings
       - run: cargo fmt --all --check
 
   docker:

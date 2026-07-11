@@ -3336,6 +3336,7 @@ dependencies = [
  "cid",
  "data-encoding",
  "deadpool-sqlite",
+ "futures-util",
  "http-body-util",
  "hyper",
  "hyper-util",
