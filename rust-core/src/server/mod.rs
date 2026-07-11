@@ -344,6 +344,81 @@ async fn refresh_session(state: &AppState, auth_header: Option<String>) -> Respo
     }
 }
 
+/// GET app.bsky.actor.getPreferences — stored preferences array for the
+/// authenticated DID, `{"preferences":[]}` when none saved yet. Mirrors the
+/// production handler so app clients (e.g. the birth-date step in the Bluesky
+/// app) work against the embedded server.
+async fn get_preferences(state: &AppState, auth_header: Option<String>) -> Response<Full<Bytes>> {
+    let did = match authed_did(&auth_header, &state.config.jwt_secret, "com.atproto.access") {
+        Ok(did) => did,
+        Err(resp) => return resp,
+    };
+    let stored = match state.store.get_preferences(&did).await {
+        Ok(v) => v,
+        Err(_) => {
+            return xrpc_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                "store error",
+            )
+        }
+    };
+    let prefs: serde_json::Value = match stored {
+        None => serde_json::Value::Array(vec![]),
+        Some(json_str) => match serde_json::from_str(&json_str) {
+            Ok(v) => v,
+            Err(_) => {
+                return xrpc_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "stored preferences are corrupt",
+                )
+            }
+        },
+    };
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({ "preferences": prefs }).to_string(),
+    )
+}
+
+/// POST app.bsky.actor.putPreferences — persist the preferences array for the
+/// authenticated DID. 200 with an empty body on success, like production.
+async fn put_preferences(
+    state: &AppState,
+    auth_header: Option<String>,
+    req: Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let did = match authed_did(&auth_header, &state.config.jwt_secret, "com.atproto.access") {
+        Ok(did) => did,
+        Err(resp) => return resp,
+    };
+    let body = match read_json_body(req).await {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    let Some(prefs) = body.get("preferences").filter(|p| p.is_array()) else {
+        return xrpc_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "preferences must be an array",
+        );
+    };
+    // Arrays always serialize; store errors are the only failure mode left.
+    let json_str = prefs.to_string();
+    match state.store.upsert_preferences(&did, &json_str).await {
+        Ok(()) => Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::new()))
+            .expect("static response builder never fails"),
+        Err(_) => xrpc_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            "store error",
+        ),
+    }
+}
+
 /// Mint an access+refresh pair and build the shared session response body.
 fn session_response(state: &AppState, did: &str, handle: &str) -> Response<Full<Bytes>> {
     let secret = &state.config.jwt_secret;
@@ -454,6 +529,15 @@ async fn route(state: AppState, req: Request<Incoming>) -> Response<Full<Bytes>>
         // com.atproto.server.refreshSession — refresh token → new token pair.
         (&Method::POST, "/xrpc/com.atproto.server.refreshSession") => {
             refresh_session(&state, auth_header).await
+        }
+
+        // app.bsky.actor.getPreferences / putPreferences — client-managed
+        // preferences blob (saved feeds, birth date, moderation prefs, …).
+        (&Method::GET, "/xrpc/app.bsky.actor.getPreferences") => {
+            get_preferences(&state, auth_header).await
+        }
+        (&Method::POST, "/xrpc/app.bsky.actor.putPreferences") => {
+            put_preferences(&state, auth_header, req).await
         }
 
         _ => xrpc_error(
@@ -851,5 +935,93 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["did"], "did:plc:alice");
         assert!(json["accessJwt"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
+    /// Preferences require a session on both verbs — no token is a 401.
+    #[tokio::test]
+    async fn preferences_require_session() {
+        let (addr, _store) = boot().await;
+        let (status, json) = get(addr, "/xrpc/app.bsky.actor.getPreferences").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(json["error"], "AuthenticationRequired");
+
+        let (status, json) = send(
+            addr,
+            "POST",
+            "/xrpc/app.bsky.actor.putPreferences",
+            None,
+            Some(r#"{"preferences":[]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(json["error"], "AuthenticationRequired");
+    }
+
+    /// getPreferences starts empty, putPreferences round-trips the array
+    /// verbatim, and a non-array payload is rejected.
+    #[tokio::test]
+    async fn preferences_round_trip() {
+        let (addr, store) = boot().await;
+        seed_account(&store, "did:plc:alice", "alice.pds.test", "hunter2hunter2").await;
+        let (_s, login) = send(
+            addr,
+            "POST",
+            "/xrpc/com.atproto.server.createSession",
+            None,
+            Some(r#"{"identifier":"alice.pds.test","password":"hunter2hunter2"}"#),
+        )
+        .await;
+        let access = login["accessJwt"].as_str().unwrap();
+
+        // Fresh DID → empty preferences array.
+        let (status, json) = send(
+            addr,
+            "GET",
+            "/xrpc/app.bsky.actor.getPreferences",
+            Some(access),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["preferences"], serde_json::json!([]));
+
+        // Store a birth-date pref (what the Bluesky app sends at onboarding).
+        let prefs = r#"{"preferences":[{"$type":"app.bsky.actor.defs#personalDetailsPref","birthDate":"1990-01-01T00:00:00.000Z"}]}"#;
+        let (status, _) = send(
+            addr,
+            "POST",
+            "/xrpc/app.bsky.actor.putPreferences",
+            Some(access),
+            Some(prefs),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Read back verbatim.
+        let (status, json) = send(
+            addr,
+            "GET",
+            "/xrpc/app.bsky.actor.getPreferences",
+            Some(access),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["preferences"][0]["birthDate"],
+            "1990-01-01T00:00:00.000Z"
+        );
+
+        // Non-array preferences payload is an InvalidRequest.
+        let (status, json) = send(
+            addr,
+            "POST",
+            "/xrpc/app.bsky.actor.putPreferences",
+            Some(access),
+            Some(r#"{"preferences":"nope"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "InvalidRequest");
     }
 }
