@@ -480,6 +480,23 @@ fn session_response(state: &AppState, did: &str, handle: &str) -> Response<Full<
     )
 }
 
+/// The DID of the single active (not deactivated / taken down) account, or
+/// None when there are zero or several — the fallback only makes sense when
+/// the device hosts exactly one identity.
+async fn sole_active_account_did(
+    store: &SqliteStore,
+) -> Result<Option<String>, crate::storage::StorageError> {
+    let mut active = store
+        .list_accounts()
+        .await?
+        .into_iter()
+        .filter(|a| a.deactivated_at.is_none() && a.takedown_ref.is_none());
+    match (active.next(), active.next()) {
+        (Some(only), None) => Ok(Some(only.did)),
+        _ => Ok(None),
+    }
+}
+
 async fn route(state: AppState, req: Request<Incoming>) -> Response<Full<Bytes>> {
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
@@ -519,10 +536,23 @@ async fn route(state: AppState, req: Request<Incoming>) -> Response<Full<Bytes>>
         // `https://<hostname>/.well-known/atproto-did` gets that account's DID as
         // plain text. This avoids a `_atproto` DNS TXT record: the hostname sits
         // within the wildcard TLS cert, unlike a deeper `user.<hostname>` handle.
+        //
+        // When the configured hostname doesn't string-match the stored handle
+        // (stale config, historical setup), fall back to the SOLE active
+        // account: on a device host they are the same identity by design, and
+        // a 404 here makes the whole network mark the handle invalid.
         (&Method::GET, "/.well-known/atproto-did") => {
             match state.store.get_did_by_handle(&state.config.hostname).await {
                 Ok(Some(did)) => text_response(StatusCode::OK, did),
-                Ok(None) => text_response(StatusCode::NOT_FOUND, "no account for this host".into()),
+                Ok(None) => match sole_active_account_did(&state.store).await {
+                    Ok(Some(did)) => text_response(StatusCode::OK, did),
+                    Ok(None) => {
+                        text_response(StatusCode::NOT_FOUND, "no account for this host".into())
+                    }
+                    Err(_) => {
+                        text_response(StatusCode::INTERNAL_SERVER_ERROR, "store error".into())
+                    }
+                },
                 Err(_) => text_response(StatusCode::INTERNAL_SERVER_ERROR, "store error".into()),
             }
         }
@@ -648,6 +678,10 @@ pub async fn serve(
     config: ServerConfig,
     proxy: Option<Arc<dyn OutboundProxy>>,
 ) -> std::io::Result<()> {
+    // Hostnames are DNS names: normalize once so config-vs-handle string
+    // comparisons (well-known, describeServer) can't miss on case/whitespace.
+    let mut config = config;
+    config.hostname = config.hostname.trim().to_ascii_lowercase();
     let state = AppState {
         store,
         config: Arc::new(config),
@@ -1664,5 +1698,33 @@ mod tests {
         let (status, json) = get(addr, "/xrpc/com.atproto.sync.subscribeRepos?cursor=-1").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["error"], "InvalidRequest");
+    }
+
+    /// A hostname/handle string mismatch must not break handle verification:
+    /// the well-known endpoint falls back to the sole active account. With a
+    /// second account the fallback is ambiguous and turns off.
+    #[tokio::test]
+    async fn well_known_falls_back_to_sole_account() {
+        let (addr, store) = boot().await;
+        // Handle does NOT match the configured hostname ("pds.test").
+        store
+            .insert_account("did:plc:solo", "j91.other.example", None, "x")
+            .await
+            .unwrap();
+
+        let (status, text) = request(addr, "GET", "/.well-known/atproto-did").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            text.ends_with("did:plc:solo"),
+            "body should be the DID: {text}"
+        );
+
+        // Two active accounts → ambiguous → 404 again.
+        store
+            .insert_account("did:plc:second", "j92.other.example", None, "x")
+            .await
+            .unwrap();
+        let (status, _) = request(addr, "GET", "/.well-known/atproto-did").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }
