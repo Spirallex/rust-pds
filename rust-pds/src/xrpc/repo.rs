@@ -847,105 +847,25 @@ pub async fn get_blob(
     Ok(([(axum::http::header::CONTENT_TYPE, mime_type)], bytes))
 }
 
-/// Validate an ATProto rkey string.
-///
-/// ATProto rkey rules:
-/// - 1–512 bytes.
-/// - Must not contain '/' (would corrupt the MST key space) or NUL bytes.
-/// - Must contain only visible ASCII characters (matching the ATProto spec
-///   allowed set: alphanumerics, `-`, `_`, `~`, `.`, `:`).
+/// Validate an ATProto rkey string (shared rules: `stelyph_core::repo::util`).
 fn validate_rkey(rkey: &str) -> Result<(), XrpcError> {
-    if rkey.is_empty() || rkey.len() > 512 {
-        return Err(XrpcError::InvalidRequest("rkey must be 1–512 chars".into()));
-    }
-    if rkey.contains('/') || rkey.contains('\0') {
-        return Err(XrpcError::InvalidRequest(
-            "rkey must not contain '/' or NUL".into(),
-        ));
-    }
-    // Reject non-printable ASCII and non-ASCII bytes.
-    if !rkey.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
-        return Err(XrpcError::InvalidRequest(
-            "rkey must contain only printable ASCII characters".into(),
-        ));
-    }
-    Ok(())
+    crate::repo::util::validate_rkey(rkey).map_err(XrpcError::InvalidRequest)
 }
 
-/// Validate a collection string (must be a valid NSID-style dotted path).
-///
-/// Rules: at least two dot-separated segments, each segment non-empty,
-/// starts with a letter, and contains only ASCII alphanumeric chars or hyphens.
-/// Must not contain NUL bytes or '/'.
+/// Validate a collection NSID (shared rules: `stelyph_core::repo::util`).
 fn validate_collection(collection: &str) -> Result<(), XrpcError> {
-    if collection.is_empty() || collection.contains('\0') || collection.contains('/') {
-        return Err(XrpcError::InvalidRequest(
-            "collection must be a valid NSID (e.g. app.bsky.feed.post)".into(),
-        ));
-    }
-    let segments: Vec<&str> = collection.split('.').collect();
-    if segments.len() < 2 {
-        return Err(XrpcError::InvalidRequest(
-            "collection must have at least two dot-separated segments".into(),
-        ));
-    }
-    for seg in &segments {
-        if seg.is_empty() {
-            return Err(XrpcError::InvalidRequest(
-                "collection segment must not be empty".into(),
-            ));
-        }
-        if !seg
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_alphabetic())
-            .unwrap_or(false)
-        {
-            return Err(XrpcError::InvalidRequest(
-                "collection segment must start with a letter".into(),
-            ));
-        }
-        if !seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-            return Err(XrpcError::InvalidRequest(
-                "collection segment must contain only alphanumeric chars or hyphens".into(),
-            ));
-        }
-    }
-    Ok(())
+    crate::repo::util::validate_collection(collection).map_err(XrpcError::InvalidRequest)
 }
 
-/// Convert a `serde_json::Value` to `ipld_core::ipld::Ipld`.
-///
-/// Uses serde_ipld_dagcbor as the conversion bridge: encode to DAG-CBOR bytes
-/// then decode back to Ipld. This is the canonical path and preserves all
-/// field types correctly including `$type`, nested objects, and arrays.
+/// Convert a `serde_json::Value` to Ipld (shared bridge: `stelyph_core::repo::util`).
 fn json_value_to_ipld(value: serde_json::Value) -> Result<Ipld, XrpcError> {
-    // Encode the JSON value to DAG-CBOR bytes.
-    let cbor_bytes = serde_ipld_dagcbor::to_vec(&value)
-        .map_err(|e| XrpcError::Internal(anyhow::anyhow!("json→dagcbor encode failed: {e}")))?;
-    // Decode the DAG-CBOR bytes back as Ipld.
-    let ipld: Ipld = serde_ipld_dagcbor::from_slice(&cbor_bytes)
-        .map_err(|e| XrpcError::Internal(anyhow::anyhow!("dagcbor→ipld decode failed: {e}")))?;
-    Ok(ipld)
+    crate::repo::util::json_value_to_ipld(value)
+        .map_err(|e| XrpcError::Internal(anyhow::anyhow!(e)))
 }
 
-/// Generate a TID-style rkey from a microsecond timestamp.
-///
-/// ATProto TID format: base32-sortable lowercase, 13 characters.
-/// The alphabet is `234567abcdefghijklmnopqrstuvwxyz` (base32 without 0, 1).
-/// Upper 53 bits = timestamp in microseconds; lower 10 bits = clock ID (0 here).
+/// TID-style rkey from a microsecond timestamp (shared: `stelyph_core::repo::util`).
 fn tid_from_micros(us: u64) -> String {
-    // Pack into 63-bit value with clock id = 0.
-    let n = us << 10;
-    // Base32 encode: 13 5-bit groups from the 65-bit value.
-    let alphabet = b"234567abcdefghijklmnopqrstuvwxyz";
-    let mut result = [b'2'; 13];
-    let mut val = n;
-    for i in (0..13).rev() {
-        result[i] = alphabet[(val & 0x1f) as usize];
-        val >>= 5;
-    }
-    String::from_utf8(result.to_vec()).unwrap_or_else(|_| "2222222222222".into())
+    crate::repo::util::tid_from_micros(us)
 }
 
 // ---------------------------------------------------------------------------

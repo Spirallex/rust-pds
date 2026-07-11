@@ -7,9 +7,11 @@
 //!
 //! This is a deliberately minimal `hyper` 1.x server: no TLS, no WebSocket, no
 //! extra runtime threads beyond what the caller's tokio provides. It binds
-//! `127.0.0.1` (or whatever the caller passes) and serves a small XRPC read
-//! surface straight off [`SqliteStore`]. TLS termination and inbound routing
-//! are an edge concern (reverse tunnel / VPS), not this process's.
+//! `127.0.0.1` (or whatever the caller passes) and serves the XRPC session,
+//! preferences, and repo surface (records, blobs, CAR export — see
+//! `server/repo.rs`) straight off [`SqliteStore`], sharing validation and the
+//! signed write path with the production server. TLS termination and inbound
+//! routing are an edge concern (reverse tunnel / VPS), not this process's.
 //!
 //! It does add permissive CORS headers and answers `OPTIONS` preflights, since
 //! browser AT Proto clients (e.g. bsky.app) are served from a different origin
@@ -20,9 +22,12 @@
 //! measured before the Network Extension target exists — see
 //! `examples/server_footprint.rs`.
 
+mod repo;
+
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -54,12 +59,32 @@ pub struct ServerConfig {
     /// generates one per device and persists it (e.g. Keychain). An empty
     /// secret disables the session endpoints (they return 401).
     pub jwt_secret: Vec<u8>,
+    /// Passphrase decrypting the account signing keys at rest (same value the
+    /// account was created with). Required for the write endpoints
+    /// (createRecord & co.) and describeRepo's DID document; with a wrong or
+    /// empty passphrase those return InternalError while reads keep working.
+    pub key_passphrase: Vec<u8>,
 }
+
+/// Per-DID write locks: concurrent writes to one DID serialize through one
+/// tokio Mutex instead of forking repo history. Std Mutex around the map —
+/// held only for get-or-insert, never across an await.
+type DidLocks = Arc<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+
+/// Decrypted signing keys by key id, so a warm write path skips the
+/// argon2id KDF. Std Mutex — held only for get/insert, never across await.
+type SigningKeyCache = Arc<StdMutex<HashMap<String, Arc<zeroize::Zeroizing<Vec<u8>>>>>>;
 
 #[derive(Clone)]
 struct AppState {
     store: Arc<SqliteStore>,
     config: Arc<ServerConfig>,
+    /// Commit-frame broadcast, threaded into every RepoWriter. No subscribers
+    /// exist yet in the embedded host (subscribeRepos is future work) — the
+    /// writer tolerates send-to-nobody.
+    firehose_tx: tokio::sync::broadcast::Sender<crate::firehose::FirehoseEvent>,
+    did_locks: DidLocks,
+    signing_key_cache: SigningKeyCache,
 }
 
 fn json_response(status: StatusCode, body: String) -> Response<Full<Bytes>> {
@@ -540,6 +565,38 @@ async fn route(state: AppState, req: Request<Incoming>) -> Response<Full<Bytes>>
             put_preferences(&state, auth_header, req).await
         }
 
+        // Repo writes — signed commits via RepoWriter, per-DID serialized.
+        (&Method::POST, "/xrpc/com.atproto.repo.createRecord") => {
+            repo::create_record(&state, auth_header, req).await
+        }
+        (&Method::POST, "/xrpc/com.atproto.repo.putRecord") => {
+            repo::put_record(&state, auth_header, req).await
+        }
+        (&Method::POST, "/xrpc/com.atproto.repo.deleteRecord") => {
+            repo::delete_record(&state, auth_header, req).await
+        }
+        (&Method::POST, "/xrpc/com.atproto.repo.applyWrites") => {
+            repo::apply_writes(&state, auth_header, req).await
+        }
+
+        // Repo reads — public, straight off the MST.
+        (&Method::GET, "/xrpc/com.atproto.repo.getRecord") => {
+            repo::get_record(&state, &query).await
+        }
+        (&Method::GET, "/xrpc/com.atproto.repo.listRecords") => {
+            repo::list_records(&state, &query).await
+        }
+        (&Method::GET, "/xrpc/com.atproto.repo.describeRepo") => {
+            repo::describe_repo(&state, &query).await
+        }
+
+        // Blobs + full-repo CAR export.
+        (&Method::POST, "/xrpc/com.atproto.repo.uploadBlob") => {
+            repo::upload_blob(&state, auth_header, req).await
+        }
+        (&Method::GET, "/xrpc/com.atproto.sync.getBlob") => repo::get_blob(&state, &query).await,
+        (&Method::GET, "/xrpc/com.atproto.sync.getRepo") => repo::get_repo(&state, &query).await,
+
         _ => xrpc_error(
             StatusCode::NOT_FOUND,
             "MethodNotImplemented",
@@ -565,6 +622,9 @@ pub async fn serve(
     let state = AppState {
         store,
         config: Arc::new(config),
+        firehose_tx: tokio::sync::broadcast::channel(16).0,
+        did_locks: Arc::new(StdMutex::new(HashMap::new())),
+        signing_key_cache: Arc::new(StdMutex::new(HashMap::new())),
     };
     loop {
         let (stream, _peer) = listener.accept().await?;
@@ -623,6 +683,7 @@ mod tests {
                     hostname: "pds.test".into(),
                     open_registration: false,
                     jwt_secret: b"test-embedded-jwt-secret".to_vec(),
+                    key_passphrase: b"test-embedded-key-passphrase".to_vec(),
                 },
             )
             .await;
@@ -1023,5 +1084,248 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["error"], "InvalidRequest");
+    }
+
+    /// Seed an account WITH an encrypted signing key (the write path needs it),
+    /// log in, and return the access token.
+    async fn seed_and_login(addr: SocketAddr, store: &SqliteStore, did: &str) -> String {
+        seed_account(store, did, "alice.pds.test", "hunter2hunter2").await;
+        use atrium_crypto::keypair::Export;
+        let signing = atrium_crypto::keypair::Secp256k1Keypair::create(&mut rand::rngs::OsRng);
+        crate::storage::keys::store_key(
+            store,
+            &format!("{did}#signing"),
+            &signing.export(),
+            b"test-embedded-key-passphrase",
+        )
+        .await
+        .expect("store_key");
+        let (_s, login) = send(
+            addr,
+            "POST",
+            "/xrpc/com.atproto.server.createSession",
+            None,
+            Some(r#"{"identifier":"alice.pds.test","password":"hunter2hunter2"}"#),
+        )
+        .await;
+        login["accessJwt"].as_str().expect("accessJwt").to_owned()
+    }
+
+    /// Full signed-write round trip: createRecord → getRecord → listRecords →
+    /// describeRepo shows the collection → deleteRecord → gone.
+    #[tokio::test]
+    async fn record_write_read_delete_round_trip() {
+        let (addr, store) = boot().await;
+        let did = "did:plc:embeddedwrite";
+        let access = seed_and_login(addr, &store, did).await;
+
+        // Unauthenticated write is rejected.
+        let (status, _) = send(
+            addr,
+            "POST",
+            "/xrpc/com.atproto.repo.createRecord",
+            None,
+            Some(r#"{"repo":"did:plc:embeddedwrite","collection":"app.bsky.feed.post","record":{"$type":"app.bsky.feed.post","text":"x"}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Writing someone else's repo is rejected.
+        let (status, json) = send(
+            addr,
+            "POST",
+            "/xrpc/com.atproto.repo.createRecord",
+            Some(&access),
+            Some(r#"{"repo":"did:plc:other","collection":"app.bsky.feed.post","record":{"$type":"app.bsky.feed.post","text":"x"}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "InvalidRequest");
+
+        // Signed create.
+        let (status, json) = send(
+            addr,
+            "POST",
+            "/xrpc/com.atproto.repo.createRecord",
+            Some(&access),
+            Some(r#"{"repo":"did:plc:embeddedwrite","collection":"app.bsky.feed.post","record":{"$type":"app.bsky.feed.post","text":"embedded hello","createdAt":"2026-01-01T00:00:00Z"}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "createRecord failed: {json}");
+        let uri = json["uri"].as_str().expect("uri").to_owned();
+        assert!(json["cid"].as_str().is_some_and(|c| !c.is_empty()));
+        let rkey = uri.rsplit('/').next().unwrap().to_owned();
+
+        // Public read-back.
+        let (status, json) = get(
+            addr,
+            &format!("/xrpc/com.atproto.repo.getRecord?repo={did}&collection=app.bsky.feed.post&rkey={rkey}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["value"]["text"], "embedded hello");
+
+        // listRecords sees it.
+        let (status, json) = get(
+            addr,
+            &format!("/xrpc/com.atproto.repo.listRecords?repo={did}&collection=app.bsky.feed.post"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["records"].as_array().map(Vec::len), Some(1));
+
+        // describeRepo reports the collection and a well-formed DID doc.
+        let (status, json) = get(
+            addr,
+            &format!("/xrpc/com.atproto.repo.describeRepo?repo={did}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["collections"][0], "app.bsky.feed.post");
+        assert_eq!(json["didDoc"]["id"], did);
+        assert_eq!(json["handleIsCorrect"], true);
+
+        // Delete, then the record is gone and a second delete is a no-op.
+        let del_body =
+            format!(r#"{{"repo":"{did}","collection":"app.bsky.feed.post","rkey":"{rkey}"}}"#);
+        let (status, json) = send(
+            addr,
+            "POST",
+            "/xrpc/com.atproto.repo.deleteRecord",
+            Some(&access),
+            Some(&del_body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["commit"].is_object());
+
+        let (status, _) = get(
+            addr,
+            &format!("/xrpc/com.atproto.repo.getRecord?repo={did}&collection=app.bsky.feed.post&rkey={rkey}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, json) = send(
+            addr,
+            "POST",
+            "/xrpc/com.atproto.repo.deleteRecord",
+            Some(&access),
+            Some(&del_body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            json["commit"].is_null(),
+            "idempotent delete returns null commit"
+        );
+    }
+
+    /// putRecord upserts at a fixed rkey (profile-style), applyWrites batches.
+    #[tokio::test]
+    async fn put_record_and_apply_writes() {
+        let (addr, store) = boot().await;
+        let did = "did:plc:embeddedput";
+        let access = seed_and_login(addr, &store, did).await;
+
+        // put twice at the same rkey — create then update.
+        for text in ["v1", "v2"] {
+            let body = format!(
+                r#"{{"repo":"{did}","collection":"app.bsky.actor.profile","rkey":"self","record":{{"$type":"app.bsky.actor.profile","displayName":"{text}"}}}}"#
+            );
+            let (status, json) = send(
+                addr,
+                "POST",
+                "/xrpc/com.atproto.repo.putRecord",
+                Some(&access),
+                Some(&body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "putRecord {text}: {json}");
+        }
+        let (_s, json) = get(
+            addr,
+            &format!("/xrpc/com.atproto.repo.getRecord?repo={did}&collection=app.bsky.actor.profile&rkey=self"),
+        )
+        .await;
+        assert_eq!(json["value"]["displayName"], "v2");
+
+        // applyWrites: one create + one delete of the profile.
+        let batch = format!(
+            r#"{{"repo":"{did}","writes":[
+                {{"$type":"com.atproto.repo.applyWrites#create","collection":"app.bsky.feed.post","value":{{"$type":"app.bsky.feed.post","text":"batched"}}}},
+                {{"$type":"com.atproto.repo.applyWrites#delete","collection":"app.bsky.actor.profile","rkey":"self"}}
+            ]}}"#
+        );
+        let (status, json) = send(
+            addr,
+            "POST",
+            "/xrpc/com.atproto.repo.applyWrites",
+            Some(&access),
+            Some(&batch),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "applyWrites: {json}");
+        assert_eq!(json["results"].as_array().map(Vec::len), Some(2));
+        assert!(json["commit"].is_object());
+    }
+
+    /// uploadBlob → getBlob round trip, and sync.getRepo yields a CAR archive.
+    #[tokio::test]
+    async fn blobs_and_car_export() {
+        let (addr, store) = boot().await;
+        let did = "did:plc:embeddedblob";
+        let access = seed_and_login(addr, &store, did).await;
+
+        // Upload raw bytes (send() only does JSON, so hand-roll the request).
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let blob: &[u8] = b"\x89PNG fake image bytes";
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "POST /xrpc/com.atproto.repo.uploadBlob HTTP/1.1\r\nHost: pds.test\r\nAuthorization: Bearer {access}\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            blob.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.write_all(blob).await.unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.starts_with("HTTP/1.1 200"), "uploadBlob: {text}");
+        let json = parse_body(&text);
+        let cid = json["blob"]["ref"]["$link"].as_str().expect("blob cid");
+        assert_eq!(json["blob"]["mimeType"], "image/png");
+
+        // getBlob returns the same bytes and mime type.
+        let (status, raw_text) = request(
+            addr,
+            "GET",
+            &format!("/xrpc/com.atproto.sync.getBlob?did={did}&cid={cid}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(raw_text.contains("content-type: image/png"));
+        assert!(raw_text.ends_with("fake image bytes"));
+
+        // A write gives the repo a root, then getRepo exports a CARv1.
+        let (status, _) = send(
+            addr,
+            "POST",
+            "/xrpc/com.atproto.repo.createRecord",
+            Some(&access),
+            Some(&format!(
+                r#"{{"repo":"{did}","collection":"app.bsky.feed.post","record":{{"$type":"app.bsky.feed.post","text":"car me"}}}}"#
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, raw_text) = request(
+            addr,
+            "GET",
+            &format!("/xrpc/com.atproto.sync.getRepo?did={did}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(raw_text.contains("content-type: application/vnd.ipld.car"));
     }
 }

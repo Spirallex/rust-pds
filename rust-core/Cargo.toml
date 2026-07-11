@@ -20,6 +20,9 @@ serde = { workspace = true }
 serde_bytes = { workspace = true }
 serde_ipld_dagcbor = { workspace = true }
 ipld-core = { workspace = true }
+# Non-optional: repo::util's JSON→IPLD bridge needs it, and jsonwebtoken already
+# pulls it into every build (device included), so this adds nothing new.
+serde_json = "1"
 iroh-car = "0.5.1"
 data-encoding = "2"
 
@@ -50,7 +53,8 @@ hyper = { version = "1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }
 bytes = { version = "1", optional = true }
-serde_json = { version = "1", optional = true }
+# MST prefix streams (`entries_prefixed`) are futures Streams; util-only, no exec.
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 # Only pulled in when the `testing` feature is on (in-memory store + seed helpers
 # for downstream test suites). Kept out of production/device builds.
 tempfile = { version = "3", optional = true }
@@ -76,7 +80,7 @@ embedded-server = [
     "dep:hyper-util",
     "dep:http-body-util",
     "dep:bytes",
-    "dep:serde_json",
+    "dep:futures-util",
     "tokio/net",
     "tokio/io-util",
 ]
