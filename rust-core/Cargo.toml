@@ -55,6 +55,8 @@ http-body-util = { version = "0.1", optional = true }
 bytes = { version = "1", optional = true }
 # MST prefix streams (`entries_prefixed`) are futures Streams; util-only, no exec.
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
+# RFC 6455 handshake accept key is SHA-1 by spec (subscribeRepos WS host only).
+sha1 = { version = "0.10", optional = true }
 # Only pulled in when the `testing` feature is on (in-memory store + seed helpers
 # for downstream test suites). Kept out of production/device builds.
 tempfile = { version = "3", optional = true }
@@ -81,6 +83,7 @@ embedded-server = [
     "dep:http-body-util",
     "dep:bytes",
     "dep:futures-util",
+    "dep:sha1",
     "tokio/net",
     "tokio/io-util",
 ]
