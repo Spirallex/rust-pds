@@ -5,11 +5,15 @@
 //! WebSocket + a relay `requestCrawl` client + reqwest — none of which fit an
 //! iOS Network Extension under the Jetsam per-process memory ceiling.
 //!
-//! This is a deliberately minimal `hyper` 1.x server: no TLS, no CORS, no
-//! WebSocket, no extra runtime threads beyond what the caller's tokio provides.
-//! It binds `127.0.0.1` (or whatever the caller passes) and serves a small XRPC
-//! read surface straight off [`SqliteStore`]. TLS termination and inbound
-//! routing are an edge concern (reverse tunnel / VPS), not this process's.
+//! This is a deliberately minimal `hyper` 1.x server: no TLS, no WebSocket, no
+//! extra runtime threads beyond what the caller's tokio provides. It binds
+//! `127.0.0.1` (or whatever the caller passes) and serves a small XRPC read
+//! surface straight off [`SqliteStore`]. TLS termination and inbound routing
+//! are an edge concern (reverse tunnel / VPS), not this process's.
+//!
+//! It does add permissive CORS headers and answers `OPTIONS` preflights, since
+//! browser AT Proto clients (e.g. bsky.app) are served from a different origin
+//! and the browser blocks any response lacking `Access-Control-Allow-Origin`.
 //!
 //! The point of having it in `stelyph-core` (rather than the server crate) is so
 //! it compiles for `aarch64-apple-ios` and its resident footprint can be
@@ -23,6 +27,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::body::Incoming;
+use hyper::header::HeaderValue;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -60,6 +65,34 @@ fn xrpc_error(status: StatusCode, error: &str, message: &str) -> Response<Full<B
         status,
         serde_json::json!({ "error": error, "message": message }).to_string(),
     )
+}
+
+/// Add permissive CORS headers to every response. `Access-Control-Allow-Origin: *`
+/// (no credentials) lets the wildcard `Allow-Headers` cover AT Proto's custom
+/// request headers (`atproto-proxy`, `atproto-accept-labelers`, `authorization`,
+/// …) without enumerating them. The production server does this via tower-http;
+/// here it's by hand to avoid the dependency.
+fn apply_cors(resp: &mut Response<Full<Bytes>>) {
+    let headers = resp.headers_mut();
+    headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+    headers.insert(
+        "access-control-allow-methods",
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    headers.insert(
+        "access-control-allow-headers",
+        HeaderValue::from_static("*"),
+    );
+    headers.insert("access-control-max-age", HeaderValue::from_static("86400"));
+}
+
+/// Empty `204 No Content` used to answer a CORS preflight; the CORS headers are
+/// added uniformly by [`apply_cors`] on the way out.
+fn preflight_response() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Full::new(Bytes::new()))
+        .expect("static response builder never fails")
 }
 
 /// Pull a single query-string value, percent-decoded. Minimal on purpose: the
@@ -110,6 +143,12 @@ async fn route(state: AppState, req: Request<Incoming>) -> Response<Full<Bytes>>
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
     let query = req.uri().query().unwrap_or("").to_owned();
+
+    // CORS preflight: browsers send OPTIONS before the real request. Answer any
+    // path so clients can probe endpoints this server hasn't implemented yet.
+    if method == Method::OPTIONS {
+        return preflight_response();
+    }
 
     match (&method, path.as_str()) {
         // Liveness probe for the host app / NE supervisor.
@@ -183,7 +222,11 @@ pub async fn serve(
         tokio::spawn(async move {
             let service = service_fn(move |req| {
                 let state = state.clone();
-                async move { Ok::<_, Infallible>(route(state, req).await) }
+                async move {
+                    let mut resp = route(state, req).await;
+                    apply_cors(&mut resp);
+                    Ok::<_, Infallible>(resp)
+                }
             });
             // Connection errors (client hangups) are non-fatal to the server.
             let _ = http1::Builder::new().serve_connection(io, service).await;
@@ -235,22 +278,28 @@ mod tests {
         (addr, store)
     }
 
-    /// Raw HTTP/1.1 GET so the tests don't need hyper's `client` feature.
-    /// Returns the parsed status line code and the JSON body.
-    async fn get(addr: SocketAddr, path: &str) -> (StatusCode, serde_json::Value) {
+    /// Raw HTTP/1.1 request so the tests don't need hyper's `client` feature.
+    /// Returns the status code and the full raw response text (headers + body).
+    async fn request(addr: SocketAddr, method: &str, path: &str) -> (StatusCode, String) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let req = format!("GET {path} HTTP/1.1\r\nHost: pds.test\r\nConnection: close\r\n\r\n");
+        let req =
+            format!("{method} {path} HTTP/1.1\r\nHost: pds.test\r\nConnection: close\r\n\r\n");
         stream.write_all(req.as_bytes()).await.unwrap();
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).await.unwrap();
-        let text = String::from_utf8_lossy(&raw);
+        let text = String::from_utf8_lossy(&raw).into_owned();
         let code: u16 = text
             .split_whitespace()
             .nth(1)
             .and_then(|c| c.parse().ok())
             .unwrap();
-        let status = StatusCode::from_u16(code).unwrap();
+        (StatusCode::from_u16(code).unwrap(), text)
+    }
+
+    /// Convenience GET returning the status and parsed JSON body.
+    async fn get(addr: SocketAddr, path: &str) -> (StatusCode, serde_json::Value) {
+        let (status, text) = request(addr, "GET", path).await;
         let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
         let json = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
         (status, json)
@@ -297,5 +346,36 @@ mod tests {
         let (status, json) = get(addr, "/xrpc/com.atproto.repo.createRecord").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(json["error"], "MethodNotImplemented");
+    }
+
+    #[tokio::test]
+    async fn responses_carry_cors_headers() {
+        let (addr, _store) = boot().await;
+        // Real responses (even errors) must be readable cross-origin.
+        let (_status, text) = request(addr, "GET", "/xrpc/_health").await;
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("access-control-allow-origin: *"),
+            "missing CORS allow-origin header:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn options_preflight_is_no_content_with_cors() {
+        let (addr, _store) = boot().await;
+        // A browser preflight to an unimplemented method must still succeed so
+        // the client can send the real request.
+        let (status, text) =
+            request(addr, "OPTIONS", "/xrpc/com.atproto.server.createSession").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("access-control-allow-origin: *"),
+            "preflight lacks CORS:\n{text}"
+        );
+        assert!(
+            lower.contains("access-control-allow-methods"),
+            "preflight lacks methods:\n{text}"
+        );
     }
 }
