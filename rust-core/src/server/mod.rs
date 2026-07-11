@@ -74,10 +74,7 @@ fn xrpc_error(status: StatusCode, error: &str, message: &str) -> Response<Full<B
 /// here it's by hand to avoid the dependency.
 fn apply_cors(resp: &mut Response<Full<Bytes>>) {
     let headers = resp.headers_mut();
-    headers.insert(
-        "access-control-allow-origin",
-        HeaderValue::from_static("*"),
-    );
+    headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
     headers.insert(
         "access-control-allow-methods",
         HeaderValue::from_static("GET, POST, OPTIONS"),
@@ -86,10 +83,7 @@ fn apply_cors(resp: &mut Response<Full<Bytes>>) {
         "access-control-allow-headers",
         HeaderValue::from_static("*"),
     );
-    headers.insert(
-        "access-control-max-age",
-        HeaderValue::from_static("86400"),
-    );
+    headers.insert("access-control-max-age", HeaderValue::from_static("86400"));
 }
 
 /// Empty `204 No Content` used to answer a CORS preflight; the CORS headers are
@@ -371,10 +365,17 @@ mod tests {
         let (addr, _store) = boot().await;
         // A browser preflight to an unimplemented method must still succeed so
         // the client can send the real request.
-        let (status, text) = request(addr, "OPTIONS", "/xrpc/com.atproto.server.createSession").await;
+        let (status, text) =
+            request(addr, "OPTIONS", "/xrpc/com.atproto.server.createSession").await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         let lower = text.to_ascii_lowercase();
-        assert!(lower.contains("access-control-allow-origin: *"), "preflight lacks CORS:\n{text}");
-        assert!(lower.contains("access-control-allow-methods"), "preflight lacks methods:\n{text}");
+        assert!(
+            lower.contains("access-control-allow-origin: *"),
+            "preflight lacks CORS:\n{text}"
+        );
+        assert!(
+            lower.contains("access-control-allow-methods"),
+            "preflight lacks methods:\n{text}"
+        );
     }
 }
