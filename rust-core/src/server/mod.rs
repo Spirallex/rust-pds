@@ -23,6 +23,7 @@
 //! `examples/server_footprint.rs`.
 
 mod appview;
+mod firehose_ws;
 mod repo;
 
 pub use appview::{OutboundProxy, ProxyResponse};
@@ -606,6 +607,12 @@ async fn route(state: AppState, req: Request<Incoming>) -> Response<Full<Bytes>>
         (&Method::GET, "/xrpc/com.atproto.sync.getBlob") => repo::get_blob(&state, &query).await,
         (&Method::GET, "/xrpc/com.atproto.sync.getRepo") => repo::get_repo(&state, &query).await,
 
+        // com.atproto.sync.subscribeRepos — the firehose WebSocket. Returns
+        // the 101 synchronously; streaming runs on the upgraded connection.
+        (&Method::GET, "/xrpc/com.atproto.sync.subscribeRepos") => {
+            firehose_ws::subscribe(state.clone(), req, &query)
+        }
+
         // com.atproto.server.getServiceAuth — inter-service token minting.
         (&Method::GET, "/xrpc/com.atproto.server.getServiceAuth") => {
             appview::get_service_auth(&state, auth_header, &query).await
@@ -663,7 +670,11 @@ pub async fn serve(
                 }
             });
             // Connection errors (client hangups) are non-fatal to the server.
-            let _ = http1::Builder::new().serve_connection(io, service).await;
+            // with_upgrades: required for the subscribeRepos WebSocket 101.
+            let _ = http1::Builder::new()
+                .serve_connection(io, service)
+                .with_upgrades()
+                .await;
         });
     }
 }
@@ -1491,6 +1502,166 @@ mod tests {
             None,
         )
         .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"], "InvalidRequest");
+    }
+
+    // ---- firehose WebSocket helpers -------------------------------------
+
+    /// Open a WebSocket to `path`: HTTP handshake with the RFC 6455 sample
+    /// key, assert the 101 + accept header, return the raw stream.
+    async fn ws_connect(addr: SocketAddr, path: &str) -> tokio::net::TcpStream {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: pds.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        // Read the response head (headers end with CRLFCRLF).
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&head).to_string();
+        assert!(
+            head.starts_with("HTTP/1.1 101"),
+            "expected 101, got: {head}"
+        );
+        // RFC 6455 §1.3 worked example for the sample nonce.
+        assert!(
+            head.to_lowercase()
+                .contains("sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo="),
+            "bad accept key in: {head}"
+        );
+        stream
+    }
+
+    /// Read one unmasked server frame; returns (opcode, payload).
+    async fn read_ws_frame(stream: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        let mut head = [0u8; 2];
+        stream.read_exact(&mut head).await.unwrap();
+        let opcode = head[0] & 0x0f;
+        let mut len = (head[1] & 0x7f) as u64;
+        if len == 126 {
+            let mut ext = [0u8; 2];
+            stream.read_exact(&mut ext).await.unwrap();
+            len = u16::from_be_bytes(ext) as u64;
+        } else if len == 127 {
+            let mut ext = [0u8; 8];
+            stream.read_exact(&mut ext).await.unwrap();
+            len = u64::from_be_bytes(ext);
+        }
+        let mut payload = vec![0u8; len as usize];
+        stream.read_exact(&mut payload).await.unwrap();
+        (opcode, payload)
+    }
+
+    /// Write one masked client frame (clients MUST mask per RFC 6455).
+    async fn write_masked_frame(stream: &mut tokio::net::TcpStream, opcode: u8, payload: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        let mask = [0x12u8, 0x34, 0x56, 0x78];
+        let mut buf = vec![0x80 | opcode, 0x80 | (payload.len() as u8)];
+        buf.extend_from_slice(&mask);
+        buf.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        stream.write_all(&buf).await.unwrap();
+    }
+
+    /// Live streaming: a signed write lands as a binary #commit frame on an
+    /// already-open socket; ping is answered with an echoing pong; close closes.
+    #[tokio::test]
+    async fn firehose_streams_live_commits() {
+        let (addr, store) = boot().await;
+        let did = "did:plc:firehoselive";
+        let access = seed_and_login(addr, &store, did).await;
+
+        let mut ws = ws_connect(addr, "/xrpc/com.atproto.sync.subscribeRepos").await;
+
+        // Give the server a beat to enter the live loop (subscribe happens
+        // in the spawned upgrade task).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let (status, _) = send(
+            addr,
+            "POST",
+            "/xrpc/com.atproto.repo.createRecord",
+            Some(&access),
+            Some(r#"{"repo":"did:plc:firehoselive","collection":"app.bsky.feed.post","record":{"$type":"app.bsky.feed.post","text":"firehose me"}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (opcode, payload) = read_ws_frame(&mut ws).await;
+        assert_eq!(opcode, 0x2, "expected a binary frame");
+        let text = String::from_utf8_lossy(&payload);
+        assert!(text.contains("#commit"), "frame should be a #commit event");
+        assert!(
+            text.contains("firehoselive"),
+            "frame should carry the repo did"
+        );
+
+        // Ping → pong with the same payload.
+        write_masked_frame(&mut ws, 0x9, b"hb").await;
+        let (opcode, payload) = read_ws_frame(&mut ws).await;
+        assert_eq!(opcode, 0xA);
+        assert_eq!(payload, b"hb");
+
+        // Close → close echo.
+        write_masked_frame(&mut ws, 0x8, &[]).await;
+        let (opcode, _) = read_ws_frame(&mut ws).await;
+        assert_eq!(opcode, 0x8);
+    }
+
+    /// cursor=0 replays the whole log before going live.
+    #[tokio::test]
+    async fn firehose_backfills_from_cursor() {
+        let (addr, store) = boot().await;
+        let did = "did:plc:firehoseback";
+        let access = seed_and_login(addr, &store, did).await;
+
+        for text in ["one", "two"] {
+            let body = format!(
+                r#"{{"repo":"{did}","collection":"app.bsky.feed.post","record":{{"$type":"app.bsky.feed.post","text":"{text}"}}}}"#
+            );
+            let (status, _) = send(
+                addr,
+                "POST",
+                "/xrpc/com.atproto.repo.createRecord",
+                Some(&access),
+                Some(&body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let mut ws = ws_connect(addr, "/xrpc/com.atproto.sync.subscribeRepos?cursor=0").await;
+        for _ in 0..2 {
+            let (opcode, payload) = read_ws_frame(&mut ws).await;
+            assert_eq!(opcode, 0x2);
+            assert!(String::from_utf8_lossy(&payload).contains("#commit"));
+        }
+    }
+
+    /// A cursor beyond max_seq gets a FutureCursor error frame, then close.
+    #[tokio::test]
+    async fn firehose_future_cursor_errors() {
+        let (addr, _store) = boot().await;
+        let mut ws = ws_connect(addr, "/xrpc/com.atproto.sync.subscribeRepos?cursor=999999").await;
+        let (opcode, payload) = read_ws_frame(&mut ws).await;
+        assert_eq!(opcode, 0x2);
+        assert!(String::from_utf8_lossy(&payload).contains("FutureCursor"));
+        let (opcode, _) = read_ws_frame(&mut ws).await;
+        assert_eq!(opcode, 0x8, "server should close after FutureCursor");
+    }
+
+    /// A negative or non-integer cursor is rejected as plain HTTP 400 before
+    /// any upgrade happens.
+    #[tokio::test]
+    async fn firehose_bad_cursor_is_http_400() {
+        let (addr, _store) = boot().await;
+        let (status, json) = get(addr, "/xrpc/com.atproto.sync.subscribeRepos?cursor=-1").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["error"], "InvalidRequest");
     }
