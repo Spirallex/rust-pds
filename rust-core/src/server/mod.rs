@@ -26,7 +26,7 @@ mod appview;
 mod firehose_ws;
 mod repo;
 
-pub use appview::{OutboundProxy, ProxyResponse};
+pub use appview::{OutboundProxy, ProxyRequest, ProxyResponse};
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -68,9 +68,15 @@ pub struct ServerConfig {
     /// (createRecord & co.) and describeRepo's DID document; with a wrong or
     /// empty passphrase those return InternalError while reads keep working.
     pub key_passphrase: Vec<u8>,
-    /// Service DID of the AppView that `app.bsky.*` reads are forwarded to —
-    /// the `aud` of minted service-auth tokens (e.g. `did:web:api.bsky.app`).
+    /// Service DID of the AppView that bare `app.bsky.*` requests are
+    /// forwarded to — the `aud` of minted service-auth tokens
+    /// (e.g. `did:web:api.bsky.app`).
     pub appview_did: String,
+    /// Base URL of that AppView (e.g. `https://api.bsky.app`).
+    pub appview_url: String,
+    /// PLC directory base URL (e.g. `https://plc.directory`) — used to
+    /// resolve `did:plc` proxy targets (feed generators, labelers).
+    pub plc_url: String,
 }
 
 /// Per-DID write locks: concurrent writes to one DID serialize through one
@@ -92,6 +98,9 @@ struct AppState {
     firehose_tx: tokio::sync::broadcast::Sender<crate::firehose::FirehoseEvent>,
     did_locks: DidLocks,
     signing_key_cache: SigningKeyCache,
+    /// Resolved `did#fragment` → base URL cache for proxied services
+    /// (process lifetime; service endpoints effectively never change).
+    proxy_target_cache: Arc<StdMutex<HashMap<String, String>>>,
     /// Embedder-provided outbound client for the AppView proxy (None → any
     /// unhandled app.bsky.* read returns MethodNotImplemented).
     proxy: Option<Arc<dyn OutboundProxy>>,
@@ -596,6 +605,15 @@ async fn route(state: AppState, req: Request<Incoming>) -> Response<Full<Bytes>>
             refresh_session(&state, auth_header).await
         }
 
+        // com.atproto.server.deleteSession — stateless logout. Sessions are
+        // self-contained short-expiry JWTs with no server-side table, so
+        // there is nothing to revoke; the official client treats an error
+        // here as a failed logout, so always 200.
+        (&Method::POST, "/xrpc/com.atproto.server.deleteSession") => Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::new()))
+            .expect("static response builder never fails"),
+
         // app.bsky.actor.getPreferences / putPreferences — client-managed
         // preferences blob (saved feeds, birth date, moderation prefs, …).
         (&Method::GET, "/xrpc/app.bsky.actor.getPreferences") => {
@@ -648,11 +666,12 @@ async fn route(state: AppState, req: Request<Incoming>) -> Response<Full<Bytes>>
             appview::get_service_auth(&state, auth_header, &query).await
         }
 
-        // app.bsky.* read fallback — forwarded to the AppView via the
-        // embedder-provided outbound client. Explicit arms above (e.g. the
-        // preferences endpoints) win because match arms are ordered.
-        (&Method::GET, p) if p.starts_with("/xrpc/app.bsky.") => {
-            appview::forward(&state, auth_header, p, &query).await
+        // Generalized proxy fallback — any unmatched /xrpc/* GET/POST is
+        // routed by the atproto-proxy header (chat, moderation, feed
+        // generators, …); bare app.bsky.* defaults to the AppView. Explicit
+        // arms above win because match arms are ordered.
+        (m, p) if p.starts_with("/xrpc/") && appview::proxyable_method(m) => {
+            appview::forward(&state, auth_header, req, &query).await
         }
 
         _ => xrpc_error(
@@ -688,6 +707,7 @@ pub async fn serve(
         firehose_tx: tokio::sync::broadcast::channel(16).0,
         did_locks: Arc::new(StdMutex::new(HashMap::new())),
         signing_key_cache: Arc::new(StdMutex::new(HashMap::new())),
+        proxy_target_cache: Arc::new(StdMutex::new(HashMap::new())),
         proxy,
     };
     loop {
@@ -759,6 +779,8 @@ mod tests {
                     jwt_secret: b"test-embedded-jwt-secret".to_vec(),
                     key_passphrase: b"test-embedded-key-passphrase".to_vec(),
                     appview_did: "did:web:appview.test".into(),
+                    appview_url: "https://appview.test".into(),
+                    plc_url: "https://plc.test".into(),
                 },
                 proxy,
             )
@@ -1405,27 +1427,41 @@ mod tests {
         assert!(raw_text.contains("content-type: application/vnd.ipld.car"));
     }
 
-    /// Records forward() calls and returns a canned upstream response.
+    /// Records forward()/fetch() calls and returns canned responses.
     struct MockProxy {
-        calls: StdMutex<Vec<(String, String, String)>>,
+        calls: StdMutex<Vec<ProxyRequest>>,
+        fetches: StdMutex<Vec<String>>,
         response: (u16, Option<String>, Vec<u8>),
+        fetch_body: Vec<u8>,
+    }
+
+    impl MockProxy {
+        fn new(response: (u16, Option<String>, Vec<u8>)) -> Self {
+            Self {
+                calls: StdMutex::new(Vec::new()),
+                fetches: StdMutex::new(Vec::new()),
+                response,
+                fetch_body: Vec::new(),
+            }
+        }
     }
 
     #[async_trait::async_trait]
     impl OutboundProxy for MockProxy {
-        async fn forward(
-            &self,
-            nsid: String,
-            query: String,
-            service_jwt: String,
-        ) -> Result<ProxyResponse, String> {
-            self.calls.lock().unwrap().push((nsid, query, service_jwt));
+        async fn forward(&self, req: ProxyRequest) -> Result<ProxyResponse, String> {
+            self.calls.lock().unwrap().push(req);
             let (status, content_type, body) = self.response.clone();
             Ok(ProxyResponse {
                 status,
                 content_type,
                 body,
+                content_labelers: None,
             })
+        }
+
+        async fn fetch(&self, url: String) -> Result<Vec<u8>, String> {
+            self.fetches.lock().unwrap().push(url);
+            Ok(self.fetch_body.clone())
         }
     }
 
@@ -1452,14 +1488,11 @@ mod tests {
     /// response relayed verbatim. Unauthenticated requests never reach it.
     #[tokio::test]
     async fn appview_fallback_forwards_with_service_auth() {
-        let mock = Arc::new(MockProxy {
-            calls: StdMutex::new(Vec::new()),
-            response: (
-                200,
-                Some("application/json".into()),
-                b"{\"feed\":[]}".to_vec(),
-            ),
-        });
+        let mock = Arc::new(MockProxy::new((
+            200,
+            Some("application/json".into()),
+            b"{\"feed\":[]}".to_vec(),
+        )));
         let (addr, store) = boot_with_proxy(Some(mock.clone())).await;
         let did = "did:plc:proxied";
         let access = seed_and_login(addr, &store, did).await;
@@ -1483,9 +1516,11 @@ mod tests {
 
         let calls = mock.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        let (nsid, query, jwt) = &calls[0];
+        let (nsid, query, jwt) = (&calls[0].nsid, &calls[0].query, &calls[0].service_jwt);
         assert_eq!(nsid, "app.bsky.feed.getTimeline");
         assert_eq!(query, "limit=5");
+        assert_eq!(calls[0].method, "GET");
+        assert_eq!(calls[0].base_url, "https://appview.test");
         // The service JWT carries the full NSID as lxm and the AppView DID as aud.
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3);
@@ -1726,5 +1761,112 @@ mod tests {
             .unwrap();
         let (status, _) = request(addr, "GET", "/.well-known/atproto-did").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// atproto-proxy header routes a POST (with body) to the named did:web
+    /// service; the service JWT carries that DID as aud.
+    #[tokio::test]
+    async fn proxy_header_routes_post_to_did_web() {
+        let mock = Arc::new(MockProxy::new((
+            200,
+            Some("application/json".into()),
+            b"{}".to_vec(),
+        )));
+        let (addr, store) = boot_with_proxy(Some(mock.clone())).await;
+        let did = "did:plc:chatuser";
+        let access = seed_and_login(addr, &store, did).await;
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let payload = br#"{"convoId":"c1"}"#;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "POST /xrpc/chat.bsky.convo.sendMessage HTTP/1.1\r\nHost: pds.test\r\nAuthorization: Bearer {access}\r\natproto-proxy: did:web:api.bsky.chat#bsky_chat\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        stream.write_all(payload).await.unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.starts_with("HTTP/1.1 200"), "response: {text}");
+
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].method, "POST");
+        assert_eq!(calls[0].base_url, "https://api.bsky.chat");
+        assert_eq!(calls[0].nsid, "chat.bsky.convo.sendMessage");
+        assert_eq!(calls[0].body, payload.to_vec());
+        assert_eq!(calls[0].content_type.as_deref(), Some("application/json"));
+        let parts: Vec<&str> = calls[0].service_jwt.split('.').collect();
+        let claims: serde_json::Value = serde_json::from_slice(
+            &data_encoding::BASE64URL_NOPAD
+                .decode(parts[1].as_bytes())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claims["aud"], "did:web:api.bsky.chat");
+        assert_eq!(claims["lxm"], "chat.bsky.convo.sendMessage");
+    }
+
+    /// did:plc proxy targets resolve through the embedder's fetch() against
+    /// the PLC directory, and the result is cached (one fetch for two calls).
+    #[tokio::test]
+    async fn proxy_did_plc_resolves_via_fetch_and_caches() {
+        let mut mock = MockProxy::new((200, None, Vec::new()));
+        mock.fetch_body = serde_json::json!({
+            "id": "did:plc:feedgen123",
+            "service": [{ "id": "#bsky_fg", "type": "BskyFeedGenerator",
+                          "serviceEndpoint": "https://feeds.example.com" }]
+        })
+        .to_string()
+        .into_bytes();
+        let mock = Arc::new(mock);
+        let (addr, store) = boot_with_proxy(Some(mock.clone())).await;
+        let did = "did:plc:feeduser";
+        let access = seed_and_login(addr, &store, did).await;
+
+        // send() has no custom-header support; hand-roll the two calls.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for _ in 0..2 {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let req = format!(
+                "GET /xrpc/app.bsky.feed.getFeedSkeleton?feed=at://x HTTP/1.1\r\nHost: pds.test\r\nAuthorization: Bearer {access}\r\natproto-proxy: did:plc:feedgen123#bsky_fg\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(req.as_bytes()).await.unwrap();
+            let mut raw = Vec::new();
+            stream.read_to_end(&mut raw).await.unwrap();
+            assert!(String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 200"));
+        }
+
+        assert_eq!(
+            mock.fetches.lock().unwrap().as_slice(),
+            &["https://plc.test/did:plc:feedgen123".to_string()],
+            "PLC doc fetched exactly once (cached afterwards)"
+        );
+        let calls = mock.calls.lock().unwrap();
+        let plc_routed: Vec<_> = calls
+            .iter()
+            .filter(|c| c.base_url == "https://feeds.example.com")
+            .collect();
+        assert_eq!(
+            plc_routed.len(),
+            2,
+            "both calls routed to the feed generator"
+        );
+    }
+
+    /// deleteSession is a stateless 200 so client logout never errors.
+    #[tokio::test]
+    async fn delete_session_is_stateless_ok() {
+        let (addr, _store) = boot().await;
+        let (status, _) = send(
+            addr,
+            "POST",
+            "/xrpc/com.atproto.server.deleteSession",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 }

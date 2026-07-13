@@ -137,6 +137,8 @@ async fn main() {
                 jwt_secret: b"footprint-example-jwt-secret".to_vec(),
                 key_passphrase: b"footprint-example-passphrase".to_vec(),
                 appview_did: "did:web:api.bsky.app".into(),
+                appview_url: "https://api.bsky.app".into(),
+                plc_url: "https://plc.directory".into(),
             },
             None,
         )
