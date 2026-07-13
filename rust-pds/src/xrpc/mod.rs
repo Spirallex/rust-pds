@@ -59,6 +59,9 @@ pub struct AppState {
     pub appview_url: String,
     /// AppView service DID, default "did:web:api.bsky.app" (the JWT aud).
     pub appview_did: String,
+    /// Resolves `atproto-proxy` target DIDs to service base URLs
+    /// (did:web by convention, did:plc via the PLC directory, cached).
+    pub service_resolver: Arc<dyn appview::ServiceDidResolver>,
     /// Per-DID write-serialization locks shared across per-request RepoWriter instances,
     /// so two concurrent writes to the same DID cannot fork the repo history.
     /// Grows by one entry per distinct DID ever written; bounded and acceptable for the
@@ -115,6 +118,10 @@ pub fn app(state: AppState) -> Router {
             get(server::get_service_auth),
         )
         .route(
+            "/xrpc/com.atproto.server.deleteSession",
+            post(server::delete_session),
+        )
+        .route(
             "/xrpc/com.atproto.server.createAccount",
             post(server::create_account),
         )
@@ -122,7 +129,9 @@ pub fn app(state: AppState) -> Router {
         .merge(repo::routes())
         .merge(crate::firehose::subscribe::routes())
         .merge(preferences::routes())
-        .merge(appview::routes())
+        // Everything not matched above is a candidate for upstream proxying
+        // (AppView reads, chat, moderation, feed generators, …).
+        .fallback(appview::proxy::proxy_fallback)
         .with_state(state)
         // Browser clients (e.g. the Bluesky web app) issue a CORS preflight
         // OPTIONS request before each XRPC call. Without this layer those

@@ -67,6 +67,9 @@ async fn spawn_server() -> (SocketAddr, AppState, tempfile::NamedTempFile) {
         ))),
         appview_url: "https://appview.test".to_string(),
         appview_did: "did:web:appview.test".to_string(),
+        service_resolver: std::sync::Arc::new(stelyph::xrpc::appview::MockServiceDidResolver::new(
+            "https://svc.test",
+        )),
         did_locks: Arc::new(dashmap::DashMap::new()),
         signing_key_cache: Arc::new(dashmap::DashMap::new()),
     };

@@ -1,40 +1,72 @@
-//! AppViewClient: injectable trait for forwarding GET requests to an AppView service.
+//! AppViewClient: injectable trait for forwarding XRPC requests upstream.
 //!
-//! Production impl: `ReqwestAppViewClient` — GETs `<appview_url>/xrpc/<method>?<query>`
-//! with an `Authorization: Bearer <jwt>` header and passes through status + body verbatim.
+//! Production impl: `ReqwestAppViewClient` — sends
+//! `GET|POST <base_url>/xrpc/<nsid>?<query>` with an
+//! `Authorization: Bearer <jwt>` header (plus the request body and
+//! `atproto-accept-labelers` when present) and passes status + body +
+//! moderation headers through verbatim. This backs the generalized
+//! `atproto-proxy` routing (AppView, chat, moderation, video, feed
+//! generators, …), not just the AppView.
 //!
-//! SSRF guard: `appview_url` MUST be an `https://` URL whose host is NOT a
-//! loopback/link-local/private/internal address — both scheme and host are validated
-//! before any network I/O.
+//! SSRF guard: the upstream base URL MUST be an `https://` URL whose host is
+//! NOT a loopback/link-local/private/internal address — both scheme and host
+//! are validated before any network I/O.
 //!
 //! Timeout: reqwest client is built with a 10-second timeout.
 //!
-//! `MockAppViewClient` is NOT `#[cfg(test)]`-gated: the integration test in `tests/`
-//! (plan 04-05) is a separate crate and cannot see `#[cfg(test)]` items.
+//! `MockAppViewClient` is NOT `#[cfg(test)]`-gated: the integration test in
+//! `tests/` is a separate crate and cannot see `#[cfg(test)]` items.
 
 use std::time::Duration;
 
 use crate::xrpc::XrpcError;
 
-/// Injectable trait for proxying AppView GET requests.
-///
-/// Returns `(status_code, body_bytes, content_type)`.
-/// A non-2xx status is NOT an error — it is passed through verbatim.
-/// Only transport/connection/body-read failures map to `XrpcError::UpstreamFailure`.
+/// HTTP verb for a proxied XRPC call. Lexicon queries are GET, procedures POST.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProxyMethod {
+    Get,
+    Post,
+}
+
+/// One proxied XRPC request, fully resolved (the routing layer has already
+/// turned the `atproto-proxy` DID into `base_url` and minted `jwt`).
+#[derive(Clone)]
+pub struct UpstreamRequest {
+    pub method: ProxyMethod,
+    /// e.g. `https://api.bsky.app` — SSRF-validated by the client impl.
+    pub base_url: String,
+    /// Full method NSID, e.g. `chat.bsky.convo.listConvos`.
+    pub nsid: String,
+    /// Raw query string ("" when none).
+    pub query: String,
+    /// Request body for POST (empty for GET).
+    pub body: bytes::Bytes,
+    /// Request Content-Type, forwarded verbatim when present.
+    pub content_type: Option<String>,
+    /// Service-auth JWT minted for the target service.
+    pub jwt: String,
+    /// Caller's `atproto-accept-labelers` header, forwarded verbatim.
+    pub accept_labelers: Option<String>,
+}
+
+/// Upstream response relayed to the caller. Non-2xx statuses are NOT errors —
+/// they pass through verbatim; only transport failures surface as
+/// `XrpcError::UpstreamFailure`.
+pub struct UpstreamResponse {
+    pub status: u16,
+    pub body: bytes::Bytes,
+    pub content_type: Option<String>,
+    /// Upstream `atproto-content-labelers` header (moderation attribution).
+    pub content_labelers: Option<String>,
+}
+
+/// Injectable trait for proxying XRPC requests upstream.
 #[async_trait::async_trait]
 pub trait AppViewClient: Send + Sync {
-    async fn proxy_get(
-        &self,
-        appview_url: &str,
-        method: &str,
-        query_string: &str,
-        jwt: &str,
-    ) -> Result<(u16, bytes::Bytes, Option<String>), XrpcError>;
+    async fn proxy_request(&self, req: UpstreamRequest) -> Result<UpstreamResponse, XrpcError>;
 }
 
 /// Production `AppViewClient` implementation using `reqwest`.
-///
-/// Sends `GET <appview_url>/xrpc/<method>[?<query>]` with a Bearer JWT.
 pub struct ReqwestAppViewClient {
     client: reqwest::Client,
 }
@@ -56,22 +88,23 @@ impl Default for ReqwestAppViewClient {
     }
 }
 
-/// SSRF guard: validate the AppView URL before any network I/O.
+/// SSRF guard: validate an upstream base URL before any network I/O.
 ///
-/// Enforces `https://` scheme AND rejects internal/loopback/link-local/private hosts
-/// (cloud metadata `169.254.169.254`, `127.0.0.1`, `localhost`, RFC1918 ranges, `.local`,
-/// `.internal`). Returns `XrpcError::UpstreamFailure` on rejection (maps to HTTP 502).
+/// Enforces `https://` scheme AND rejects internal/loopback/link-local/private
+/// hosts (cloud metadata `169.254.169.254`, `127.0.0.1`, `localhost`, RFC1918
+/// ranges, `.local`, `.internal`). Returns `XrpcError::UpstreamFailure` on
+/// rejection (maps to HTTP 502).
 pub fn validate_appview_url(url: &str) -> Result<(), XrpcError> {
     let parsed = reqwest::Url::parse(url)
-        .map_err(|e| XrpcError::UpstreamFailure(format!("invalid appview_url: {e}")))?;
+        .map_err(|e| XrpcError::UpstreamFailure(format!("invalid upstream url: {e}")))?;
     if parsed.scheme() != "https" {
         return Err(XrpcError::UpstreamFailure(format!(
-            "appview_url must be an https:// URL, got: {url}"
+            "upstream url must be an https:// URL, got: {url}"
         )));
     }
     let host = parsed
         .host_str()
-        .ok_or_else(|| XrpcError::UpstreamFailure("appview_url missing host".to_string()))?;
+        .ok_or_else(|| XrpcError::UpstreamFailure("upstream url missing host".to_string()))?;
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         let blocked = match ip {
             std::net::IpAddr::V4(v4) => {
@@ -101,12 +134,12 @@ pub fn validate_appview_url(url: &str) -> Result<(), XrpcError> {
         };
         if blocked {
             return Err(XrpcError::UpstreamFailure(
-                "appview_url host not allowed".to_string(),
+                "upstream host not allowed".to_string(),
             ));
         }
     } else if host == "localhost" || host.ends_with(".local") || host.ends_with(".internal") {
         return Err(XrpcError::UpstreamFailure(
-            "appview_url host not allowed".to_string(),
+            "upstream host not allowed".to_string(),
         ));
     }
     Ok(())
@@ -114,48 +147,58 @@ pub fn validate_appview_url(url: &str) -> Result<(), XrpcError> {
 
 #[async_trait::async_trait]
 impl AppViewClient for ReqwestAppViewClient {
-    async fn proxy_get(
-        &self,
-        appview_url: &str,
-        method: &str,
-        query_string: &str,
-        jwt: &str,
-    ) -> Result<(u16, bytes::Bytes, Option<String>), XrpcError> {
+    async fn proxy_request(&self, req: UpstreamRequest) -> Result<UpstreamResponse, XrpcError> {
         // SSRF guard: enforce https scheme AND block internal/private hosts.
-        validate_appview_url(appview_url)?;
-        let mut url = format!("{appview_url}/xrpc/{method}");
-        if !query_string.is_empty() {
+        validate_appview_url(&req.base_url)?;
+        let mut url = format!("{}/xrpc/{}", req.base_url, req.nsid);
+        if !req.query.is_empty() {
             url.push('?');
-            url.push_str(query_string);
+            url.push_str(&req.query);
         }
-        let resp = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {jwt}"))
+        let mut builder = match req.method {
+            ProxyMethod::Get => self.client.get(&url),
+            ProxyMethod::Post => self.client.post(&url).body(req.body.clone()),
+        };
+        builder = builder.header("Authorization", format!("Bearer {}", req.jwt));
+        if let Some(ct) = &req.content_type {
+            builder = builder.header("Content-Type", ct);
+        }
+        if let Some(labelers) = &req.accept_labelers {
+            builder = builder.header("atproto-accept-labelers", labelers);
+        }
+        let resp = builder
             .send()
             .await
-            .map_err(|e| XrpcError::UpstreamFailure(format!("appview GET failed: {e}")))?;
+            .map_err(|e| XrpcError::UpstreamFailure(format!("upstream request failed: {e}")))?;
         let status = resp.status().as_u16();
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let content_type = header("content-type");
+        let content_labelers = header("atproto-content-labelers");
         let body = resp
             .bytes()
             .await
-            .map_err(|e| XrpcError::UpstreamFailure(format!("appview body read: {e}")))?;
+            .map_err(|e| XrpcError::UpstreamFailure(format!("upstream body read: {e}")))?;
         // Do NOT branch on is_success() — pass non-2xx through verbatim.
-        Ok((status, body, content_type))
+        Ok(UpstreamResponse {
+            status,
+            body,
+            content_type,
+            content_labelers,
+        })
     }
 }
 
-/// Test double for `AppViewClient`. Records every `(method, query_string, jwt)` call.
+/// Test double for `AppViewClient`. Records every request.
 ///
-/// NOT `#[cfg(test)]`-gated: the integration test in `tests/` lives in a separate
-/// crate and cannot access `#[cfg(test)]` items.
+/// NOT `#[cfg(test)]`-gated: the integration test in `tests/` lives in a
+/// separate crate and cannot access `#[cfg(test)]` items.
 pub struct MockAppViewClient {
-    calls: std::sync::Mutex<Vec<(String, String, String)>>,
+    calls: std::sync::Mutex<Vec<UpstreamRequest>>,
     response: (u16, Vec<u8>, Option<String>),
 }
 
@@ -167,9 +210,19 @@ impl MockAppViewClient {
         }
     }
 
-    /// Returns all recorded `(method, query_string, jwt)` triples in call order.
-    pub fn calls(&self) -> Vec<(String, String, String)> {
+    /// All recorded requests, in call order.
+    pub fn requests(&self) -> Vec<UpstreamRequest> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// Back-compat view of recorded calls as `(nsid, query, jwt)` triples.
+    pub fn calls(&self) -> Vec<(String, String, String)> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| (r.nsid.clone(), r.query.clone(), r.jwt.clone()))
+            .collect()
     }
 }
 
@@ -181,23 +234,14 @@ impl Default for MockAppViewClient {
 
 #[async_trait::async_trait]
 impl AppViewClient for MockAppViewClient {
-    async fn proxy_get(
-        &self,
-        _appview_url: &str,
-        method: &str,
-        query_string: &str,
-        jwt: &str,
-    ) -> Result<(u16, bytes::Bytes, Option<String>), XrpcError> {
-        self.calls.lock().unwrap().push((
-            method.to_string(),
-            query_string.to_string(),
-            jwt.to_string(),
-        ));
-        Ok((
-            self.response.0,
-            bytes::Bytes::from(self.response.1.clone()),
-            self.response.2.clone(),
-        ))
+    async fn proxy_request(&self, req: UpstreamRequest) -> Result<UpstreamResponse, XrpcError> {
+        self.calls.lock().unwrap().push(req);
+        Ok(UpstreamResponse {
+            status: self.response.0,
+            body: bytes::Bytes::from(self.response.1.clone()),
+            content_type: self.response.2.clone(),
+            content_labelers: None,
+        })
     }
 }
 
@@ -232,7 +276,7 @@ mod tests {
         );
     }
 
-    /// Mock records the call tuple and returns the canned response.
+    /// Mock records the request and returns the canned response.
     #[tokio::test]
     async fn mock_records_call_and_returns_canned() {
         let mock = MockAppViewClient::new((
@@ -240,13 +284,22 @@ mod tests {
             b"{\"ok\":true}".to_vec(),
             Some("application/json".into()),
         ));
-        let (status, body, ct) = mock
-            .proxy_get("https://x", "app.bsky.feed.getTimeline", "limit=5", "tok")
+        let resp = mock
+            .proxy_request(UpstreamRequest {
+                method: ProxyMethod::Get,
+                base_url: "https://x".into(),
+                nsid: "app.bsky.feed.getTimeline".into(),
+                query: "limit=5".into(),
+                body: bytes::Bytes::new(),
+                content_type: None,
+                jwt: "tok".into(),
+                accept_labelers: None,
+            })
             .await
             .unwrap();
-        assert_eq!(status, 200);
-        assert_eq!(body, bytes::Bytes::from(b"{\"ok\":true}".as_ref()));
-        assert_eq!(ct, Some("application/json".to_string()));
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, bytes::Bytes::from(b"{\"ok\":true}".as_ref()));
+        assert_eq!(resp.content_type, Some("application/json".to_string()));
 
         let calls = mock.calls();
         assert_eq!(calls.len(), 1);
