@@ -290,6 +290,10 @@ pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()>
         appview_client,
         appview_url,
         appview_did,
+        service_resolver: Arc::new(
+            crate::xrpc::appview::ReqwestServiceDidResolver::new(plc_url.clone())
+                .map_err(|e| anyhow::anyhow!("resolver: {e}"))?,
+        ),
         did_locks: Arc::new(dashmap::DashMap::new()),
         signing_key_cache: Arc::new(dashmap::DashMap::new()),
     };

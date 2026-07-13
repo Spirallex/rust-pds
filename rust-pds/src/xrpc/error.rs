@@ -51,6 +51,10 @@ pub enum XrpcError {
     #[error("Handle not found")]
     HandleNotFound,
 
+    // --- Routing ---
+    #[error("Method not implemented")]
+    MethodNotImplemented,
+
     // --- Generic ---
     #[error("{0}")]
     InvalidRequest(String),
@@ -115,6 +119,7 @@ impl IntoResponse for XrpcError {
             XrpcError::IncompatibleDidDoc => StatusCode::BAD_REQUEST,
             XrpcError::InvalidSwap => StatusCode::BAD_REQUEST,
             XrpcError::HandleNotFound => StatusCode::NOT_FOUND,
+            XrpcError::MethodNotImplemented => StatusCode::NOT_FOUND,
             XrpcError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             XrpcError::UpstreamFailure(_) => StatusCode::BAD_GATEWAY,
             XrpcError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -134,6 +139,7 @@ impl IntoResponse for XrpcError {
             XrpcError::IncompatibleDidDoc => "IncompatibleDidDoc",
             XrpcError::InvalidSwap => "InvalidSwap",
             XrpcError::HandleNotFound => "HandleNotFound",
+            XrpcError::MethodNotImplemented => "MethodNotImplemented",
             XrpcError::InvalidRequest(_) => "InvalidRequest",
             XrpcError::UpstreamFailure(_) => "UpstreamFailure",
             XrpcError::Internal(_) => "InternalServerError",

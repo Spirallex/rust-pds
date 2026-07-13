@@ -18,8 +18,6 @@
 ///     at account-creation time for accounts that may never post.
 ///   - The plan's success criterion ("account created + can post") is satisfied by
 ///     the createRecord round-trip in Plan 03-04.
-use std::sync::Arc;
-
 use atrium_crypto::keypair::Secp256k1Keypair;
 use axum::extract::{Query, State};
 use axum::Json;
@@ -29,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::extractor::{AccessAuth, RefreshAuth};
 use crate::auth::jwt::{encode_access_jwt, encode_refresh_jwt, hash_password, verify_password};
 use crate::identity::plc::register_did_plc;
-use crate::storage::keys::{load_key, store_key};
+use crate::storage::keys::store_key;
 use crate::xrpc::appview::service_auth::mint_service_auth_jwt_with;
 use crate::xrpc::{AppState, XrpcError};
 
@@ -212,6 +210,16 @@ pub struct GetServiceAuthOutput {
 /// Mint an ES256K inter-service auth token signed with the account's signing
 /// key (iss = account DID). The Bluesky client uses this to call the AppView,
 /// chat, video, and labeler services on the user's behalf.
+/// POST /xrpc/com.atproto.server.deleteSession
+///
+/// Stateless logout. Sessions are self-contained HS256 JWTs with short
+/// expiries and no server-side session table, so there is nothing to revoke —
+/// but the official client calls this on logout and treats an error as a
+/// failed logout. Accept and return 200 regardless of the supplied token.
+pub async fn delete_session() -> axum::http::StatusCode {
+    axum::http::StatusCode::OK
+}
+
 pub async fn get_service_auth(
     State(state): State<AppState>,
     AccessAuth(did): AccessAuth,
@@ -219,25 +227,9 @@ pub async fn get_service_auth(
 ) -> Result<Json<GetServiceAuthOutput>, XrpcError> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    // Check the process-local signing-key cache before calling load_key (B4) —
-    // getServiceAuth is the read-path "Worst" case CONTEXT.md names explicitly.
-    let key_id = format!("{did}#signing");
-    let signing = if let Some(cached) = state.signing_key_cache.get(&key_id) {
-        Secp256k1Keypair::import(cached.as_slice()).map_err(|e| {
-            XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}"))
-        })?
-    } else {
-        let key_bytes = load_key(&state.store, &key_id, &state.key_passphrase)
-            .await
-            .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to load signing key: {e}")))?;
-        state.signing_key_cache.insert(
-            key_id.clone(),
-            Arc::new(zeroize::Zeroizing::new(key_bytes.clone())),
-        );
-        Secp256k1Keypair::import(&key_bytes).map_err(|e| {
-            XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}"))
-        })?
-    };
+    // Shared cached loader (B4) — getServiceAuth is the read-path "Worst"
+    // case CONTEXT.md names explicitly.
+    let signing = crate::xrpc::repo::load_signing_key_cached(&state, &did).await?;
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -545,6 +537,9 @@ mod tests {
             ),
             appview_url: "https://appview.test".to_string(),
             appview_did: "did:web:appview.test".to_string(),
+            service_resolver: std::sync::Arc::new(
+                crate::xrpc::appview::MockServiceDidResolver::new("https://svc.test"),
+            ),
             did_locks: Arc::new(dashmap::DashMap::new()),
             signing_key_cache: Arc::new(dashmap::DashMap::new()),
         };
@@ -571,6 +566,9 @@ mod tests {
             ),
             appview_url: "https://appview.test".to_string(),
             appview_did: "did:web:appview.test".to_string(),
+            service_resolver: std::sync::Arc::new(
+                crate::xrpc::appview::MockServiceDidResolver::new("https://svc.test"),
+            ),
             did_locks: Arc::new(dashmap::DashMap::new()),
             signing_key_cache: Arc::new(dashmap::DashMap::new()),
         };

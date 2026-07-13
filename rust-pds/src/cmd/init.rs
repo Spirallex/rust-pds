@@ -268,6 +268,10 @@ async fn add_user(
         appview_client: Arc::new(appview_client),
         appview_url: "https://api.bsky.app".to_string(),
         appview_did: "did:web:api.bsky.app".to_string(),
+        service_resolver: Arc::new(
+            crate::xrpc::appview::ReqwestServiceDidResolver::new(args.plc_url.clone())
+                .map_err(|e| anyhow::anyhow!("resolver: {e}"))?,
+        ),
         did_locks: Arc::new(dashmap::DashMap::new()),
         signing_key_cache: Arc::new(dashmap::DashMap::new()),
     };
@@ -817,6 +821,10 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
         appview_client: Arc::new(appview_client),
         appview_url: "https://api.bsky.app".to_string(),
         appview_did: "did:web:api.bsky.app".to_string(),
+        service_resolver: Arc::new(
+            crate::xrpc::appview::ReqwestServiceDidResolver::new(args.plc_url.clone())
+                .map_err(|e| anyhow::anyhow!("resolver: {e}"))?,
+        ),
         did_locks: Arc::new(dashmap::DashMap::new()),
         signing_key_cache: Arc::new(dashmap::DashMap::new()),
     };
@@ -926,6 +934,9 @@ mod tests {
             ))),
             appview_url: "https://appview.test".to_string(),
             appview_did: "did:web:appview.test".to_string(),
+            service_resolver: Arc::new(crate::xrpc::appview::MockServiceDidResolver::new(
+                "https://svc.test",
+            )),
             did_locks: Arc::new(dashmap::DashMap::new()),
             signing_key_cache: Arc::new(dashmap::DashMap::new()),
         };
