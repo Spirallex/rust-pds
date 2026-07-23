@@ -10,10 +10,16 @@
 
 use worker::*;
 
+use crate::handlers::{self as h, Ctx};
 use crate::store::DoStore;
 
 /// Name of the R2 binding declared in `wrangler.toml`.
 const BLOBS_BINDING: &str = "BLOBS";
+
+/// Header the front Worker uses to pass the real hostname through. The
+/// forwarding URL carries an opaque authority (see lib.rs), so this is the only
+/// place the DO learns which PDS it is serving.
+const HOST_HEADER: &str = "X-Stelyph-Host";
 
 #[durable_object]
 pub struct PdsDurableObject {
@@ -56,10 +62,50 @@ impl PdsDurableObject {
 
     async fn route(&self, req: Request) -> Result<Response> {
         let url = req.url()?;
+        let hostname = req
+            .headers()
+            .get(HOST_HEADER)?
+            .unwrap_or_else(|| "unknown.invalid".to_string());
+        let ctx = Ctx::from_host(&hostname);
+
         match url.path() {
+            // --- discovery -------------------------------------------------
+            "/.well-known/oauth-authorization-server" => h::oauth_as_metadata(&ctx),
+            "/.well-known/oauth-protected-resource" => h::oauth_protected_resource(&ctx),
+            "/.well-known/did.json" => h::did_web_document(&ctx),
+            "/oauth/jwks" => {
+                let store = self.store()?;
+                h::jwks(&store, &self.key_passphrase()?).await
+            }
+
+            // --- XRPC ------------------------------------------------------
+            "/xrpc/com.atproto.server.describeServer" => {
+                h::describe_server(&ctx, &self.zone_suffix())
+            }
+
             "/_stelyph/health" => self.health().await,
-            _ => Response::error("not found", 404),
+            _ => xrpc_error(404, "MethodNotImplemented", "unknown endpoint"),
         }
+    }
+
+    /// Passphrase wrapping every key this PDS stores at rest.
+    ///
+    /// Hard failure when unset rather than a default: a predictable passphrase
+    /// would leave the OAuth signing key recoverable by anyone who obtains the
+    /// Durable Object's storage.
+    fn key_passphrase(&self) -> Result<Vec<u8>> {
+        self.env
+            .secret("PDS_KEY_PASSPHRASE")
+            .map(|s| s.to_string().into_bytes())
+            .map_err(|_| Error::RustError("PDS_KEY_PASSPHRASE secret is not set".into()))
+    }
+
+    /// Zone the handles live under, e.g. `spirallex.net`.
+    fn zone_suffix(&self) -> String {
+        self.env
+            .var("PDS_ZONE_SUFFIX")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| "invalid".to_string())
     }
 
     /// Diagnostic endpoint: proves the DO can reach both storage substrates.
@@ -131,4 +177,15 @@ impl PdsDurableObject {
         }
         Ok(resp)
     }
+}
+
+/// An XRPC error envelope: `{"error": ..., "message": ...}`.
+///
+/// atproto clients parse this shape; a bare text body would surface to the user
+/// as an opaque failure.
+fn xrpc_error(status: u16, error: &str, message: &str) -> Result<Response> {
+    Ok(
+        Response::from_json(&serde_json::json!({ "error": error, "message": message }))?
+            .with_status(status),
+    )
 }

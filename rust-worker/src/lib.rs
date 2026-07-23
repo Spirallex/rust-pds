@@ -6,6 +6,7 @@
 //! sequencer and a safely-updated root pointer.
 
 mod durable;
+mod handlers;
 mod schema;
 mod store;
 

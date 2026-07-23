@@ -56,7 +56,7 @@ bucket_name = "stelyph-pds-blobs"
 # Overridden per-environment. The issuer is derived per-request from the Host
 # header's registered zone suffix, not from this value; this is only the
 # fallback for local development.
-PDS_ZONE_SUFFIX = "pds.spirallex.net"
+PDS_ZONE_SUFFIX = "spirallex.net"
 
 # Secrets (set with `wrangler secret put`, never in this file):
 #   PDS_JWT_SECRET       HMAC secret for legacy session JWTs; also the seed for
