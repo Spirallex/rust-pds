@@ -77,9 +77,23 @@ impl PdsDurableObject {
         // SQL round trip through BlockStore.
         let payload = b"stelyph health probe".to_vec();
         let cid = stelyph_core::storage::cid_of(0x71, &payload);
+        let mut detail = String::new();
         let sql_ok = match store.put_block(cid, payload.clone()).await {
-            Ok(()) => matches!(store.read_block_bytes(cid).await, Ok(b) if b == payload),
-            Err(_) => false,
+            Ok(()) => match store.read_block_bytes(cid).await {
+                Ok(b) if b == payload => true,
+                Ok(b) => {
+                    detail = format!("read back {} bytes, expected {}", b.len(), payload.len());
+                    false
+                }
+                Err(e) => {
+                    detail = format!("read failed: {e}");
+                    false
+                }
+            },
+            Err(e) => {
+                detail = format!("write failed: {e}");
+                false
+            }
         };
         checks.push(("do_sqlite", sql_ok));
 
@@ -108,6 +122,7 @@ impl PdsDurableObject {
                 .map(|(k, v)| (k.to_string(), serde_json::Value::Bool(*v)))
                 .collect::<serde_json::Map<String, serde_json::Value>>(),
             "schema_version": crate::schema::SCHEMA_VERSION,
+            "detail": detail,
         });
 
         let mut resp = Response::from_json(&body)?;

@@ -45,10 +45,17 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpResponse
     let namespace = env.durable_object(PDS_BINDING)?;
     let stub = namespace.id_from_name(&host)?.get_stub()?;
 
-    // Rebuild the request for the DO: the URL's authority is irrelevant inside
-    // (the stub is already the routing decision), but the path and method are
-    // not.
-    let url = format!("https://{host}{}", req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"));
+    // Rebuild the request for the DO. The authority must NOT be this Worker's
+    // own hostname: the runtime treats a subrequest to the zone it is serving
+    // as a loop and rejects it with error 1042. The stub is already the routing
+    // decision, so an opaque internal authority is correct — the DO learns which
+    // PDS it is from `X-Stelyph-Host` below, not from the URL.
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    let url = format!("https://stelyph.internal{path}");
     let mut init = RequestInit::new();
     init.with_method(match *req.method() {
         http::Method::POST => Method::Post,
@@ -59,6 +66,12 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpResponse
         http::Method::OPTIONS => Method::Options,
         _ => Method::Get,
     });
+
+    // The DO needs the real hostname to derive its issuer URL and DID, which
+    // the opaque forwarding URL has thrown away.
+    let mut headers = Headers::new();
+    headers.set("X-Stelyph-Host", &host)?;
+    init.with_headers(headers);
 
     let forwarded = Request::new_with_init(&url, &init)?;
     let resp = stub.fetch_with_request(forwarded).await?;

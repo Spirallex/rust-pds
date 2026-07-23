@@ -10,8 +10,17 @@ routes = [
   { pattern = "*.pds.spirallex.net/*", zone_name = "spirallex.net" },
 ]
 
+# Also publish on workers.dev. The custom route above only receives traffic once
+# a proxied wildcard DNS record for *.pds.spirallex.net exists, and creating DNS
+# needs a permission the Workers OAuth token does not carry. This gives a
+# reachable URL for smoke-testing in the meantime.
+workers_dev = true
+
 [build]
-command = "cargo install -q worker-build --version ^0.1 && worker-build --release"
+# worker-build must match the `worker` crate's wasm-bindgen requirement — a
+# mismatch fails at the bindgen step with an opaque schema-version error, so the
+# version is pinned to the crate's.
+command = "cargo install -q worker-build --version ^0.8 && worker-build --release"
 
 # --- Durable Objects -------------------------------------------------------
 #

@@ -123,12 +123,24 @@ impl DoStore {
 
     /// Create tables on first use. Idempotent.
     pub fn migrate(&self) -> Result<(), StorageError> {
-        // `exec` takes one statement at a time, so the batch is split here
-        // rather than relying on a multi-statement execute the API does not
-        // offer. Empty fragments (from the trailing semicolon) are skipped.
-        for stmt in crate::schema::SCHEMA.split(';') {
+        // `exec` takes one statement at a time, so the batch is split here.
+        //
+        // Comments are stripped *before* splitting, not filtered afterwards: a
+        // `--` comment may itself contain a semicolon, and splitting first would
+        // cut it in half and hand SQLite the tail as a statement. That is a real
+        // bug this hit, not a hypothetical one.
+        let sql: String = crate::schema::SCHEMA
+            .lines()
+            .map(|line| match line.find("--") {
+                Some(i) => &line[..i],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for stmt in sql.split(';') {
             let stmt = stmt.trim();
-            if stmt.is_empty() || stmt.starts_with("--") {
+            if stmt.is_empty() {
                 continue;
             }
             self.sql.exec(stmt, None).map_err(sql_err)?;
@@ -166,6 +178,7 @@ impl DoStore {
 
 #[derive(Deserialize)]
 struct BytesRow {
+    #[serde(with = "serde_bytes")]
     bytes: Vec<u8>,
 }
 
@@ -177,6 +190,7 @@ struct CidRow {
 #[derive(Deserialize)]
 struct SeqRow {
     seq: i64,
+    #[serde(with = "serde_bytes")]
     event: Vec<u8>,
 }
 
@@ -222,6 +236,7 @@ struct PrefsRow {
 
 #[derive(Deserialize)]
 struct CipherRow {
+    #[serde(with = "serde_bytes")]
     ciphertext: Vec<u8>,
 }
 

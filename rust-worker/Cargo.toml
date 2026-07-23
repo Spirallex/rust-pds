@@ -31,6 +31,9 @@ console_error_panic_hook = "0.1"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# DO SQLite hands BLOB columns back as a serde *byte array*, not a sequence, so
+# a plain Vec<u8> field fails to deserialize with "invalid type: byte array".
+serde_bytes = "0.11"
 cid = "0.11"
 atrium-crypto = "0.1.3"
 atrium-api = "0.25.8"
@@ -46,4 +49,3 @@ opt-level = "s"
 lto = true
 codegen-units = 1
 panic = "abort"
-strip = true
