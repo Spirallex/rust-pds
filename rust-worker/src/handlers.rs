@@ -25,15 +25,34 @@ pub struct Ctx {
     /// e.g. `https://joey.pds.spirallex.net` — the OAuth issuer. No trailing
     /// slash, because clients compare `iss` byte-for-byte.
     pub issuer: String,
-    /// e.g. `did:web:joey.pds.spirallex.net`.
-    pub did: String,
+    /// The **service** DID of this PDS instance — not the DID of the account it
+    /// hosts. e.g. `did:web:joey.pds.spirallex.net`.
+    ///
+    /// The two are easy to confuse here, because one hostname is both the
+    /// person's handle and the PDS serving it, so both DIDs answer at the same
+    /// name. They are different identities with different jobs:
+    ///
+    /// | | value | served at | answers |
+    /// |---|---|---|---|
+    /// | service | `did:web:<host>` | `/.well-known/did.json` | "what software is this?" |
+    /// | account | `did:plc:…` | `/.well-known/atproto-did` | "who lives here?" |
+    ///
+    /// Accounts are `did:plc` so they stay portable — a `did:web` identity is
+    /// welded to its hostname and cannot survive a move to another server, which
+    /// is the whole point of the protocol. The service DID has no such
+    /// requirement: it describes a deployment, which does not migrate.
+    ///
+    /// This is why `did.json` deliberately carries no `verificationMethod`. A
+    /// client that mistook it for the account's identity finds nothing to verify
+    /// against and fails, rather than proceeding with the wrong DID.
+    pub service_did: String,
 }
 
 impl Ctx {
     pub fn from_host(hostname: &str) -> Self {
         Self {
             issuer: format!("https://{hostname}"),
-            did: format!("did:web:{hostname}"),
+            service_did: format!("did:web:{hostname}"),
         }
     }
 }
@@ -53,9 +72,14 @@ pub fn oauth_protected_resource(ctx: &Ctx) -> Result<Response> {
 /// The first call most atproto clients make. `availableUserDomains` is the
 /// zone suffix rather than this hostname: it advertises where *new* handles can
 /// be created, and every account on this deployment is a label under the zone.
+///
+/// `did` here is the service DID, which is what the lexicon field means — the
+/// same way `bsky.social` answers `did:web:bsky.social`. It is not the DID of
+/// whoever's account lives at this hostname; that one is `did:plc` and is
+/// resolved through `/.well-known/atproto-did`.
 pub fn describe_server(ctx: &Ctx, zone_suffix: &str) -> Result<Response> {
     Response::from_json(&serde_json::json!({
-        "did": ctx.did,
+        "did": ctx.service_did,
         "availableUserDomains": [format!(".{zone_suffix}")],
         // No open registration: an account needs a `pulumi`-free but
         // operator-driven creation step, so advertise the invite requirement
@@ -238,19 +262,22 @@ pub enum ProvisionOutcome {
     },
 }
 
-/// `GET /.well-known/did.json` — the did:web document for this PDS.
+/// `GET /.well-known/did.json` — the did:web document for this PDS *service*.
 ///
-/// Advertises the PDS service endpoint so a resolver pointed at the handle can
-/// find where the repo lives. The verification method is deliberately absent
-/// until account signing keys are wired in; a did:web document without one is
-/// still valid and still resolves the service endpoint.
+/// Describes the deployment, not the person. Accounts are `did:plc` and resolve
+/// through `/.well-known/atproto-did`; see the note on [`Ctx::service_did`] for
+/// why the two answer at the same hostname without being the same identity.
+///
+/// The verification method is deliberately absent. Nothing should be
+/// authenticating against the service DID — a client that mistook this for the
+/// account's identity finds no key and fails, which is the outcome to want.
 pub fn did_web_document(ctx: &Ctx) -> Result<Response> {
     Response::from_json(&serde_json::json!({
         "@context": [
             "https://www.w3.org/ns/did/v1",
             "https://w3id.org/security/multikey/v1",
         ],
-        "id": ctx.did,
+        "id": ctx.service_did,
         "service": [{
             "id": "#atproto_pds",
             "type": "AtprotoPersonalDataServer",
