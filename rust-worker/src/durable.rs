@@ -94,7 +94,7 @@ impl PdsDurableObject {
 
             // --- XRPC ------------------------------------------------------
             "/xrpc/com.atproto.server.describeServer" => {
-                h::describe_server(&ctx, &self.zone_suffix())
+                h::describe_server(&ctx, &self.zone_suffix(), self.open_registration())
             }
 
             // --- internal --------------------------------------------------
@@ -147,6 +147,18 @@ impl PdsDurableObject {
             .secret("PDS_JWT_SECRET")
             .map(|s| s.to_string().into_bytes())
             .map_err(|_| Error::RustError("PDS_JWT_SECRET secret is not set".into()))
+    }
+
+    /// Whether this deployment advertises open registration in describeServer.
+    ///
+    /// Read here only to render the discovery document honestly; the front
+    /// Worker is what actually enforces the gate. Kept in sync with the
+    /// `open_registration` reader there.
+    fn open_registration(&self) -> bool {
+        self.env
+            .var("PDS_OPEN_REGISTRATION")
+            .map(|v| v.to_string() == "true")
+            .unwrap_or(false)
     }
 
     /// PLC directory that genesis operations are submitted to.

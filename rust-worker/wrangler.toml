@@ -96,6 +96,14 @@ PDS_ZONE_SUFFIX = "pds.spirallex.com"
 # register.rs, so nobody can claim it as a handle.
 PDS_SIGNUP_HOST = "signup.pds.spirallex.com"
 
+# Open registration: anyone reaching the signup host may create an account with
+# no invite code. On because the iOS app offers cloud hosting as a one-tap
+# option and cannot carry an operator credential to mint invites. The registry
+# still reserves each label, so handles stay unique; only the invite gate is
+# lifted. describeServer reflects this as `inviteCodeRequired: false`. Set to
+# anything other than "true" (or unset) to put the gate back.
+PDS_OPEN_REGISTRATION = "true"
+
 # Secrets (set with `wrangler secret put`, never in this file):
 #   PDS_JWT_SECRET       HMAC secret for legacy session JWTs; also the seed for
 #                        the derived DPoP nonce secret.

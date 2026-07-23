@@ -77,14 +77,16 @@ pub fn oauth_protected_resource(ctx: &Ctx) -> Result<Response> {
 /// same way `bsky.social` answers `did:web:bsky.social`. It is not the DID of
 /// whoever's account lives at this hostname; that one is `did:plc` and is
 /// resolved through `/.well-known/atproto-did`.
-pub fn describe_server(ctx: &Ctx, zone_suffix: &str) -> Result<Response> {
+///
+/// `inviteCodeRequired` mirrors the deployment's gate, so a client learns
+/// whether to prompt for a code before it tries — advertising `true` while
+/// registration is open would make well-behaved clients demand a code that is
+/// not needed.
+pub fn describe_server(ctx: &Ctx, zone_suffix: &str, open_registration: bool) -> Result<Response> {
     Response::from_json(&serde_json::json!({
         "did": ctx.service_did,
         "availableUserDomains": [format!(".{zone_suffix}")],
-        // No open registration: an account needs a `pulumi`-free but
-        // operator-driven creation step, so advertise the invite requirement
-        // rather than letting clients attempt a signup that will fail.
-        "inviteCodeRequired": true,
+        "inviteCodeRequired": !open_registration,
         "links": {},
     }))
 }

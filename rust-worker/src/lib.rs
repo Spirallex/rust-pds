@@ -331,11 +331,22 @@ async fn check_handle(env: &Env, body: &str) -> Result<Response> {
     }))
 }
 
+/// Whether this deployment lets anyone register without an invite.
+///
+/// Off unless `PDS_OPEN_REGISTRATION` is exactly `"true"`. A typo or an unset
+/// var leaves the gate up, which is the safe direction to fail.
+fn open_registration(env: &Env) -> bool {
+    env.var("PDS_OPEN_REGISTRATION")
+        .map(|v| v.to_string() == "true")
+        .unwrap_or(false)
+}
+
 /// `POST /xrpc/com.atproto.server.createAccount`.
 ///
 /// Order matters and is the whole design:
 ///
-/// 1. reserve the label and burn the invite, atomically, in the registry;
+/// 1. reserve the label (burning an invite unless registration is open),
+///    atomically, in the registry;
 /// 2. provision the account in its own object, which writes the DID to a public
 ///    ledger and is the step that cannot be undone;
 /// 3. bind the DID to the reservation.
@@ -375,12 +386,13 @@ async fn create_account(env: &Env, zone_suffix: &str, body: &str) -> Result<Resp
         );
     }
 
-    // Step 1 — the gate.
+    // Step 1 — the gate (or, in open mode, just the reservation).
+    let open = open_registration(env);
     let registry = registry_stub(env)?;
     let claim = call_do(
         &registry,
         "/claim",
-        serde_json::json!({ "label": label, "invite_code": input.invite_code }),
+        serde_json::json!({ "label": label, "invite_code": input.invite_code, "open": open }),
     )
     .await?;
     if !claim.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {

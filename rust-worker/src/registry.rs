@@ -61,6 +61,14 @@ struct ClaimReq {
     label: String,
     #[serde(default)]
     invite_code: Option<String>,
+    /// Open registration: reserve without requiring or consuming an invite.
+    ///
+    /// Trusted because only the front Worker can reach a DO stub — the registry
+    /// is not externally addressable, so this flag cannot be forged by a client.
+    /// The Worker sets it from `PDS_OPEN_REGISTRATION`, the same way it is the
+    /// Worker that decides which host may register at all.
+    #[serde(default)]
+    open: bool,
 }
 
 #[derive(Deserialize)]
@@ -153,7 +161,7 @@ impl RegistryDurableObject {
             }
             "/claim" => {
                 let body: ClaimReq = req.json().await?;
-                self.claim(&body.label, body.invite_code.as_deref())
+                self.claim(&body.label, body.invite_code.as_deref(), body.open)
             }
             "/release" => {
                 let body: LabelReq = req.json().await?;
@@ -195,18 +203,38 @@ impl RegistryDurableObject {
         })
     }
 
-    /// Reserve `label`, burning one use of `invite_code`.
+    /// Reserve `label`. In gated mode this burns one use of `invite_code`; in
+    /// open mode it reserves with no invite at all.
     ///
     /// **Await-free by construction.** See the module note: the atomicity of the
-    /// whole check-burn-insert sequence rests on there being no suspension point
-    /// anywhere in this function.
-    fn claim(&self, label: &str, invite_code: Option<&str>) -> Result<Response> {
+    /// whole check-(burn-)insert sequence rests on there being no suspension
+    /// point anywhere in this function.
+    fn claim(&self, label: &str, invite_code: Option<&str>, open: bool) -> Result<Response> {
         let sql = self.sql()?;
 
         if self.is_taken(&sql, label)? {
             return Response::from_json(&OkResp {
                 ok: false,
                 error: Some("HandleNotAvailable".into()),
+            });
+        }
+
+        // Open registration still reserves the label — the uniqueness guarantee
+        // that stops two people claiming one handle is independent of invites —
+        // it just does not require or record one. `invite_code` is NULL, so a
+        // later `release` refunds nothing, which is correct: nothing was spent.
+        if open {
+            sql.exec(
+                "INSERT INTO claims (label, did, state, invite_code, created_at) \
+                 VALUES (?, NULL, 'reserved', NULL, ?)",
+                vec![
+                    SqlStorageValue::from(label.to_string()),
+                    SqlStorageValue::from(now_iso()),
+                ],
+            )?;
+            return Response::from_json(&OkResp {
+                ok: true,
+                error: None,
             });
         }
 
