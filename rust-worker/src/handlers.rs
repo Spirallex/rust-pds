@@ -21,10 +21,10 @@ const AS_SIGNING_KEY_ID: &str = "oauth#as-signing";
 /// A single Worker and Durable Object class serve every hostname, so identity is
 /// per-request, not per-deployment.
 pub struct Ctx {
-    /// e.g. `https://joey.spirallex.net` — the OAuth issuer. No trailing slash,
-    /// because clients compare `iss` byte-for-byte.
+    /// e.g. `https://joey.pds.spirallex.net` — the OAuth issuer. No trailing
+    /// slash, because clients compare `iss` byte-for-byte.
     pub issuer: String,
-    /// e.g. `did:web:joey.spirallex.net`.
+    /// e.g. `did:web:joey.pds.spirallex.net`.
     pub did: String,
 }
 

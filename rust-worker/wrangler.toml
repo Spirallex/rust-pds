@@ -13,11 +13,15 @@ account_id = "9a497744238ab16a1060dc3ae8abd102"
 # and R2 buckets. Declaring routes here as well would make `wrangler deploy` and
 # `pulumi up` fight over the same resource, and in that repo drift is a bug.
 #
-# Routes and DNS live in src/accounts/primary/stelyph-pds.ts.
-# Also publish on workers.dev. The custom route above only receives traffic once
-# a proxied wildcard DNS record for *.pds.spirallex.net exists, and creating DNS
-# needs a permission the Workers OAuth token does not carry. This gives a
-# reachable URL for smoke-testing in the meantime.
+# Routes, DNS, and the TLS certificate live in
+# src/accounts/primary/stelyph-pds.ts.
+#
+# Also publish on workers.dev. The custom route serves traffic only once BOTH a
+# proxied wildcard DNS record for *.pds.spirallex.net and an ACM advanced
+# certificate carrying that SAN exist — Universal SSL covers only one label, so
+# without the certificate the route matches and the handshake then fails. Both
+# are Pulumi's to create. This gives a reachable URL for smoke-testing in the
+# meantime, and it is the only URL that works if the certificate lapses.
 workers_dev = true
 
 [build]
@@ -53,10 +57,18 @@ binding = "BLOBS"
 bucket_name = "stelyph-pds-blobs"
 
 [vars]
-# Overridden per-environment. The issuer is derived per-request from the Host
-# header's registered zone suffix, not from this value; this is only the
-# fallback for local development.
-PDS_ZONE_SUFFIX = "spirallex.net"
+# The suffix new handles are created under, advertised as `availableUserDomains`
+# by com.atproto.server.describeServer. This is a real production value, not a
+# local-dev fallback — it is what clients read to decide what a new handle may
+# end in. The issuer and did:web are a separate matter: those come per-request
+# from the Host header, so this value does not determine which PDS is served.
+#
+# Second-level on purpose. Handles are `<label>.pds.spirallex.net`, which needs
+# an ACM advanced certificate carrying a `*.pds.spirallex.net` SAN — Universal
+# SSL stops at one label. The certificate is declared in the Pulumi estate
+# (IdeaProjects/cloudflare, src/accounts/primary/stelyph-pds.ts); if it is ever
+# removed, every account here fails at the TLS handshake.
+PDS_ZONE_SUFFIX = "pds.spirallex.net"
 
 # Secrets (set with `wrangler secret put`, never in this file):
 #   PDS_JWT_SECRET       HMAC secret for legacy session JWTs; also the seed for

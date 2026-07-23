@@ -100,7 +100,7 @@ impl PdsDurableObject {
             .map_err(|_| Error::RustError("PDS_KEY_PASSPHRASE secret is not set".into()))
     }
 
-    /// Zone the handles live under, e.g. `spirallex.net`.
+    /// Zone the handles live under, e.g. `pds.spirallex.net`.
     fn zone_suffix(&self) -> String {
         self.env
             .var("PDS_ZONE_SUFFIX")
