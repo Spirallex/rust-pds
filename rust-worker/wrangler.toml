@@ -1,0 +1,57 @@
+name = "stelyph-pds"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-07-01"
+account_id = "9a497744238ab16a1060dc3ae8abd102"
+
+# One Worker serves every PDS on the zone. `*.pds.spirallex.net` is deliberately
+# a different zone from spirallex.com, which carries a catch-all persona Worker
+# route (`*.spirallex.com/*`) that would otherwise shadow this one.
+routes = [
+  { pattern = "*.pds.spirallex.net/*", zone_name = "spirallex.net" },
+]
+
+[build]
+command = "cargo install -q worker-build --version ^0.1 && worker-build --release"
+
+# --- Durable Objects -------------------------------------------------------
+#
+# One instance per PDS hostname. It is the single writer for that repo, which is
+# what makes `seq` monotonic and the root pointer safe to compare-and-swap — a
+# guarantee no amount of care in a fan-out of stateless isolates can provide.
+[durable_objects]
+bindings = [
+  { name = "PDS", class_name = "PdsDurableObject" },
+]
+
+[[migrations]]
+tag = "v1"
+# `new_sqlite_classes`, not `new_classes`: the SQLite-backed storage engine is
+# what lets the existing schema port over more or less intact, and it is the
+# only backend with a real transaction.
+new_sqlite_classes = ["PdsDurableObject"]
+
+# --- R2 --------------------------------------------------------------------
+#
+# Blobs (avatars, images, video) and cold CAR chunks. Both are large, immutable,
+# and content-addressed, which is exactly what R2 is good at — and exactly what
+# would be wasteful to keep in the DO's SQLite.
+[[r2_buckets]]
+binding = "BLOBS"
+bucket_name = "stelyph-pds-blobs"
+
+[vars]
+# Overridden per-environment. The issuer is derived per-request from the Host
+# header's registered zone suffix, not from this value; this is only the
+# fallback for local development.
+PDS_ZONE_SUFFIX = "pds.spirallex.net"
+
+# Secrets (set with `wrangler secret put`, never in this file):
+#   PDS_JWT_SECRET       HMAC secret for legacy session JWTs; also the seed for
+#                        the derived DPoP nonce secret.
+#   PDS_KEY_PASSPHRASE   argon2id passphrase wrapping every signing key at rest.
+
+[dev]
+port = 8787
+
+[observability]
+enabled = true

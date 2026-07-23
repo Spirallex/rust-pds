@@ -1896,11 +1896,13 @@ dependencies = [
  "cid",
  "console_error_panic_hook",
  "http",
+ "js-sys",
  "rand",
  "serde",
  "serde_json",
  "stelyph-core",
  "tokio",
+ "wasm-bindgen",
  "worker",
  "worker-macros",
 ]
