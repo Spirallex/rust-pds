@@ -27,9 +27,12 @@ iroh-car = "0.5.1"
 data-encoding = "2"
 
 # --- storage (SQLite is C but `bundled` compiles in-tree for iOS) ---
-rusqlite = { workspace = true }
-tokio-rusqlite = "0.7.0"
-deadpool-sqlite = { version = "0.12.1", features = ["rt_tokio_1"] }
+# Optional so the `sqlite` feature can be turned off: the trait-based storage
+# layer (src/storage/traits.rs) lets a host run on MemoryStore alone, which is
+# what a target that cannot link a C SQLite — notably wasm32 — needs.
+rusqlite = { workspace = true, optional = true }
+tokio-rusqlite = { version = "0.7.0", optional = true }
+deadpool-sqlite = { version = "0.12.1", features = ["rt_tokio_1"], optional = true }
 chrono = "0.4"
 
 # --- keystore + auth crypto (pure Rust RustCrypto) ---
@@ -62,6 +65,19 @@ sha1 = { version = "0.10", optional = true }
 tempfile = { version = "3", optional = true }
 
 [features]
+default = ["sqlite"]
+
+# The SQLite storage backend. On by default — it is what every current host
+# uses. Turning it off drops rusqlite/tokio-rusqlite/deadpool-sqlite (and the C
+# SQLite they bundle) and leaves `MemoryStore` as the only backend, which is the
+# configuration a wasm32 target needs. Both backends implement the same traits
+# and are held to the same behaviour by `storage::conformance`.
+#
+# `MemoryStore` has no feature gate: it is pure Rust with no extra dependencies,
+# and the conformance suite needs it present in every configuration to have
+# something to compare the SQLite backend against.
+sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "dep:deadpool-sqlite"]
+
 # Exposes in-memory store construction and account/invite seed helpers for use
 # by downstream crates' test suites (the server enables this via dev-deps).
 testing = ["dep:tempfile"]

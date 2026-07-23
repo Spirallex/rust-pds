@@ -1,6 +1,6 @@
 //! `stelyph export-keys` — export encrypted signing keys to a portable blob.
 //!
-//! Wraps `crate::storage::keys::export_keys` with a CLI-friendly interface:
+//! Wraps `crate::storage::crypto::export_keys` with a CLI-friendly interface:
 //! - `--did`:    the DID whose keys to export (required)
 //! - `--output`: path to write the signing-key blob (required)
 //! - `--db-path`: path to the PDS SQLite database (default: `pds.db` / `PDS_DB_PATH`)
@@ -38,7 +38,7 @@ pub async fn run(args: ExportKeysArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to open database {}: {e}", args.db_path))?;
 
     // Export signing key to --output.
-    let signing = crate::storage::keys::export_keys(
+    let signing = crate::storage::crypto::export_keys(
         &store,
         &format!("{}#signing", args.did),
         passphrase.as_bytes(),
@@ -65,7 +65,7 @@ pub async fn run(args: ExportKeysArgs) -> anyhow::Result<()> {
     }
 
     // Export rotation key to <output>.rotation.
-    let rotation = crate::storage::keys::export_keys(
+    let rotation = crate::storage::crypto::export_keys(
         &store,
         &format!("{}#rotation", args.did),
         passphrase.as_bytes(),
@@ -97,7 +97,7 @@ pub async fn run(args: ExportKeysArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::{keys, SqliteStore};
+    use crate::storage::{crypto as keys, SqliteStore};
 
     /// Round-trip: store a key → export to tempfile via storage fn → import under new id →
     /// load and verify bytes match. Drives the storage layer directly (no TTY prompt needed).

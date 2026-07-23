@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::extractor::{AccessAuth, RefreshAuth};
 use crate::auth::jwt::{encode_access_jwt, encode_refresh_jwt, hash_password, verify_password};
 use crate::identity::plc::register_did_plc;
-use crate::storage::keys::store_key;
+use crate::storage::crypto::store_key;
 use crate::xrpc::appview::service_auth::mint_service_auth_jwt_with;
 use crate::xrpc::{AppState, XrpcError};
 
@@ -467,7 +467,7 @@ pub async fn create_account_inner(
     let rotation_scalar = rotation.export();
 
     store_key(
-        &state.store,
+        state.store.as_ref(),
         &format!("{did}#signing"),
         &signing_scalar,
         &state.key_passphrase,
@@ -475,7 +475,7 @@ pub async fn create_account_inner(
     .await?;
 
     store_key(
-        &state.store,
+        state.store.as_ref(),
         &format!("{did}#rotation"),
         &rotation_scalar,
         &state.key_passphrase,
@@ -1003,8 +1003,8 @@ mod tests {
         let did = json["did"].as_str().expect("did must be present");
 
         // Both keys must decrypt successfully with the key_passphrase.
-        let signing = crate::storage::keys::load_key(
-            &state.store,
+        let signing = crate::storage::crypto::load_key(
+            state.store.as_ref(),
             &format!("{did}#signing"),
             &state.key_passphrase,
         )
@@ -1012,8 +1012,8 @@ mod tests {
         .expect("signing key must exist and decrypt");
         assert_eq!(signing.len(), 32, "signing key must be 32 bytes");
 
-        let rotation = crate::storage::keys::load_key(
-            &state.store,
+        let rotation = crate::storage::crypto::load_key(
+            state.store.as_ref(),
             &format!("{did}#rotation"),
             &state.key_passphrase,
         )

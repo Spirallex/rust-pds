@@ -194,7 +194,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::auth::jwt::encode_access_jwt;
-    use crate::storage::keys::store_key;
+    use crate::storage::crypto::store_key;
     use crate::storage::SqliteStore;
     use crate::xrpc::app;
     use crate::xrpc::appview::MockServiceDidResolver;
@@ -236,7 +236,7 @@ mod tests {
         use atrium_crypto::keypair::{Export, Secp256k1Keypair};
         let signing = Secp256k1Keypair::create(&mut rand::rngs::OsRng);
         store_key(
-            &state.store,
+            state.store.as_ref(),
             &format!("{TEST_DID}#signing"),
             &signing.export(),
             &state.key_passphrase,

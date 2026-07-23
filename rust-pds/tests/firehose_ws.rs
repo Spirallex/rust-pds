@@ -25,7 +25,7 @@ use stelyph::firehose::MockRelayClient;
 use stelyph::identity::plc::MockPlcClient;
 use stelyph::identity::web_resolver::MockDidWebResolver;
 use stelyph::repo::RepoWriter;
-use stelyph::storage::keys::store_key;
+use stelyph::storage::crypto::store_key;
 use stelyph::storage::SqliteStore;
 use stelyph::xrpc::{app, AppState};
 use tokio_tungstenite::tungstenite::Message;
@@ -101,7 +101,7 @@ async fn seed_account(state: &AppState, handle: &str) -> (String, Secp256k1Keypa
     let signing = Secp256k1Keypair::create(&mut OsRng);
     let key_bytes = signing.export();
     store_key(
-        &state.store,
+        state.store.as_ref(),
         &format!("{did}#signing"),
         &key_bytes,
         &state.key_passphrase,
@@ -125,8 +125,8 @@ async fn write_records_offset(state: &AppState, did: &str, n: u32, start_offset:
     let did_typed = did.parse::<Did>().expect("parse did");
 
     // Re-import the key from the store.
-    let key_bytes = stelyph::storage::keys::load_key(
-        &state.store,
+    let key_bytes = stelyph::storage::crypto::load_key(
+        state.store.as_ref(),
         &format!("{did}#signing"),
         &state.key_passphrase,
     )

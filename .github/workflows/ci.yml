@@ -31,6 +31,11 @@ jobs:
       # The embedded (on-device) server is feature-gated off by default, so the
       # workspace run above never compiles or tests it — gate it explicitly.
       - run: cargo test -p stelyph-core --features embedded-server
+      # The storage traits exist so a host can run without a C SQLite (the
+      # precondition for a wasm32 target). That only stays true if it is built:
+      # without this, the first `rusqlite::` outside `storage/sqlite/` would
+      # silently re-couple the core to SQLite and nothing would notice.
+      - run: cargo build -p stelyph-core --no-default-features
       - run: cargo clippy --workspace --all-features -- -D warnings
       - run: cargo fmt --all --check
 

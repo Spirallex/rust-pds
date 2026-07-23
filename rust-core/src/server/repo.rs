@@ -22,7 +22,8 @@ use sha2::{Digest, Sha256};
 
 use crate::repo::util::{json_value_to_ipld, tid_from_micros, validate_collection, validate_rkey};
 use crate::repo::writer::{RepoWriter, WriteOp};
-use crate::storage::keys::load_key;
+use crate::storage::crypto::load_key;
+use crate::storage::BlockStoreAdapter;
 
 use super::{authed_did, json_response, query_param, read_json_body, xrpc_error, AppState};
 
@@ -65,7 +66,7 @@ pub(super) async fn load_signing_key(
         Some(bytes) => Secp256k1Keypair::import(bytes.as_slice())
             .map_err(|_| internal("failed to import signing key")),
         None => {
-            let key_bytes = load_key(&state.store, &key_id, &state.config.key_passphrase)
+            let key_bytes = load_key(state.store.as_ref(), &key_id, &state.config.key_passphrase)
                 .await
                 .map_err(|_| internal("failed to load signing key"))?;
             let signing = Secp256k1Keypair::import(&key_bytes)
@@ -117,8 +118,7 @@ async fn lookup_record_cid(
         Ok(None) => return Ok(None),
         Err(_) => return Err(internal("store error")),
     };
-    let cloned_store = (*state.store).clone();
-    let mut diff = DiffBlockStore::wrap(cloned_store);
+    let mut diff = DiffBlockStore::wrap(BlockStoreAdapter::new(state.store.clone()));
     let mut repo = Repository::open(&mut diff, root_cid)
         .await
         .map_err(|_| internal("failed to open repo"))?;
@@ -554,8 +554,7 @@ pub(super) async fn list_records(state: &AppState, query: &str) -> Response<Full
         Ok(None) => return invalid(&format!("repo not found for did: {did}")),
         Err(_) => return internal("store error"),
     };
-    let cloned_store = (*state.store).clone();
-    let mut diff = DiffBlockStore::wrap(cloned_store);
+    let mut diff = DiffBlockStore::wrap(BlockStoreAdapter::new(state.store.clone()));
     let mut repo = match Repository::open(&mut diff, root_cid).await {
         Ok(r) => r,
         Err(_) => return internal("failed to open repo"),
@@ -627,8 +626,7 @@ pub(super) async fn describe_repo(state: &AppState, query: &str) -> Response<Ful
     // Distinct top-level collection NSIDs present in the MST.
     let mut collections = std::collections::BTreeSet::new();
     if let Ok(Some(root_cid)) = state.store.load_repo_root(&did).await {
-        let cloned_store = (*state.store).clone();
-        let mut diff = DiffBlockStore::wrap(cloned_store);
+        let mut diff = DiffBlockStore::wrap(BlockStoreAdapter::new(state.store.clone()));
         let mut repo = match Repository::open(&mut diff, root_cid).await {
             Ok(r) => r,
             Err(_) => return internal("failed to open repo"),
@@ -786,8 +784,7 @@ pub(super) async fn get_repo(state: &AppState, query: &str) -> Response<Full<Byt
         Err(_) => return internal("store error"),
     };
 
-    let cloned_store = (*state.store).clone();
-    let mut diff = DiffBlockStore::wrap(cloned_store);
+    let mut diff = DiffBlockStore::wrap(BlockStoreAdapter::new(state.store.clone()));
     let mut repo = match Repository::open(&mut diff, root_cid).await {
         Ok(r) => r,
         Err(_) => return internal("failed to open repo"),

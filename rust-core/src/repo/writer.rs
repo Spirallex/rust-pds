@@ -9,7 +9,7 @@ use ipld_core::ipld::Ipld;
 use tokio::sync::Mutex;
 
 use crate::repo::RepoError;
-use crate::storage::SqliteStore;
+use crate::storage::{BlockStoreAdapter, StorageBackend};
 
 /// Minimal typed repo writer. Phase 3's createRecord handler calls this.
 /// Stateless across calls: re-opens the repo from the stored root CID each time.
@@ -20,7 +20,7 @@ use crate::storage::SqliteStore;
 /// path. The lock is an Arc so callers can share a single `RepoWriter` across tasks
 /// while still preserving per-DID sequencing.
 pub struct RepoWriter {
-    pub(crate) store: Arc<SqliteStore>,
+    pub(crate) store: Arc<dyn StorageBackend>,
     pub(crate) signing_key: Secp256k1Keypair,
     pub(crate) did: Did,
     /// Logical per-writer serialisation lock. Held for the entire
@@ -52,7 +52,7 @@ pub struct WriteOutcome {
 
 impl RepoWriter {
     pub fn new(
-        store: Arc<SqliteStore>,
+        store: Arc<dyn StorageBackend>,
         signing_key: Secp256k1Keypair,
         did: Did,
         firehose_tx: tokio::sync::broadcast::Sender<crate::firehose::FirehoseEvent>,
@@ -71,7 +71,7 @@ impl RepoWriter {
     /// for the same DID across concurrent requests serialize their writes through one lock,
     /// preventing two concurrent commits from forking the repo history.
     pub fn with_lock(
-        store: Arc<SqliteStore>,
+        store: Arc<dyn StorageBackend>,
         signing_key: Secp256k1Keypair,
         did: Did,
         firehose_tx: tokio::sync::broadcast::Sender<crate::firehose::FirehoseEvent>,
@@ -117,12 +117,10 @@ impl RepoWriter {
         // at the application level even when the SQLite writer lock is released
         // between individual operations.
         let _guard = self.write_lock.lock().await;
-        // Clone the store handle (Arc bump — cheap, shares the underlying writer mutex + pool).
-        let cloned_store = (*self.store).clone();
-        // Wrap in DiffBlockStore so we track which CIDs are new this session.
-        // DiffBlockStore<SqliteStore> delegates reads and writes to SqliteStore;
-        // write_block does INSERT OR IGNORE (idempotent).
-        let mut diff = DiffBlockStore::wrap(cloned_store);
+        // Adapt the backend to atrium's blockstore traits (Arc bump — cheap, shares
+        // the underlying backend). Wrap in DiffBlockStore so we track which CIDs are
+        // new this session; the adapter's write_block is idempotent per block.
+        let mut diff = DiffBlockStore::wrap(BlockStoreAdapter::new(self.store.clone()));
 
         // Open or create the repo. Pass &mut diff so Repository borrows diff by &mut,
         // leaving diff owned by this function for recovery after the borrow ends.
@@ -219,13 +217,13 @@ impl RepoWriter {
         // BORROW ORDER (critical — borrow checker requires this sequence):
         // 1. drop(repo) — releases the &mut borrow on diff held by Repository<&mut DiffBlockStore<_>>
         // 2. diff.blocks().collect() — safe only after repo is dropped (&self borrow on diff)
-        // 3. diff.into_inner() — consumes diff, recovers the cloned SqliteStore handle
+        // 3. diff.into_inner() — consumes diff, recovers the adapter handle
         drop(repo);
         let new_cids: Vec<Cid> = diff.blocks().collect();
         let inner = diff.into_inner();
 
-        // Read back the bytes for each new CID. They are already in SQLite from the
-        // individual write_block calls (INSERT OR IGNORE is idempotent).
+        // Read back the bytes for each new CID. They are already in the backend from
+        // the individual write_block calls (each is idempotent).
         let mut blocks = Vec::with_capacity(new_cids.len());
         for cid in new_cids {
             let bytes = inner.read_block_bytes(cid).await?;
@@ -334,9 +332,8 @@ impl RepoWriter {
             None => return Ok(None),
             Some(r) => r,
         };
-        // Open is read-only; wrap the store so reads hit SQLite. No new writes occur.
-        let cloned_store = (*self.store).clone();
-        let mut diff = DiffBlockStore::wrap(cloned_store);
+        // Open is read-only; wrap the store so reads hit the backend. No new writes occur.
+        let mut diff = DiffBlockStore::wrap(BlockStoreAdapter::new(self.store.clone()));
         let repo = Repository::open(&mut diff, root)
             .await
             .map_err(|e| RepoError::Repo(e.to_string()))?;
@@ -349,7 +346,8 @@ impl RepoWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::keys::{load_key, store_key};
+    use crate::storage::crypto::{load_key, store_key};
+    use crate::storage::MemoryStore;
     use atrium_crypto::keypair::{Did as _, Secp256k1Keypair};
     use atrium_crypto::verify::verify_signature;
     use ipld_core::ipld::Ipld;
@@ -372,26 +370,51 @@ mod tests {
         Ipld::Map(m)
     }
 
+    /// Build a writer over the in-memory backend.
+    ///
+    /// These tests exercise repo/MST/signing semantics, none of which are
+    /// backend-specific — the storage layer is covered separately by
+    /// `storage::conformance`. Using `MemoryStore` keeps them fast and free of
+    /// temp files, and means they run through the same `dyn StorageBackend` path
+    /// production uses.
     async fn writer_with_store() -> (
         RepoWriter,
-        SqliteStore,
-        tempfile::NamedTempFile,
+        Arc<dyn StorageBackend>,
         tokio::sync::broadcast::Receiver<crate::firehose::FirehoseEvent>,
     ) {
-        let (store, tmp) = SqliteStore::open_in_memory().await.expect("open");
+        let store: Arc<dyn StorageBackend> = Arc::new(MemoryStore::new());
         let passphrase = b"test-signing-passphrase";
-        store_key(&store, "signing", &SIGNING_SCALAR, passphrase)
+        store_key(store.as_ref(), "signing", &SIGNING_SCALAR, passphrase)
             .await
             .expect("store_key");
-        let scalar = load_key(&store, "signing", passphrase)
+        let scalar = load_key(store.as_ref(), "signing", passphrase)
             .await
             .expect("load_key");
         let key = Secp256k1Keypair::import(&scalar).expect("import key");
         let did = Did::from_str("did:web:example.com").unwrap();
-        let store_arc = Arc::new(store.clone());
         let (tx, rx) = tokio::sync::broadcast::channel(16);
-        let writer = RepoWriter::new(store_arc, key, did, tx);
-        (writer, store, tmp, rx)
+        let writer = RepoWriter::new(store.clone(), key, did, tx);
+        (writer, store, rx)
+    }
+
+    /// Number of appended firehose rows — the backend-neutral equivalent of
+    /// `SELECT count(*) FROM repo_seq`.
+    async fn seq_count(store: &Arc<dyn StorageBackend>) -> usize {
+        store
+            .backfill_page(0, i64::MAX)
+            .await
+            .expect("backfill_page")
+            .len()
+    }
+
+    /// The most recently appended event body, or None if nothing was written.
+    async fn last_event_body(store: &Arc<dyn StorageBackend>) -> Option<Vec<u8>> {
+        store
+            .backfill_page(0, i64::MAX)
+            .await
+            .expect("backfill_page")
+            .pop()
+            .map(|(_, event)| event)
     }
 
     use serde::{Deserialize, Serialize};
@@ -435,7 +458,7 @@ mod tests {
     /// signature verifies against the signer's did:key.
     #[tokio::test]
     async fn signed_commit_signature_verifies() {
-        let (writer, store, _tmp, _rx) = writer_with_store().await;
+        let (writer, store, _rx) = writer_with_store().await;
         let (record_cid, commit_cid) = writer
             .create_record("app.bsky.feed.post/3kaaaa", post("hi"))
             .await
@@ -458,7 +481,7 @@ mod tests {
     /// REPO-02: a record survives write -> SQLite -> read unchanged.
     #[tokio::test]
     async fn record_roundtrips_through_mst() {
-        let (writer, _store, _tmp, _rx) = writer_with_store().await;
+        let (writer, _store, _rx) = writer_with_store().await;
         let original = post("round trip me");
         let (record_cid, _commit) = writer
             .create_record("app.bsky.feed.post/3kaaaa", original.clone())
@@ -482,7 +505,7 @@ mod tests {
     #[tokio::test]
     async fn mst_root_is_insertion_order_independent() {
         async fn root_for(order: &[(&str, &str)]) -> Cid {
-            let (writer, _store, _tmp, _rx) = writer_with_store().await;
+            let (writer, _store, _rx) = writer_with_store().await;
             for (k, t) in order {
                 writer
                     .create_record(k, post(t))
@@ -515,13 +538,13 @@ mod tests {
     /// the empty-repo root commit).
     #[tokio::test]
     async fn create_record_produces_one_seq_row() {
-        let (writer, store, _tmp, _rx) = writer_with_store().await;
-        let before = store.repo_seq_count().await.expect("count");
+        let (writer, store, _rx) = writer_with_store().await;
+        let before = seq_count(&store).await;
         writer
             .create_record("app.bsky.feed.post/3kaaaa", post("hi"))
             .await
             .expect("create_record");
-        let after = store.repo_seq_count().await.expect("count");
+        let after = seq_count(&store).await;
         assert_eq!(
             after - before,
             1,
@@ -536,7 +559,7 @@ mod tests {
     ///   3. Each commit's `prev` field forms a chain: commit2.prev == commit1 (or vice versa).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_create_record_produces_linear_chain() {
-        let (writer, store, _tmp, _rx) = writer_with_store().await;
+        let (writer, store, _rx) = writer_with_store().await;
         let writer = Arc::new(writer);
 
         let w1 = writer.clone();
@@ -567,11 +590,11 @@ mod tests {
         );
 
         // Exactly two repo_seq rows — no lost update.
-        let seq_count = store.repo_seq_count().await.expect("seq count");
+        let seq_rows = seq_count(&store).await;
         assert_eq!(
-            seq_count, 2,
+            seq_rows, 2,
             "expected exactly 2 repo_seq rows, got {}",
-            seq_count
+            seq_rows
         );
 
         // The final repo_roots must point to one of the two commit CIDs.
@@ -612,7 +635,7 @@ mod tests {
     /// and `ops` path == the MST key (collection/rkey), action == "create".
     #[tokio::test]
     async fn create_record_stores_real_commit_event() {
-        let (writer, store, _tmp, _rx) = writer_with_store().await;
+        let (writer, store, _rx) = writer_with_store().await;
         let mst_key = "app.bsky.feed.post/3kaaaa";
         let (record_cid, commit_cid) = writer
             .create_record(mst_key, post("event body test"))
@@ -620,10 +643,8 @@ mod tests {
             .expect("create_record");
 
         // Read the stored event BLOB from the last repo_seq row.
-        let event_blob = store
-            .last_event_body()
+        let event_blob = last_event_body(&store)
             .await
-            .expect("last_event_body")
             .expect("event BLOB must be present after create_record");
 
         // Decode the DAG-CBOR event body into CommitBody.
@@ -665,7 +686,7 @@ mod tests {
     /// whose `frame` decodes to a #commit with the injected seq.
     #[tokio::test]
     async fn create_record_publishes_to_broadcast() {
-        let (writer, _store, _tmp, mut rx) = writer_with_store().await;
+        let (writer, _store, mut rx) = writer_with_store().await;
 
         let (_record_cid, _commit_cid) = writer
             .create_record("app.bsky.feed.post/3kaaaa", post("broadcast test"))

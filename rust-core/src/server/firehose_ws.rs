@@ -23,7 +23,7 @@ use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::firehose::{encode_error_frame, encode_message_frame, CommitBody};
-use crate::storage::SqliteStore;
+use crate::storage::StorageBackend;
 
 use super::{query_param, xrpc_error, AppState};
 
@@ -272,7 +272,7 @@ where
 /// store error.
 async fn run_backfill<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
-    store: &Arc<SqliteStore>,
+    store: &Arc<dyn StorageBackend>,
     after_seq: i64,
 ) -> Option<i64> {
     let mut last_sent_seq = after_seq;
