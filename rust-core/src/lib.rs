@@ -30,5 +30,7 @@ pub mod repo;
 #[cfg(feature = "embedded-server")]
 pub mod server;
 pub mod storage;
+/// Cross-platform blocking-work helper (threaded runtime vs single-threaded wasm32).
+pub mod task;
 
 pub use error::CoreError;

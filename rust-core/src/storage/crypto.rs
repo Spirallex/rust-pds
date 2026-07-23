@@ -113,9 +113,9 @@ pub async fn store_key<S: KeyStore + ?Sized>(
 ) -> Result<(), StorageError> {
     let plaintext = plaintext.to_vec();
     let passphrase = passphrase.to_vec();
-    let blob = tokio::task::spawn_blocking(move || encrypt_key(&plaintext, &passphrase))
+    let blob = crate::task::run_blocking(move || encrypt_key(&plaintext, &passphrase))
         .await
-        .map_err(|e| StorageError::Crypto(format!("blocking key-encrypt task panicked: {e}")))??;
+        .ok_or_else(|| StorageError::Crypto("key-encrypt task failed".into()))??;
     store.put_key_blob(id, blob).await
 }
 
@@ -132,11 +132,9 @@ pub async fn load_key<S: KeyStore + ?Sized>(
         None => Err(StorageError::Crypto("key not found".into())),
         Some(b) => {
             let passphrase = passphrase.to_vec();
-            tokio::task::spawn_blocking(move || decrypt_key(&b, &passphrase))
+            crate::task::run_blocking(move || decrypt_key(&b, &passphrase))
                 .await
-                .map_err(|e| {
-                    StorageError::Crypto(format!("blocking key-decrypt task panicked: {e}"))
-                })?
+                .ok_or_else(|| StorageError::Crypto("key-decrypt task failed".into()))?
         }
     }
 }

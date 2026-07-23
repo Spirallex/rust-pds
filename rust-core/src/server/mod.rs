@@ -323,10 +323,10 @@ async fn create_session(state: &AppState, body: serde_json::Value) -> Response<F
     // Verify off the async runtime: the argon2id KDF is CPU-heavy and must not
     // block tokio worker threads.
     let password = password.to_owned();
-    let verified = tokio::task::spawn_blocking(move || verify_password(&password, &phc)).await;
+    let verified = crate::task::run_blocking(move || verify_password(&password, &phc)).await;
     match verified {
-        Ok(Ok(true)) => {}
-        Ok(Ok(false)) => return bad_creds(),
+        Some(Ok(true)) => {}
+        Some(Ok(false)) => return bad_creds(),
         _ => {
             return xrpc_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
