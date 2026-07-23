@@ -134,3 +134,14 @@ mach2 = "0.4"
 [[example]]
 name = "server_footprint"
 required-features = ["embedded-server"]
+
+# wasm32 has no OS entropy source and no thread pool. `getrandom`/`uuid` both
+# need to be told to reach for the JS crypto API instead; without these two the
+# build fails at compile time with a `compile_error!` from each crate.
+#
+# Target-gated, so no other build sees them. Blocking work is handled separately
+# by `crate::task::run_blocking`, which runs inline here because a Workers
+# isolate is single-threaded.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+uuid = { version = "1", features = ["v4", "js"] }

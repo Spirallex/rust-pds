@@ -36,6 +36,14 @@ jobs:
       # without this, the first `rusqlite::` outside `storage/sqlite/` would
       # silently re-couple the core to SQLite and nothing would notice.
       - run: cargo build -p stelyph-core --no-default-features
+      # The Cloudflare Workers port compiles the core to wasm32. Two failure
+      # modes are invisible to every other job: a dependency that has no wasm
+      # support, and a `tokio::task::spawn_blocking` that compiles here but has
+      # no thread pool in a single-threaded isolate (use `task::run_blocking`).
+      # Only building the target catches the first; the second is caught by
+      # review, so keep this job's failure message in mind when adding either.
+      - run: rustup target add wasm32-unknown-unknown
+      - run: cargo build -p stelyph-core --no-default-features --target wasm32-unknown-unknown
       - run: cargo clippy --workspace --all-features -- -D warnings
       - run: cargo fmt --all --check
 
