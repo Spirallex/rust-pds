@@ -383,6 +383,126 @@ impl RepoStore for DoStore {
     }
 }
 
+// --- device-approval sign-in ("Sign in with Stelyph") ----------------------
+
+/// One enrolled device.
+#[derive(Deserialize)]
+pub struct DeviceKeyRow {
+    pub did_key: String,
+}
+
+/// A pending sign-in, as the poll endpoint needs to see it.
+#[derive(Deserialize)]
+pub struct SigninRow {
+    pub user_code: String,
+    pub status: String,
+    pub did: Option<String>,
+    pub handle: Option<String>,
+    pub access_jwt: Option<String>,
+    pub refresh_jwt: Option<String>,
+    pub expires_at: i64,
+}
+
+impl DoStore {
+    /// Enrol a device public key. `device_id` is caller-generated (random).
+    pub fn register_device(
+        &self,
+        device_id: &str,
+        did_key: &str,
+        label: &str,
+    ) -> Result<(), StorageError> {
+        self.run(
+            "INSERT OR REPLACE INTO device_keys (device_id, did_key, label, created_at) \
+             VALUES (?, ?, ?, ?)",
+            vec![s(device_id), s(did_key), s(label), s(now_iso())],
+        )
+    }
+
+    /// The enrolled `did:key` for a device, or `None` if unknown.
+    pub fn device_did_key(&self, device_id: &str) -> Result<Option<String>, StorageError> {
+        let rows: Vec<DeviceKeyRow> = self
+            .exec(
+                "SELECT did_key FROM device_keys WHERE device_id = ?",
+                vec![s(device_id)],
+            )?
+            .to_array()
+            .map_err(sql_err)?;
+        Ok(rows.into_iter().next().map(|r| r.did_key))
+    }
+
+    /// Create a pending sign-in request.
+    pub fn create_signin(
+        &self,
+        request_id: &str,
+        user_code: &str,
+        client_name: &str,
+        expires_at: u64,
+    ) -> Result<(), StorageError> {
+        self.run(
+            "INSERT INTO signin_requests \
+             (request_id, user_code, client_name, status, created_at, expires_at) \
+             VALUES (?, ?, ?, 'pending', ?, ?)",
+            vec![
+                s(request_id),
+                s(user_code),
+                s(client_name),
+                s(now_iso()),
+                i(expires_at as i64),
+            ],
+        )
+    }
+
+    /// Fetch a sign-in request by id.
+    pub fn get_signin(&self, request_id: &str) -> Result<Option<SigninRow>, StorageError> {
+        let rows: Vec<SigninRow> = self
+            .exec(
+                "SELECT user_code, status, did, handle, access_jwt, refresh_jwt, expires_at \
+                 FROM signin_requests WHERE request_id = ?",
+                vec![s(request_id)],
+            )?
+            .to_array()
+            .map_err(sql_err)?;
+        Ok(rows.into_iter().next())
+    }
+
+    /// Mark a request approved and attach the issued session.
+    ///
+    /// Guarded on `status = 'pending'` so a second approval — or an approval
+    /// racing a denial — cannot overwrite a decided request. The DO is
+    /// single-threaded, so this UPDATE is atomic with the preceding status read
+    /// as long as no await sits between them at the call site.
+    pub fn approve_signin(
+        &self,
+        request_id: &str,
+        did: &str,
+        handle: &str,
+        access_jwt: &str,
+        refresh_jwt: &str,
+    ) -> Result<(), StorageError> {
+        self.run(
+            "UPDATE signin_requests \
+             SET status = 'approved', did = ?, handle = ?, access_jwt = ?, refresh_jwt = ? \
+             WHERE request_id = ? AND status = 'pending'",
+            vec![
+                s(did),
+                s(handle),
+                s(access_jwt),
+                s(refresh_jwt),
+                s(request_id),
+            ],
+        )
+    }
+
+    /// Mark a request denied.
+    pub fn deny_signin(&self, request_id: &str) -> Result<(), StorageError> {
+        self.run(
+            "UPDATE signin_requests SET status = 'denied' \
+             WHERE request_id = ? AND status = 'pending'",
+            vec![s(request_id)],
+        )
+    }
+}
+
 // --- accounts --------------------------------------------------------------
 
 #[async_trait]

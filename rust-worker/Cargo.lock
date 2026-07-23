@@ -1896,6 +1896,7 @@ dependencies = [
  "atrium-crypto",
  "cid",
  "console_error_panic_hook",
+ "data-encoding",
  "futures-util",
  "http",
  "js-sys",

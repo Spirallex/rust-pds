@@ -23,6 +23,40 @@ struct ProvisionInput {
     password: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceRegisterInput {
+    handle: String,
+    password: String,
+    device_did_key: String,
+    #[serde(default)]
+    label: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SigninStartInput {
+    #[serde(default)]
+    client_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceDecisionInput {
+    request_id: String,
+    device_id: String,
+    /// Base64 signature over the approval challenge.
+    signature: String,
+}
+
+/// Decode a base64 approval signature, mapping a bad value to a 400 rather than
+/// a 500 — a malformed signature is a client error, not a server fault.
+fn decode_b64(s: &str) -> Result<Vec<u8>> {
+    data_encoding::BASE64
+        .decode(s.as_bytes())
+        .map_err(|_| Error::RustError("signature is not valid base64".into()))
+}
+
 /// Name of the R2 binding declared in `wrangler.toml`.
 const BLOBS_BINDING: &str = "BLOBS";
 
@@ -90,6 +124,48 @@ impl PdsDurableObject {
             "/oauth/jwks" => {
                 let store = self.store()?;
                 h::jwks(&store, &self.key_passphrase()?).await
+            }
+
+            // --- Sign in with Stelyph: device-approval sign-in -------------
+            "/oauth/device/register" => {
+                let b: DeviceRegisterInput = req.json().await?;
+                let store = self.store()?;
+                h::device_register(&store, &b.handle, &b.password, &b.device_did_key, &b.label)
+                    .await
+            }
+            "/oauth/signin/start" => {
+                let b: SigninStartInput = req.json().await?;
+                let store = self.store()?;
+                h::signin_start(&store, &b.client_name).await
+            }
+            "/oauth/signin/poll" => {
+                let request_id = url
+                    .query_pairs()
+                    .find(|(k, _)| k == "requestId")
+                    .map(|(_, v)| v.into_owned())
+                    .unwrap_or_default();
+                let store = self.store()?;
+                h::signin_poll(&store, &request_id).await
+            }
+            "/oauth/device/approve" => {
+                let b: DeviceDecisionInput = req.json().await?;
+                let sig = decode_b64(&b.signature)?;
+                let store = self.store()?;
+                h::device_approve(
+                    &store,
+                    &ctx,
+                    &b.request_id,
+                    &b.device_id,
+                    &sig,
+                    &self.jwt_secret()?,
+                )
+                .await
+            }
+            "/oauth/device/deny" => {
+                let b: DeviceDecisionInput = req.json().await?;
+                let sig = decode_b64(&b.signature)?;
+                let store = self.store()?;
+                h::device_deny(&store, &b.request_id, &b.device_id, &sig).await
             }
 
             // --- XRPC ------------------------------------------------------

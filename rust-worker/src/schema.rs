@@ -22,7 +22,7 @@
 
 /// Schema version, tracked in `schema_version`. Mirrors the SQLite backend's
 /// numbering so the two cannot drift apart unnoticed.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 pub const SCHEMA: &str = r#"
 -- Content-addressed blocks. Hot blocks live here; cold ones spill to R2.
@@ -147,8 +147,36 @@ CREATE TABLE IF NOT EXISTS oauth_dpop_jti (
     expires_at INTEGER NOT NULL
 );
 
+-- --- Sign in with Stelyph: device-approval sign-in ------------------------
+
+-- A device enrolled to approve sign-ins for this account. The private half of
+-- did_key never leaves the device; only the public did:key is stored.
+CREATE TABLE IF NOT EXISTS device_keys (
+    device_id  TEXT PRIMARY KEY NOT NULL,
+    did_key    TEXT NOT NULL,
+    label      TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+-- A pending passwordless sign-in awaiting device approval. Short-lived and
+-- single-use: consumed on approval/denial, ignored past expires_at. The issued
+-- session tokens are parked here for the client's next poll and cleared once
+-- read is not required — they are already bearer secrets in flight either way.
+CREATE TABLE IF NOT EXISTS signin_requests (
+    request_id  TEXT PRIMARY KEY NOT NULL,
+    user_code   TEXT NOT NULL,
+    client_name TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL,           -- pending | approved | denied
+    did         TEXT,
+    handle      TEXT,
+    access_jwt  TEXT,
+    refresh_jwt TEXT,
+    created_at  TEXT NOT NULL,
+    expires_at  INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY NOT NULL
 );
-INSERT OR REPLACE INTO schema_version (version) VALUES (5);
+INSERT OR REPLACE INTO schema_version (version) VALUES (6);
 "#;
