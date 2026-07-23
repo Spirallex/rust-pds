@@ -74,12 +74,27 @@ bucket_name = "stelyph-pds-blobs"
 # end in. The issuer and did:web are a separate matter: those come per-request
 # from the Host header, so this value does not determine which PDS is served.
 #
-# Second-level on purpose. Handles are `<label>.pds.spirallex.net`, which needs
-# an ACM advanced certificate carrying a `*.pds.spirallex.net` SAN — Universal
-# SSL stops at one label. The certificate is declared in the Pulumi estate
-# (IdeaProjects/cloudflare, src/accounts/primary/stelyph-pds.ts); if it is ever
-# removed, every account here fails at the TLS handshake.
-PDS_ZONE_SUFFIX = "pds.spirallex.net"
+# Second-level on purpose, and on .com rather than .net. Universal SSL stops at
+# one label, so `<label>.pds.<zone>` needs ACM either way — and spirallex.com
+# already has ACM with Total TLS enabled, while spirallex.net would have to buy
+# it. Total TLS issues the `*.pds.spirallex.com` certificate automatically from
+# the proxied wildcard DNS record; nothing orders it explicitly. If Total TLS is
+# ever turned off on that zone, every account here fails at the handshake.
+#
+# The DNS record and Worker route are declared in the Pulumi estate
+# (IdeaProjects/cloudflare, src/accounts/primary/stelyph-pds.ts).
+PDS_ZONE_SUFFIX = "pds.spirallex.com"
+
+# Where the registration page and createAccount are served.
+#
+# NOT the bare zone suffix. `pds.spirallex.com` already runs Statusphere on a
+# `pds.spirallex.com/` route, and taking it would displace a live app. This host
+# sits under `*.pds.spirallex.com`, so it is covered by the same wildcard
+# certificate and the same Worker route and needs no infrastructure of its own.
+#
+# It can never collide with an account: `signup` is in the reserved-label list in
+# register.rs, so nobody can claim it as a handle.
+PDS_SIGNUP_HOST = "signup.pds.spirallex.com"
 
 # Secrets (set with `wrangler secret put`, never in this file):
 #   PDS_JWT_SECRET       HMAC secret for legacy session JWTs; also the seed for

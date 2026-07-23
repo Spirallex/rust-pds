@@ -92,8 +92,16 @@ pub fn validate_label(label: &str) -> Result<(), &'static str> {
     }
     // Reserved because these are real hostnames on the zone: handing them out
     // would let an account answer for infrastructure.
+    //
+    // `signup` is the load-bearing one. Handles are `<label>.pds.<zone>` and the
+    // registration surface is served at `signup.pds.<zone>`, so claiming this
+    // label would put an account's Durable Object on the exact hostname the
+    // signup flow runs on — and the front Worker checks the signup host first,
+    // meaning the account would be unreachable while the registration page
+    // answered in its place.
     const RESERVED: &[&str] = &[
-        "www", "api", "admin", "pds", "registry", "plc", "oauth", "xrpc", "mail", "ns1", "ns2",
+        "www", "api", "admin", "pds", "signup", "registry", "plc", "oauth", "xrpc", "mail", "ns1",
+        "ns2",
     ];
     if RESERVED.contains(&label) {
         return Err("That name is reserved.");

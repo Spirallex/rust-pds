@@ -65,7 +65,7 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpResponse
     // Served only from the signup host. On an account host these paths fall
     // through to the DO, which 404s them — `alice.pds.example.net/` is Alice's
     // PDS, not a second front door onto the registry.
-    if is_signup_host(&host, &zone_suffix) {
+    if is_signup_host(&host, &zone_suffix, signup_host(&env).as_deref()) {
         let route = path.split('?').next().unwrap_or("/");
         match (&method, route) {
             (&http::Method::GET, "/") => {
@@ -145,14 +145,24 @@ fn zone_suffix(env: &Env) -> String {
         .unwrap_or_else(|_| "invalid".to_string())
 }
 
+/// Where the registration page and `createAccount` are served, from
+/// `PDS_SIGNUP_HOST`.
+///
+/// Falls back to the zone suffix, which is the natural choice when nothing else
+/// occupies it. On spirallex.com something does — `pds.spirallex.com` runs
+/// another app — so the deployed value is a label underneath instead.
+fn signup_host(env: &Env) -> Option<String> {
+    env.var("PDS_SIGNUP_HOST").ok().map(|v| v.to_string())
+}
+
 /// Whether this host serves the registration surface.
 ///
-/// The zone suffix itself is the signup host — handles are labels *under* it, so
-/// the bare suffix can never be an account. `*.workers.dev` is included because
-/// it is the only hostname that works before the wildcard certificate exists,
-/// which makes it the one place the flow can be smoke-tested.
-fn is_signup_host(host: &str, zone_suffix: &str) -> bool {
-    host == zone_suffix || host.ends_with(".workers.dev")
+/// `*.workers.dev` is always included: it is the only hostname that works before
+/// the wildcard DNS record and its certificate exist, which makes it the one
+/// place the flow can be smoke-tested.
+fn is_signup_host(host: &str, zone_suffix: &str, configured: Option<&str>) -> bool {
+    let expected = configured.unwrap_or(zone_suffix);
+    host == expected || host.ends_with(".workers.dev")
 }
 
 /// Drain a request body into a string.
