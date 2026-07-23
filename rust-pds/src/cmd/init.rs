@@ -29,6 +29,7 @@ use crate::detect::{self, ExternalIpClient, Recommendation};
 use crate::dns::{self, DnsCheck, DnsResolver};
 use crate::firehose::RelayClient;
 use crate::identity::web::did_web;
+use crate::storage::AccountStore;
 use crate::xrpc::{create_account_inner, AppState, CreateAccountInput};
 
 // ---------------------------------------------------------------------------
@@ -206,7 +207,7 @@ async fn add_user(
     store: crate::storage::SqliteStore,
 ) -> anyhow::Result<()> {
     use crate::identity::plc::ReqwestPlcClient;
-    use crate::storage::keys::load_key;
+    use crate::storage::crypto::load_key;
     use std::io::IsTerminal;
 
     // Password: --password/PDS_ADMIN_PASSWORD wins, else prompt (TTY-guarded, as B5).

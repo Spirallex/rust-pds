@@ -207,8 +207,8 @@ mod tests {
     use super::*;
     use crate::firehose::encode_error_frame;
     use crate::repo::RepoWriter;
-    use crate::storage::keys::store_key;
-    use crate::storage::SqliteStore;
+    use crate::storage::crypto::store_key;
+    use crate::storage::MemoryStore;
     use atrium_api::types::string::Did as AtDid;
     use atrium_crypto::keypair::{Did as KeypairDid, Secp256k1Keypair};
     use std::str::FromStr;
@@ -233,16 +233,16 @@ mod tests {
     /// Produce a real signed commit frame and the signer's did:key.
     /// Returns (frame_bytes, did_key_string, fresh_keypair_for_wrong_key_test).
     async fn make_signed_commit_frame() -> (Vec<u8>, String, Secp256k1Keypair) {
-        let (store, _tmp) = SqliteStore::open_in_memory().await.expect("open");
+        let store: Arc<dyn crate::storage::StorageBackend> = Arc::new(MemoryStore::new());
         let passphrase = b"test-tail-passphrase";
-        store_key(&store, "signing", &SIGNING_SCALAR, passphrase)
+        store_key(store.as_ref(), "signing", &SIGNING_SCALAR, passphrase)
             .await
             .expect("store_key");
         let key = Secp256k1Keypair::import(&SIGNING_SCALAR).expect("import");
         let did_key = key.did(); // "did:key:zQ3sh..." — the verification key
         let did = AtDid::from_str("did:web:example.com").unwrap();
         let (tx, mut rx) = tokio::sync::broadcast::channel(16);
-        let writer = RepoWriter::new(Arc::new(store), key, did, tx);
+        let writer = RepoWriter::new(store, key, did, tx);
         writer
             .create_record("app.bsky.feed.post/3kaaaa", post("hi"))
             .await

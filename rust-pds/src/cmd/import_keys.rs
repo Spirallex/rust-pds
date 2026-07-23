@@ -1,6 +1,6 @@
 //! `stelyph import-keys` — import keys from a portable blob.
 //!
-//! Wraps `crate::storage::keys::import_keys` with a CLI-friendly interface:
+//! Wraps `crate::storage::crypto::import_keys` with a CLI-friendly interface:
 //! - `--did`:    the DID to import keys under (required; overrides embedded id in blob)
 //! - `--input`:  path to the signing-key blob produced by `export-keys` (required)
 //! - `--db-path`: path to the PDS SQLite database (default: `pds.db` / `PDS_DB_PATH`)
@@ -46,7 +46,7 @@ pub async fn run(args: ImportKeysArgs) -> anyhow::Result<()> {
         )
     })?;
 
-    crate::storage::keys::import_keys(
+    crate::storage::crypto::import_keys(
         &store,
         &format!("{}#signing", args.did),
         &signing_blob,
@@ -69,7 +69,7 @@ pub async fn run(args: ImportKeysArgs) -> anyhow::Result<()> {
             )
         })?;
 
-        crate::storage::keys::import_keys(
+        crate::storage::crypto::import_keys(
             &store,
             &format!("{}#rotation", args.did),
             &rotation_blob,
@@ -92,7 +92,7 @@ pub async fn run(args: ImportKeysArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::{keys, SqliteStore};
+    use crate::storage::{crypto as keys, SqliteStore};
 
     /// Round-trip through export → import, then load to verify bytes match.
     /// Drives the storage layer directly (no TTY prompt needed in tests).

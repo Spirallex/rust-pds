@@ -35,7 +35,7 @@ use axum::{
 use serde::Serialize;
 
 use crate::identity::web::{did_web, did_web_document};
-use crate::storage::keys::load_key;
+use crate::storage::crypto::load_key;
 use crate::xrpc::{AppState, XrpcError};
 
 // ---------------------------------------------------------------------------
@@ -120,7 +120,7 @@ pub async fn well_known_did_json(
     let key_id = format!("{did}#signing");
 
     // Load and decrypt the signing key for the did:web identity.
-    let key_bytes = load_key(&state.store, &key_id, &state.key_passphrase)
+    let key_bytes = load_key(state.store.as_ref(), &key_id, &state.key_passphrase)
         .await
         .map_err(|_| XrpcError::HandleNotFound)?;
 
@@ -164,7 +164,7 @@ mod tests {
 
     use crate::auth::jwt::hash_password;
     use crate::identity::plc::MockPlcClient;
-    use crate::storage::keys::store_key;
+    use crate::storage::crypto::store_key;
     use crate::storage::SqliteStore;
     use crate::xrpc::{app, AppState};
 
@@ -338,7 +338,7 @@ mod tests {
 
         // Store the signing key under "did:web:pds.test#signing".
         store_key(
-            &state.store,
+            state.store.as_ref(),
             "did:web:pds.test#signing",
             &key_bytes,
             &state.key_passphrase,

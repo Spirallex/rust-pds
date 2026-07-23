@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use stelyph_core::server::{bind, serve, ServerConfig};
-use stelyph_core::storage::SqliteStore;
+use stelyph_core::storage::{SqliteStore, StorageBackend};
 
 // `task_vm_info`, laid out (per <mach/task_info.h>) through `phys_footprint` —
 // the exact field iOS Jetsam meters. The count we pass covers just these bytes;
@@ -116,7 +116,10 @@ async fn main() {
         .into_owned();
     let _ = std::fs::remove_file(&path);
 
-    let store = Arc::new(SqliteStore::open(&path).await.expect("open store"));
+    // Deliberately SqliteStore, not MemoryStore: this example measures the
+    // real device footprint, which includes the bundled SQLite and its pools.
+    let store: Arc<dyn StorageBackend> =
+        Arc::new(SqliteStore::open(&path).await.expect("open store"));
     // Seed one account so resolveHandle returns a real row.
     store
         .insert_account("did:plc:footprint00000000", "alice.pds.test", None, "x")

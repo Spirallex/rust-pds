@@ -9,7 +9,7 @@
 //! extra runtime threads beyond what the caller's tokio provides. It binds
 //! `127.0.0.1` (or whatever the caller passes) and serves the XRPC session,
 //! preferences, and repo surface (records, blobs, CAR export — see
-//! `server/repo.rs`) straight off [`SqliteStore`], sharing validation and the
+//! `server/repo.rs`) straight off the storage traits, sharing validation and the
 //! signed write path with the production server. TLS termination and inbound
 //! routing are an edge concern (reverse tunnel / VPS), not this process's.
 //!
@@ -45,7 +45,7 @@ use tokio::net::TcpListener;
 
 use crate::auth::jwt::{decode_jwt, encode_access_jwt, encode_refresh_jwt, verify_password};
 use crate::error::CoreError;
-use crate::storage::SqliteStore;
+use crate::storage::StorageBackend;
 
 /// Cap on a request body we'll buffer. Session inputs are tiny JSON objects;
 /// this just bounds a hostile client, not real traffic.
@@ -90,7 +90,7 @@ type SigningKeyCache = Arc<StdMutex<HashMap<String, Arc<zeroize::Zeroizing<Vec<u
 
 #[derive(Clone)]
 struct AppState {
-    store: Arc<SqliteStore>,
+    store: Arc<dyn StorageBackend>,
     config: Arc<ServerConfig>,
     /// Commit-frame broadcast, threaded into every RepoWriter. No subscribers
     /// exist yet in the embedded host (subscribeRepos is future work) — the
@@ -493,7 +493,7 @@ fn session_response(state: &AppState, did: &str, handle: &str) -> Response<Full<
 /// None when there are zero or several — the fallback only makes sense when
 /// the device hosts exactly one identity.
 async fn sole_active_account_did(
-    store: &SqliteStore,
+    store: &dyn StorageBackend,
 ) -> Result<Option<String>, crate::storage::StorageError> {
     let mut active = store
         .list_accounts()
@@ -553,7 +553,7 @@ async fn route(state: AppState, req: Request<Incoming>) -> Response<Full<Bytes>>
         (&Method::GET, "/.well-known/atproto-did") => {
             match state.store.get_did_by_handle(&state.config.hostname).await {
                 Ok(Some(did)) => text_response(StatusCode::OK, did),
-                Ok(None) => match sole_active_account_did(&state.store).await {
+                Ok(None) => match sole_active_account_did(state.store.as_ref()).await {
                     Ok(Some(did)) => text_response(StatusCode::OK, did),
                     Ok(None) => {
                         text_response(StatusCode::NOT_FOUND, "no account for this host".into())
@@ -693,7 +693,7 @@ pub async fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
 /// up here, keeping the footprint the caller's to control.
 pub async fn serve(
     listener: TcpListener,
-    store: Arc<SqliteStore>,
+    store: Arc<dyn StorageBackend>,
     config: ServerConfig,
     proxy: Option<Arc<dyn OutboundProxy>>,
 ) -> std::io::Result<()> {
@@ -755,17 +755,17 @@ mod tests {
         assert_eq!(query_param("foo=bar", "handle"), None);
     }
 
-    async fn boot() -> (SocketAddr, Arc<SqliteStore>) {
+    async fn boot() -> (SocketAddr, Arc<dyn StorageBackend>) {
         boot_with_proxy(None).await
     }
 
     async fn boot_with_proxy(
         proxy: Option<Arc<dyn OutboundProxy>>,
-    ) -> (SocketAddr, Arc<SqliteStore>) {
-        let (store, tmp) = SqliteStore::open_in_memory().await.unwrap();
-        // Leak the temp file so the on-disk DB outlives the test server.
-        std::mem::forget(tmp);
-        let store = Arc::new(store);
+    ) -> (SocketAddr, Arc<dyn StorageBackend>) {
+        // MemoryStore rather than SQLite: these tests exercise HTTP routing and
+        // handler behaviour, not persistence, and it avoids leaking a temp file
+        // per test to keep the DB alive for the spawned server.
+        let store: Arc<dyn StorageBackend> = Arc::new(crate::storage::MemoryStore::new());
         let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let srv_store = store.clone();
@@ -856,7 +856,7 @@ mod tests {
     }
 
     /// Insert an account with a real argon2 password hash, for login tests.
-    async fn seed_account(store: &SqliteStore, did: &str, handle: &str, password: &str) {
+    async fn seed_account(store: &dyn StorageBackend, did: &str, handle: &str, password: &str) {
         let phc = crate::auth::jwt::hash_password(password).unwrap();
         store.insert_account(did, handle, None, &phc).await.unwrap();
     }
@@ -963,7 +963,13 @@ mod tests {
     #[tokio::test]
     async fn create_session_valid_login_returns_tokens() {
         let (addr, store) = boot().await;
-        seed_account(&store, "did:plc:alice", "alice.pds.test", "hunter2hunter2").await;
+        seed_account(
+            store.as_ref(),
+            "did:plc:alice",
+            "alice.pds.test",
+            "hunter2hunter2",
+        )
+        .await;
 
         let (status, json) = send(
             addr,
@@ -983,7 +989,13 @@ mod tests {
     #[tokio::test]
     async fn create_session_wrong_password_is_rejected() {
         let (addr, store) = boot().await;
-        seed_account(&store, "did:plc:alice", "alice.pds.test", "hunter2hunter2").await;
+        seed_account(
+            store.as_ref(),
+            "did:plc:alice",
+            "alice.pds.test",
+            "hunter2hunter2",
+        )
+        .await;
 
         let (status, json) = send(
             addr,
@@ -1016,7 +1028,13 @@ mod tests {
     #[tokio::test]
     async fn get_session_validates_access_token() {
         let (addr, store) = boot().await;
-        seed_account(&store, "did:plc:alice", "alice.pds.test", "hunter2hunter2").await;
+        seed_account(
+            store.as_ref(),
+            "did:plc:alice",
+            "alice.pds.test",
+            "hunter2hunter2",
+        )
+        .await;
         let (_s, login) = send(
             addr,
             "POST",
@@ -1058,7 +1076,13 @@ mod tests {
     #[tokio::test]
     async fn refresh_session_rejects_access_scope_and_reissues() {
         let (addr, store) = boot().await;
-        seed_account(&store, "did:plc:alice", "alice.pds.test", "hunter2hunter2").await;
+        seed_account(
+            store.as_ref(),
+            "did:plc:alice",
+            "alice.pds.test",
+            "hunter2hunter2",
+        )
+        .await;
         let (_s, login) = send(
             addr,
             "POST",
@@ -1121,7 +1145,13 @@ mod tests {
     #[tokio::test]
     async fn preferences_round_trip() {
         let (addr, store) = boot().await;
-        seed_account(&store, "did:plc:alice", "alice.pds.test", "hunter2hunter2").await;
+        seed_account(
+            store.as_ref(),
+            "did:plc:alice",
+            "alice.pds.test",
+            "hunter2hunter2",
+        )
+        .await;
         let (_s, login) = send(
             addr,
             "POST",
@@ -1186,11 +1216,11 @@ mod tests {
 
     /// Seed an account WITH an encrypted signing key (the write path needs it),
     /// log in, and return the access token.
-    async fn seed_and_login(addr: SocketAddr, store: &SqliteStore, did: &str) -> String {
+    async fn seed_and_login(addr: SocketAddr, store: &dyn StorageBackend, did: &str) -> String {
         seed_account(store, did, "alice.pds.test", "hunter2hunter2").await;
         use atrium_crypto::keypair::Export;
         let signing = atrium_crypto::keypair::Secp256k1Keypair::create(&mut rand::rngs::OsRng);
-        crate::storage::keys::store_key(
+        crate::storage::crypto::store_key(
             store,
             &format!("{did}#signing"),
             &signing.export(),
@@ -1215,7 +1245,7 @@ mod tests {
     async fn record_write_read_delete_round_trip() {
         let (addr, store) = boot().await;
         let did = "did:plc:embeddedwrite";
-        let access = seed_and_login(addr, &store, did).await;
+        let access = seed_and_login(addr, store.as_ref(), did).await;
 
         // Unauthenticated write is rejected.
         let (status, _) = send(
@@ -1324,7 +1354,7 @@ mod tests {
     async fn put_record_and_apply_writes() {
         let (addr, store) = boot().await;
         let did = "did:plc:embeddedput";
-        let access = seed_and_login(addr, &store, did).await;
+        let access = seed_and_login(addr, store.as_ref(), did).await;
 
         // put twice at the same rkey — create then update.
         for text in ["v1", "v2"] {
@@ -1373,7 +1403,7 @@ mod tests {
     async fn blobs_and_car_export() {
         let (addr, store) = boot().await;
         let did = "did:plc:embeddedblob";
-        let access = seed_and_login(addr, &store, did).await;
+        let access = seed_and_login(addr, store.as_ref(), did).await;
 
         // Upload raw bytes (send() only does JSON, so hand-roll the request).
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1470,7 +1500,7 @@ mod tests {
     async fn appview_fallback_without_proxy_is_not_implemented() {
         let (addr, store) = boot().await;
         let did = "did:plc:noproxy";
-        let access = seed_and_login(addr, &store, did).await;
+        let access = seed_and_login(addr, store.as_ref(), did).await;
         let (status, json) = send(
             addr,
             "GET",
@@ -1495,7 +1525,7 @@ mod tests {
         )));
         let (addr, store) = boot_with_proxy(Some(mock.clone())).await;
         let did = "did:plc:proxied";
-        let access = seed_and_login(addr, &store, did).await;
+        let access = seed_and_login(addr, store.as_ref(), did).await;
 
         // Unauthenticated → 401, proxy untouched.
         let (status, _) = get(addr, "/xrpc/app.bsky.feed.getTimeline?limit=5").await;
@@ -1540,7 +1570,7 @@ mod tests {
     async fn get_service_auth_mints_token() {
         let (addr, store) = boot().await;
         let did = "did:plc:svcauth";
-        let access = seed_and_login(addr, &store, did).await;
+        let access = seed_and_login(addr, store.as_ref(), did).await;
 
         let (status, json) = send(
             addr,
@@ -1644,7 +1674,7 @@ mod tests {
     async fn firehose_streams_live_commits() {
         let (addr, store) = boot().await;
         let did = "did:plc:firehoselive";
-        let access = seed_and_login(addr, &store, did).await;
+        let access = seed_and_login(addr, store.as_ref(), did).await;
 
         let mut ws = ws_connect(addr, "/xrpc/com.atproto.sync.subscribeRepos").await;
 
@@ -1688,7 +1718,7 @@ mod tests {
     async fn firehose_backfills_from_cursor() {
         let (addr, store) = boot().await;
         let did = "did:plc:firehoseback";
-        let access = seed_and_login(addr, &store, did).await;
+        let access = seed_and_login(addr, store.as_ref(), did).await;
 
         for text in ["one", "two"] {
             let body = format!(
@@ -1774,7 +1804,7 @@ mod tests {
         )));
         let (addr, store) = boot_with_proxy(Some(mock.clone())).await;
         let did = "did:plc:chatuser";
-        let access = seed_and_login(addr, &store, did).await;
+        let access = seed_and_login(addr, store.as_ref(), did).await;
 
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let payload = br#"{"convoId":"c1"}"#;
@@ -1823,7 +1853,7 @@ mod tests {
         let mock = Arc::new(mock);
         let (addr, store) = boot_with_proxy(Some(mock.clone())).await;
         let did = "did:plc:feeduser";
-        let access = seed_and_login(addr, &store, did).await;
+        let access = seed_and_login(addr, store.as_ref(), did).await;
 
         // send() has no custom-header support; hand-roll the two calls.
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

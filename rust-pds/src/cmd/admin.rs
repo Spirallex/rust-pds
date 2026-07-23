@@ -14,6 +14,7 @@
 //!   - `reset-password`  set a new password for an account (handle or DID)
 
 use crate::auth::jwt::hash_password;
+use crate::storage::AccountStore;
 use crate::storage::SqliteStore;
 
 #[derive(clap::Args, Debug)]

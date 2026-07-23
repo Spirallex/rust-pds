@@ -16,7 +16,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::identity::plc::PlcClient;
 use crate::identity::web_resolver::DidWebResolver;
-use crate::storage::SqliteStore;
+use crate::storage::StorageBackend;
 use crate::xrpc::appview::client::AppViewClient;
 
 /// Shared application state injected into every XRPC handler.
@@ -24,8 +24,9 @@ use crate::xrpc::appview::client::AppViewClient;
 /// `Clone` is cheap — every field is already behind `Arc` or is `Copy`/`String`.
 #[derive(Clone)]
 pub struct AppState {
-    /// The underlying SQLite store (accounts, keys, blocks, invites, …).
-    pub store: Arc<SqliteStore>,
+    /// The storage backend (accounts, keys, blocks, invites, …). Held as a trait
+    /// object so the server is not bound to SQLite — see `stelyph_core::storage`.
+    pub store: Arc<dyn StorageBackend>,
     /// HMAC secret for JWT signing/verification (HS256).
     pub jwt_secret: Arc<Vec<u8>>,
     /// Server hostname, e.g. `"pds.example.com"`.

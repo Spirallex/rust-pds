@@ -39,7 +39,8 @@ use sha2::{Digest, Sha256};
 use crate::auth::extractor::AccessAuth;
 use crate::identity::web::{DidDocument, ServiceEntry, VerificationMethod};
 use crate::repo::writer::{RepoWriter, WriteOp};
-use crate::storage::keys::load_key;
+use crate::storage::crypto::load_key;
+use crate::storage::BlockStoreAdapter;
 use crate::xrpc::{AppState, XrpcError};
 
 // ---------------------------------------------------------------------------
@@ -359,7 +360,7 @@ pub(crate) async fn load_signing_key_cached(
             XrpcError::Internal(anyhow::anyhow!("failed to import signing key: {e}"))
         });
     }
-    let key_bytes = load_key(&state.store, &key_id, &state.key_passphrase)
+    let key_bytes = load_key(state.store.as_ref(), &key_id, &state.key_passphrase)
         .await
         .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to load signing key: {e}")))?;
     state
@@ -403,8 +404,7 @@ async fn lookup_record_cid(
         Some(c) => c,
         None => return Ok(None),
     };
-    let cloned_store = (*state.store).clone();
-    let mut diff = DiffBlockStore::wrap(cloned_store);
+    let mut diff = DiffBlockStore::wrap(BlockStoreAdapter::new(state.store.clone()));
     let mut repo = Repository::open(&mut diff, root_cid)
         .await
         .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to open repo: {e}")))?;
@@ -660,8 +660,7 @@ async fn list_collections(state: &AppState, did: &str) -> Result<Vec<String>, Xr
         Some(c) => c,
         None => return Ok(vec![]),
     };
-    let cloned_store = (*state.store).clone();
-    let mut diff = DiffBlockStore::wrap(cloned_store);
+    let mut diff = DiffBlockStore::wrap(BlockStoreAdapter::new(state.store.clone()));
     let mut repo = Repository::open(&mut diff, root_cid)
         .await
         .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to open repo: {e}")))?;
@@ -859,8 +858,7 @@ pub async fn get_repo(
         .ok_or_else(|| XrpcError::InvalidRequest(format!("repo not found for did: {did}")))?;
 
     // Open the repo via DiffBlockStore (read-only; no new writes occur).
-    let cloned_store = (*state.store).clone();
-    let mut diff = DiffBlockStore::wrap(cloned_store);
+    let mut diff = DiffBlockStore::wrap(BlockStoreAdapter::new(state.store.clone()));
     let mut repo = Repository::open(&mut diff, root_cid)
         .await
         .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to open repo: {e}")))?;
@@ -952,8 +950,7 @@ pub async fn list_records(
         .ok_or_else(|| XrpcError::InvalidRequest(format!("repo not found for did: {did}")))?;
 
     // Open the repo.
-    let cloned_store = (*state.store).clone();
-    let mut diff = DiffBlockStore::wrap(cloned_store);
+    let mut diff = DiffBlockStore::wrap(BlockStoreAdapter::new(state.store.clone()));
     let mut repo = Repository::open(&mut diff, root_cid)
         .await
         .map_err(|e| XrpcError::Internal(anyhow::anyhow!("failed to open repo: {e}")))?;
@@ -1064,7 +1061,8 @@ mod tests {
     use crate::auth::extractor::AccessAuth;
     use crate::auth::jwt::{encode_access_jwt, encode_refresh_jwt, hash_password};
     use crate::identity::plc::MockPlcClient;
-    use crate::storage::keys::store_key;
+    use crate::storage::crypto::store_key;
+    use crate::storage::BlockStoreAdapter;
     use crate::storage::SqliteStore;
     use crate::xrpc::{app, AppState};
 
@@ -1119,7 +1117,7 @@ mod tests {
         let signing = Secp256k1Keypair::create(&mut OsRng);
         let key_bytes = signing.export();
         store_key(
-            &state.store,
+            state.store.as_ref(),
             &format!("{did}#signing"),
             &key_bytes,
             &state.key_passphrase,
@@ -1972,7 +1970,13 @@ mod tests {
         );
 
         // Exactly two repo_seq rows — no lost update.
-        let seq_count = state.store.repo_seq_count().await.expect("seq count");
+        // Backend-neutral row count: backfill_page over the whole log.
+        let seq_count = state
+            .store
+            .backfill_page(0, i64::MAX)
+            .await
+            .expect("backfill_page")
+            .len() as i64;
         assert_eq!(
             seq_count, 2,
             "expected exactly 2 repo_seq rows, got {seq_count}"
@@ -1986,8 +1990,7 @@ mod tests {
             .await
             .expect("load_repo_root")
             .expect("must have a root after two writes");
-        let cloned_store = (*state.store).clone();
-        let mut diff = DiffBlockStore::wrap(cloned_store);
+        let mut diff = DiffBlockStore::wrap(BlockStoreAdapter::new(state.store.clone()));
         let mut repo = Repository::open(&mut diff, root_cid)
             .await
             .expect("open repo");
