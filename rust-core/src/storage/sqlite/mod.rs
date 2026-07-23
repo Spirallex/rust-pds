@@ -11,6 +11,7 @@ pub mod account;
 pub mod backup;
 pub mod blob;
 pub mod keys;
+pub mod oauth;
 pub mod repo;
 pub mod schema;
 

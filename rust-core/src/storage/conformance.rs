@@ -36,6 +36,9 @@ macro_rules! storage_conformance_tests {
             #![allow(unused_imports)]
             use super::*;
             use atrium_repo::blockstore::DAG_CBOR;
+            use $crate::oauth::store::{
+                AuthCode, ConsumeResult, OAuthStore, RefreshTokenRecord, StoredPushedRequest,
+            };
             use $crate::storage::{
                 cid_of, crypto, AccountStore, BlobStore, BlockStore, KeyStore, RepoStore,
                 Sequencer, StorageError,
@@ -555,6 +558,319 @@ macro_rules! storage_conformance_tests {
                     s.get_blob("did:plc:b", "cid1").await.unwrap(),
                     Some(("image/jpeg".to_string(), vec![9, 9]))
                 );
+            }
+
+            // --- OAuth: pushed authorization requests ---------------------
+
+            fn par(hash: &str, expires_at: u64) -> StoredPushedRequest {
+                StoredPushedRequest {
+                    request_uri_hash: hash.into(),
+                    client_id: "https://app.test/client-metadata.json".into(),
+                    redirect_uri: "https://app.test/cb".into(),
+                    scope: "atproto".into(),
+                    state: "st".into(),
+                    code_challenge: "chal".into(),
+                    dpop_jkt: Some("jkt".into()),
+                    login_hint: None,
+                    expires_at,
+                }
+            }
+
+            #[tokio::test]
+            async fn pushed_request_round_trip_and_expiry() {
+                let (s, _g) = $setup().await;
+                assert_eq!(s.get_pushed_request("nope", 100).await.unwrap(), None);
+
+                s.put_pushed_request(par("h1", 1000)).await.unwrap();
+                assert_eq!(
+                    s.get_pushed_request("h1", 100).await.unwrap(),
+                    Some(par("h1", 1000))
+                );
+
+                // Reads are repeatable — the login page may be loaded more than
+                // once before a decision is made.
+                assert!(s.get_pushed_request("h1", 100).await.unwrap().is_some());
+
+                // Expired requests are invisible.
+                assert_eq!(
+                    s.get_pushed_request("h1", 1001).await.unwrap(),
+                    None,
+                    "an expired pushed request must not be returned"
+                );
+
+                s.delete_pushed_request("h1").await.unwrap();
+                assert_eq!(s.get_pushed_request("h1", 100).await.unwrap(), None);
+            }
+
+            // --- OAuth: authorization codes -------------------------------
+
+            fn code(hash: &str, expires_at: u64) -> AuthCode {
+                AuthCode {
+                    code_hash: hash.into(),
+                    did: "did:plc:user".into(),
+                    client_id: "https://app.test/client-metadata.json".into(),
+                    redirect_uri: "https://app.test/cb".into(),
+                    scope: "atproto".into(),
+                    code_challenge: "chal".into(),
+                    dpop_jkt: Some("jkt".into()),
+                    expires_at,
+                }
+            }
+
+            #[tokio::test]
+            async fn auth_code_is_single_use() {
+                let (s, _g) = $setup().await;
+                s.put_auth_code(code("c1", 1000)).await.unwrap();
+
+                assert_eq!(
+                    s.consume_auth_code("c1", 100).await.unwrap(),
+                    Some(code("c1", 1000))
+                );
+                assert_eq!(
+                    s.consume_auth_code("c1", 100).await.unwrap(),
+                    None,
+                    "an authorization code must never be redeemable twice"
+                );
+            }
+
+            #[tokio::test]
+            async fn expired_and_unknown_auth_codes_are_not_redeemable() {
+                let (s, _g) = $setup().await;
+                assert_eq!(
+                    s.consume_auth_code("never-issued", 100).await.unwrap(),
+                    None
+                );
+
+                s.put_auth_code(code("c2", 500)).await.unwrap();
+                assert_eq!(
+                    s.consume_auth_code("c2", 501).await.unwrap(),
+                    None,
+                    "an expired code must not be redeemable"
+                );
+            }
+
+            /// Concurrent redemptions of one code: exactly one may succeed.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn concurrent_auth_code_redemption_yields_one_winner() {
+                let (s, _g) = $setup().await;
+                s.put_auth_code(code("race", 1_000_000)).await.unwrap();
+
+                let mut tasks = Vec::new();
+                for _ in 0..8 {
+                    let s = s.clone();
+                    tasks.push(tokio::spawn(async move {
+                        s.consume_auth_code("race", 100).await.unwrap().is_some()
+                    }));
+                }
+                let mut wins = 0;
+                for t in tasks {
+                    if t.await.unwrap() {
+                        wins += 1;
+                    }
+                }
+                assert_eq!(wins, 1, "exactly one concurrent redemption may succeed");
+            }
+
+            // --- OAuth: refresh tokens ------------------------------------
+
+            fn refresh(hash: &str, session: &str, expires_at: u64) -> RefreshTokenRecord {
+                RefreshTokenRecord {
+                    token_hash: hash.into(),
+                    session_id: session.into(),
+                    did: "did:plc:user".into(),
+                    client_id: "https://app.test/client-metadata.json".into(),
+                    scope: "atproto".into(),
+                    dpop_jkt: "jkt".into(),
+                    issued_at: 100,
+                    expires_at,
+                }
+            }
+
+            #[tokio::test]
+            async fn refresh_token_rotation_detects_reuse() {
+                let (s, _g) = $setup().await;
+                s.put_refresh_token(refresh("r1", "sess-1", 1000))
+                    .await
+                    .unwrap();
+
+                match s.consume_refresh_token("r1", 200).await.unwrap() {
+                    ConsumeResult::Consumed(rec) => assert_eq!(rec.session_id, "sess-1"),
+                    other => panic!("first use must consume, got {other:?}"),
+                }
+
+                // Presenting it again must report reuse, not absence — the
+                // caller needs the session_id to revoke the whole chain.
+                match s.consume_refresh_token("r1", 200).await.unwrap() {
+                    ConsumeResult::Reused { session_id } => assert_eq!(session_id, "sess-1"),
+                    other => panic!("a spent token must report Reused, got {other:?}"),
+                }
+            }
+
+            #[tokio::test]
+            async fn unknown_and_expired_refresh_tokens_are_not_found() {
+                let (s, _g) = $setup().await;
+                assert_eq!(
+                    s.consume_refresh_token("nope", 200).await.unwrap(),
+                    ConsumeResult::NotFound
+                );
+
+                s.put_refresh_token(refresh("r-exp", "s", 500))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    s.consume_refresh_token("r-exp", 501).await.unwrap(),
+                    ConsumeResult::NotFound,
+                    "an expired token is NotFound, not Reused"
+                );
+            }
+
+            #[tokio::test]
+            async fn revoking_a_session_kills_every_token_in_the_chain() {
+                let (s, _g) = $setup().await;
+                s.put_refresh_token(refresh("a1", "sess-a", 1000))
+                    .await
+                    .unwrap();
+                s.put_refresh_token(refresh("a2", "sess-a", 1000))
+                    .await
+                    .unwrap();
+                s.put_refresh_token(refresh("b1", "sess-b", 1000))
+                    .await
+                    .unwrap();
+
+                assert_eq!(s.revoke_session("sess-a").await.unwrap(), 2);
+                assert_eq!(
+                    s.consume_refresh_token("a2", 200).await.unwrap(),
+                    ConsumeResult::NotFound
+                );
+                // An unrelated chain survives.
+                assert!(matches!(
+                    s.consume_refresh_token("b1", 200).await.unwrap(),
+                    ConsumeResult::Consumed(_)
+                ));
+            }
+
+            #[tokio::test]
+            async fn revoking_one_token_revokes_its_chain() {
+                let (s, _g) = $setup().await;
+                s.put_refresh_token(refresh("c1", "sess-c", 1000))
+                    .await
+                    .unwrap();
+                s.put_refresh_token(refresh("c2", "sess-c", 1000))
+                    .await
+                    .unwrap();
+
+                assert!(s.revoke_refresh_token("c1").await.unwrap());
+                assert_eq!(
+                    s.consume_refresh_token("c2", 200).await.unwrap(),
+                    ConsumeResult::NotFound,
+                    "revoking one token must end the whole session"
+                );
+                assert!(
+                    !s.revoke_refresh_token("never-issued").await.unwrap(),
+                    "revoking an unknown token reports false, not an error"
+                );
+            }
+
+            #[tokio::test]
+            async fn list_sessions_shows_only_live_unused_tokens_for_the_did() {
+                let (s, _g) = $setup().await;
+                s.put_refresh_token(refresh("l1", "s1", 1000))
+                    .await
+                    .unwrap();
+                s.put_refresh_token(refresh("l2", "s2", 1000))
+                    .await
+                    .unwrap();
+
+                let mut other = refresh("l3", "s3", 1000);
+                other.did = "did:plc:someone-else".into();
+                s.put_refresh_token(other).await.unwrap();
+
+                let sessions = s.list_sessions_for_did("did:plc:user", 200).await.unwrap();
+                assert_eq!(sessions.len(), 2, "only this DID's sessions");
+
+                // A spent token drops out of the listing.
+                s.consume_refresh_token("l1", 200).await.unwrap();
+                assert_eq!(
+                    s.list_sessions_for_did("did:plc:user", 200)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                // As does an expired one.
+                assert_eq!(
+                    s.list_sessions_for_did("did:plc:user", 5000)
+                        .await
+                        .unwrap()
+                        .len(),
+                    0
+                );
+            }
+
+            // --- OAuth: DPoP replay cache ---------------------------------
+
+            #[tokio::test]
+            async fn dpop_jti_is_recorded_once() {
+                let (s, _g) = $setup().await;
+                assert!(s.record_dpop_jti("jti-1", 1000).await.unwrap());
+                assert!(
+                    !s.record_dpop_jti("jti-1", 1000).await.unwrap(),
+                    "a repeated jti must report replay"
+                );
+                assert!(s.record_dpop_jti("jti-2", 1000).await.unwrap());
+            }
+
+            /// The replay check must hold under real concurrency — a
+            /// check-then-insert split would let several callers all win.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn concurrent_dpop_jti_yields_one_winner() {
+                let (s, _g) = $setup().await;
+                let mut tasks = Vec::new();
+                for _ in 0..8 {
+                    let s = s.clone();
+                    tasks.push(tokio::spawn(async move {
+                        s.record_dpop_jti("contended", 1_000_000).await.unwrap()
+                    }));
+                }
+                let mut wins = 0;
+                for t in tasks {
+                    if t.await.unwrap() {
+                        wins += 1;
+                    }
+                }
+                assert_eq!(wins, 1, "exactly one caller may record a given jti");
+            }
+
+            // --- OAuth: maintenance ---------------------------------------
+
+            #[tokio::test]
+            async fn purge_removes_only_expired_records() {
+                let (s, _g) = $setup().await;
+                s.put_pushed_request(par("p-old", 100)).await.unwrap();
+                s.put_pushed_request(par("p-new", 9999)).await.unwrap();
+                s.put_auth_code(code("c-old", 100)).await.unwrap();
+                s.put_auth_code(code("c-new", 9999)).await.unwrap();
+                s.put_refresh_token(refresh("r-old", "s", 100))
+                    .await
+                    .unwrap();
+                s.put_refresh_token(refresh("r-new", "s", 9999))
+                    .await
+                    .unwrap();
+                s.record_dpop_jti("j-old", 100).await.unwrap();
+                s.record_dpop_jti("j-new", 9999).await.unwrap();
+
+                assert_eq!(s.purge_expired(500).await.unwrap(), 4, "four expired rows");
+
+                assert!(s.get_pushed_request("p-new", 500).await.unwrap().is_some());
+                assert!(s.consume_auth_code("c-new", 500).await.unwrap().is_some());
+                assert!(matches!(
+                    s.consume_refresh_token("r-new", 500).await.unwrap(),
+                    ConsumeResult::Consumed(_)
+                ));
+                // A purged jti is free to be used again — which is correct, since
+                // it can no longer be inside any proof's acceptance window.
+                assert!(s.record_dpop_jti("j-old", 9999).await.unwrap());
+                assert!(!s.record_dpop_jti("j-new", 9999).await.unwrap());
             }
         }
     };

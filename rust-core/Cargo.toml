@@ -36,6 +36,17 @@ deadpool-sqlite = { version = "0.12.1", features = ["rt_tokio_1"], optional = tr
 chrono = "0.4"
 
 # --- keystore + auth crypto (pure Rust RustCrypto) ---
+# p256 is already in the tree via atrium-crypto; named directly here because the
+# OAuth authorization server needs ES256 signing (token + JWKS) and raw
+# coordinate access for RFC 7638 JWK thumbprints, neither of which atrium-crypto
+# exposes. k256 likewise, for verifying ES256K DPoP proofs.
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+k256 = { version = "0.13", features = ["ecdsa"] }
+# OAuth `client_id`s are URLs with strict structural rules (no fragment, no
+# credentials, no non-default port, hostname must not be an IP). Hand-rolling
+# that parsing is exactly the sort of thing that yields a redirect-URI bypass,
+# so use the real parser. Already in the tree via reqwest.
+url = "2.5"
 argon2 = { version = "0.5.3", features = ["zeroize"] }
 aes-gcm = { version = "0.10.3", features = ["zeroize"] }
 zeroize = "1"
