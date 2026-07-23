@@ -7,7 +7,12 @@ account_id = "9a497744238ab16a1060dc3ae8abd102"
 # a different zone from spirallex.com, which carries a catch-all persona Worker
 # route (`*.spirallex.com/*`) that would otherwise shadow this one.
 routes = [
+  # Each PDS is a subdomain: joey.pds.spirallex.net, etc.
   { pattern = "*.pds.spirallex.net/*", zone_name = "spirallex.net" },
+  # The wildcard above does NOT match the bare apex — `*` cannot stand in for
+  # the empty string before a literal dot — so the apex needs its own route or
+  # visiting pds.spirallex.net returns nothing.
+  { pattern = "pds.spirallex.net/*", zone_name = "spirallex.net" },
 ]
 
 # Also publish on workers.dev. The custom route above only receives traffic once
