@@ -72,6 +72,7 @@ async fn spawn_server() -> (SocketAddr, AppState, tempfile::NamedTempFile) {
         )),
         did_locks: Arc::new(dashmap::DashMap::new()),
         signing_key_cache: Arc::new(dashmap::DashMap::new()),
+        oauth: stelyph::xrpc::oauth::test_oauth_state(),
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

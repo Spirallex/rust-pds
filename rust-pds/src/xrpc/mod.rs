@@ -1,6 +1,7 @@
 pub mod appview;
 pub mod error;
 pub mod identity;
+pub mod oauth;
 pub mod preferences;
 pub mod repo;
 pub mod server;
@@ -73,6 +74,9 @@ pub struct AppState {
     /// import-keys/reset-password run as separate CLI processes and require a server restart
     /// to be picked up. Wrapped in Zeroizing so key bytes are zeroed on drop.
     pub signing_key_cache: Arc<dashmap::DashMap<String, Arc<zeroize::Zeroizing<Vec<u8>>>>>,
+    /// OAuth authorization-server state: the AS signing key, the DPoP verifier,
+    /// and the client-metadata resolver.
+    pub oauth: Arc<crate::xrpc::oauth::OAuthState>,
 }
 
 /// Implement `AsRef<AppState>` so the axum extractor impls in `auth::extractor`
@@ -130,6 +134,9 @@ pub fn app(state: AppState) -> Router {
         .merge(repo::routes())
         .merge(crate::firehose::subscribe::routes())
         .merge(preferences::routes())
+        // Must be merged before the fallback: the OAuth endpoints live outside
+        // /xrpc, and the proxy fallback would otherwise forward them upstream.
+        .merge(oauth::routes())
         // Everything not matched above is a candidate for upstream proxying
         // (AppView reads, chat, moderation, feed generators, …).
         .fallback(appview::proxy::proxy_fallback)

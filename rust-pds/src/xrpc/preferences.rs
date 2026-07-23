@@ -115,6 +115,7 @@ mod tests {
             ),
             did_locks: Arc::new(dashmap::DashMap::new()),
             signing_key_cache: Arc::new(dashmap::DashMap::new()),
+            oauth: crate::xrpc::oauth::test_oauth_state(),
         };
         (state, tmp)
     }
