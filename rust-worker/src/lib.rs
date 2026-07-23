@@ -37,7 +37,7 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpResponse
         .to_ascii_lowercase();
 
     if host.is_empty() {
-        return Ok(Response::error("missing Host header", 400)?.try_into()?);
+        return Response::error("missing Host header", 400)?.try_into();
     }
 
     // The DO name is the hostname, so every PDS gets its own instance and its
@@ -70,11 +70,11 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpResponse
 
     // The DO needs the real hostname to derive its issuer URL and DID, which
     // the opaque forwarding URL has thrown away.
-    let mut headers = Headers::new();
+    let headers = Headers::new();
     headers.set("X-Stelyph-Host", &host)?;
     init.with_headers(headers);
 
     let forwarded = Request::new_with_init(&url, &init)?;
     let resp = stub.fetch_with_request(forwarded).await?;
-    Ok(resp.try_into()?)
+    resp.try_into()
 }

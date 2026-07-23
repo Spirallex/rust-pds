@@ -149,7 +149,13 @@ impl PdsDurableObject {
 
         // R2 round trip through BlobStore.
         let r2_ok = match store
-            .put_blob("did:plc:health", "probe", "text/plain", 5, b"probe".to_vec())
+            .put_blob(
+                "did:plc:health",
+                "probe",
+                "text/plain",
+                5,
+                b"probe".to_vec(),
+            )
             .await
         {
             Ok(()) => matches!(

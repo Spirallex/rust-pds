@@ -356,7 +356,10 @@ impl RepoStore for DoStore {
         }
 
         // Claim the next seq by incrementing the counter and reading it back.
-        self.run("UPDATE seq_counter SET next = next + 1 WHERE id = 0", vec![])?;
+        self.run(
+            "UPDATE seq_counter SET next = next + 1 WHERE id = 0",
+            vec![],
+        )?;
         let rows: Vec<NextSeqRow> = self
             .exec("SELECT next FROM seq_counter WHERE id = 0", vec![])?
             .to_array()
@@ -447,7 +450,8 @@ impl AccountStore for DoStore {
         // Await-free between the count and the insert, so the first-account gate
         // cannot be won twice.
         let before = self.count_accounts().await?;
-        self.insert_account(did, handle, email, password_phc).await?;
+        self.insert_account(did, handle, email, password_phc)
+            .await?;
         Ok(before)
     }
 
