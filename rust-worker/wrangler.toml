@@ -35,9 +35,16 @@ command = "cargo install -q worker-build --version ^0.8 && worker-build --releas
 # One instance per PDS hostname. It is the single writer for that repo, which is
 # what makes `seq` monotonic and the root pointer safe to compare-and-swap — a
 # guarantee no amount of care in a fan-out of stateless isolates can provide.
+#
+# REGISTRY is a single instance for the whole deployment, holding claimed labels
+# and invite codes. It exists because the per-hostname objects cannot gate their
+# own creation: an unclaimed hostname resolves to an empty object, so a
+# first-account check inside one would pass for every registration. See
+# registry.rs.
 [durable_objects]
 bindings = [
   { name = "PDS", class_name = "PdsDurableObject" },
+  { name = "REGISTRY", class_name = "RegistryDurableObject" },
 ]
 
 [[migrations]]
@@ -46,6 +53,10 @@ tag = "v1"
 # what lets the existing schema port over more or less intact, and it is the
 # only backend with a real transaction.
 new_sqlite_classes = ["PdsDurableObject"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["RegistryDurableObject"]
 
 # --- R2 --------------------------------------------------------------------
 #

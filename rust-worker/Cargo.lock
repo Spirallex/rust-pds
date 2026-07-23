@@ -1890,11 +1890,13 @@ dependencies = [
 name = "stelyph-worker"
 version = "0.1.0-alpha.3"
 dependencies = [
+ "anyhow",
  "async-trait",
  "atrium-api",
  "atrium-crypto",
  "cid",
  "console_error_panic_hook",
+ "futures-util",
  "http",
  "js-sys",
  "rand",

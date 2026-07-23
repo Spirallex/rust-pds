@@ -8,10 +8,20 @@
 //! Everything that mutates repo state runs here. The Worker in front is a
 //! router: it maps `Host` to a DO name and forwards.
 
+use serde::Deserialize;
 use worker::*;
 
 use crate::handlers::{self as h, Ctx};
 use crate::store::DoStore;
+
+/// Body of the internal `/_stelyph/provision` call.
+#[derive(Deserialize)]
+struct ProvisionInput {
+    handle: String,
+    #[serde(default)]
+    email: Option<String>,
+    password: String,
+}
 
 /// Name of the R2 binding declared in `wrangler.toml`.
 const BLOBS_BINDING: &str = "BLOBS";
@@ -60,7 +70,7 @@ impl PdsDurableObject {
         Ok(store)
     }
 
-    async fn route(&self, req: Request) -> Result<Response> {
+    async fn route(&self, mut req: Request) -> Result<Response> {
         let url = req.url()?;
         let hostname = req
             .headers()
@@ -73,6 +83,10 @@ impl PdsDurableObject {
             "/.well-known/oauth-authorization-server" => h::oauth_as_metadata(&ctx),
             "/.well-known/oauth-protected-resource" => h::oauth_protected_resource(&ctx),
             "/.well-known/did.json" => h::did_web_document(&ctx),
+            "/.well-known/atproto-did" => {
+                let store = self.store()?;
+                h::atproto_did(&store, &hostname).await
+            }
             "/oauth/jwks" => {
                 let store = self.store()?;
                 h::jwks(&store, &self.key_passphrase()?).await
@@ -83,9 +97,68 @@ impl PdsDurableObject {
                 h::describe_server(&ctx, &self.zone_suffix())
             }
 
+            // --- internal --------------------------------------------------
+            // Reachable only from the front Worker: a DO stub cannot be
+            // addressed from outside the network, and the Worker never routes a
+            // client request to this path.
+            "/_stelyph/provision" => {
+                let input: ProvisionInput = req.json().await?;
+                let store = self.store()?;
+                let outcome = h::provision_account(
+                    &store,
+                    &ctx,
+                    &input.handle,
+                    input.email.as_deref(),
+                    &input.password,
+                    &self.key_passphrase()?,
+                    &self.jwt_secret()?,
+                    &self.plc_directory(),
+                )
+                .await?;
+                match outcome {
+                    h::ProvisionOutcome::Created {
+                        did,
+                        access_jwt,
+                        refresh_jwt,
+                    } => Response::from_json(&serde_json::json!({
+                        "ok": true,
+                        "did": did,
+                        "accessJwt": access_jwt,
+                        "refreshJwt": refresh_jwt,
+                    })),
+                    h::ProvisionOutcome::Rejected { error, message } => {
+                        Response::from_json(&serde_json::json!({
+                            "ok": false,
+                            "error": error,
+                            "message": message,
+                        }))
+                    }
+                }
+            }
+
             "/_stelyph/health" => self.health().await,
             _ => xrpc_error(404, "MethodNotImplemented", "unknown endpoint"),
         }
+    }
+
+    /// Secret used to sign session JWTs.
+    fn jwt_secret(&self) -> Result<Vec<u8>> {
+        self.env
+            .secret("PDS_JWT_SECRET")
+            .map(|s| s.to_string().into_bytes())
+            .map_err(|_| Error::RustError("PDS_JWT_SECRET secret is not set".into()))
+    }
+
+    /// PLC directory that genesis operations are submitted to.
+    ///
+    /// Overridable so a staging deployment can point at a throwaway directory —
+    /// a genesis op against the real one is public and permanent, which is not
+    /// something a test should be able to do by accident.
+    fn plc_directory(&self) -> String {
+        self.env
+            .var("PDS_PLC_DIRECTORY")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| crate::plc::DEFAULT_PLC_DIRECTORY.to_string())
     }
 
     /// Passphrase wrapping every key this PDS stores at rest.

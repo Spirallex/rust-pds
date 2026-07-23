@@ -29,6 +29,12 @@ wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1"
 
 async-trait = "0.1"
+# `CoreError::Internal` wraps an `anyhow::Error`, so constructing one needs the
+# crate by name even though nothing here uses it for its own error handling.
+anyhow = "1"
+# `worker::Body` is a `Stream`, not a buffered body — reading a POST body means
+# draining it chunk by chunk.
+futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # DO SQLite hands BLOB columns back as a serde *byte array*, not a sequence, so

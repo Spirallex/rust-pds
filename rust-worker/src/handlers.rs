@@ -10,6 +10,7 @@
 use worker::*;
 
 use stelyph_core::oauth::{AuthorizationServerMetadata, JwkSet, ProtectedResourceMetadata};
+use stelyph_core::storage::AccountStore;
 
 use crate::store::DoStore;
 
@@ -100,6 +101,141 @@ pub async fn load_or_create_signing_key(
         .await
         .map_err(|e| Error::RustError(format!("persist OAuth signing key: {e}")))?;
     Ok(key)
+}
+
+/// `GET /.well-known/atproto-did` — handle resolution.
+///
+/// How a handle becomes a DID: a resolver fetches this over HTTPS at the handle
+/// itself and gets back the DID as bare text. `did.json` does not substitute for
+/// it — that document only answers for `did:web`, and accounts here are
+/// `did:plc`, so without this endpoint every handle on the deployment is
+/// unresolvable and no appview ever finds the account.
+pub async fn atproto_did(store: &DoStore, hostname: &str) -> Result<Response> {
+    let did = store
+        .get_did_by_handle(hostname)
+        .await
+        .map_err(|e| Error::RustError(format!("handle lookup: {e}")))?;
+    match did {
+        Some(did) => {
+            let mut resp = Response::ok(did)?;
+            resp.headers_mut().set("content-type", "text/plain")?;
+            Ok(resp)
+        }
+        // Deliberately 404 rather than an empty 200: a resolver must be able to
+        // tell "no account here" from "an account with an empty DID".
+        None => Response::error("no account for this handle", 404),
+    }
+}
+
+/// Create the single account this Durable Object exists to serve.
+///
+/// Called only by the front Worker, and only after the registry has reserved the
+/// label — the invite gate is not re-checked here because it cannot be: this
+/// object sees one hostname and can never tell a first registration from a
+/// thousandth. What it *can* enforce is that it holds at most one account, which
+/// is the invariant that makes "one DO per hostname" mean "one PDS per person".
+#[allow(clippy::too_many_arguments)]
+pub async fn provision_account(
+    store: &DoStore,
+    ctx: &Ctx,
+    handle: &str,
+    email: Option<&str>,
+    password: &str,
+    passphrase: &[u8],
+    jwt_secret: &[u8],
+    plc_directory: &str,
+) -> Result<ProvisionOutcome> {
+    use atrium_crypto::keypair::{Export, Secp256k1Keypair};
+    use stelyph_core::auth::jwt::{encode_access_jwt, encode_refresh_jwt, hash_password};
+    use stelyph_core::identity::plc::register_did_plc;
+    use stelyph_core::storage::crypto;
+
+    if password.len() < 8 {
+        return Ok(ProvisionOutcome::Rejected {
+            error: "InvalidRequest",
+            message: "Password must be at least 8 characters.".into(),
+        });
+    }
+
+    // One account per object. A second call means either a retry after a
+    // response was lost, or a registry that handed out the same label twice;
+    // either way, creating a second identity in the same repo is wrong.
+    let existing = store
+        .count_accounts()
+        .await
+        .map_err(|e| Error::RustError(format!("count accounts: {e}")))?;
+    if existing > 0 {
+        return Ok(ProvisionOutcome::Rejected {
+            error: "HandleNotAvailable",
+            message: "That handle already has an account.".into(),
+        });
+    }
+
+    let signing = Secp256k1Keypair::create(&mut rand::rngs::OsRng);
+    let rotation = Secp256k1Keypair::create(&mut rand::rngs::OsRng);
+
+    // The point of no return. Everything above is local to this object and can
+    // be abandoned; this writes a signed genesis operation to a public ledger.
+    // It runs before the account row is inserted so that a PLC failure leaves no
+    // local trace, which is the recoverable direction to fail in — the opposite
+    // order would leave an account whose DID does not exist.
+    let plc = crate::plc::FetchPlcClient::new(plc_directory);
+    let did = match register_did_plc(handle, &ctx.issuer, &signing, &rotation, &plc).await {
+        Ok(did) => did,
+        Err(e) => {
+            return Ok(ProvisionOutcome::Rejected {
+                error: "UpstreamFailure",
+                message: format!("Could not register your identity: {e}"),
+            })
+        }
+    };
+
+    // argon2id runs inline — a Workers isolate has no thread pool to move it to,
+    // which is why this crate builds with `lean-auth`.
+    let phc =
+        hash_password(password).map_err(|e| Error::RustError(format!("hash password: {e}")))?;
+
+    store
+        .count_and_insert_account(&did, handle, email, &phc)
+        .await
+        .map_err(|e| Error::RustError(format!("insert account: {e}")))?;
+
+    for (suffix, scalar) in [
+        ("signing", signing.export()),
+        ("rotation", rotation.export()),
+    ] {
+        crypto::store_key(store, &format!("{did}#{suffix}"), &scalar, passphrase)
+            .await
+            .map_err(|e| Error::RustError(format!("store {suffix} key: {e}")))?;
+    }
+
+    let access_jwt = encode_access_jwt(&did, jwt_secret)
+        .map_err(|e| Error::RustError(format!("access jwt: {e}")))?;
+    let refresh_jwt = encode_refresh_jwt(&did, jwt_secret)
+        .map_err(|e| Error::RustError(format!("refresh jwt: {e}")))?;
+
+    Ok(ProvisionOutcome::Created {
+        did,
+        access_jwt,
+        refresh_jwt,
+    })
+}
+
+/// Result of a provisioning attempt.
+///
+/// A rejection is a value rather than an `Err` because the front Worker has to
+/// act on it — releasing the reservation and returning the invite — and an
+/// opaque transport error would not tell it whether that is safe.
+pub enum ProvisionOutcome {
+    Created {
+        did: String,
+        access_jwt: String,
+        refresh_jwt: String,
+    },
+    Rejected {
+        error: &'static str,
+        message: String,
+    },
 }
 
 /// `GET /.well-known/did.json` — the did:web document for this PDS.
