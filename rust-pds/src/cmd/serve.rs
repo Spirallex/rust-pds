@@ -275,8 +275,23 @@ pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()>
 
     let open_registration = args.open_registration;
 
+    // The OAuth AS signing key lives in the same encrypted key store as account
+    // keys, so this must run after the store is open and before AppState is
+    // built. On first start it generates and persists a key.
+    let store: Arc<dyn stelyph_core::storage::StorageBackend> = Arc::new(store);
+    let oauth = crate::xrpc::oauth::OAuthState::bootstrap(
+        store.as_ref(),
+        &key_passphrase,
+        &jwt_secret,
+        pds_endpoint.clone(),
+        format!("did:web:{hostname}"),
+        Arc::new(crate::xrpc::oauth::HttpClientResolver::new()),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("FATAL: Failed to initialize the OAuth server: {e}"))?;
+
     let state = AppState {
-        store: Arc::new(store),
+        store,
         jwt_secret: Arc::new(jwt_secret),
         hostname: hostname.clone(),
         pds_endpoint,
@@ -296,6 +311,7 @@ pub async fn run(args: ServeArgs, config: Option<PathBuf>) -> anyhow::Result<()>
         ),
         did_locks: Arc::new(dashmap::DashMap::new()),
         signing_key_cache: Arc::new(dashmap::DashMap::new()),
+        oauth: Arc::new(oauth),
     };
 
     match mode {

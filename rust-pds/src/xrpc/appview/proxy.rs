@@ -231,6 +231,7 @@ mod tests {
             service_resolver: Arc::new(MockServiceDidResolver::new("https://plcsvc.test")),
             did_locks: Arc::new(dashmap::DashMap::new()),
             signing_key_cache: Arc::new(dashmap::DashMap::new()),
+            oauth: crate::xrpc::oauth::test_oauth_state(),
         };
         // The proxy mints service auth with the account signing key.
         use atrium_crypto::keypair::{Export, Secp256k1Keypair};

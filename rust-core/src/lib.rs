@@ -21,6 +21,9 @@ pub mod auth;
 pub mod error;
 pub mod firehose;
 pub mod identity;
+/// AT Protocol OAuth 2.0 authorization server — protocol layer only. The HTTP
+/// routes and login/consent UI live in the `stelyph` server crate.
+pub mod oauth;
 pub mod repo;
 /// Minimal in-process `hyper` server for on-device hosting. Feature-gated
 /// (`embedded-server`) so it never touches the default device-portable build.

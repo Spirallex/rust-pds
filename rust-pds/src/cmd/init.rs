@@ -254,8 +254,23 @@ async fn add_user(
         .map_err(|e| anyhow::anyhow!("Failed to create relay client: {e}"))?;
     let appview_client = crate::xrpc::appview::client::ReqwestAppViewClient::new()
         .map_err(|e| anyhow::anyhow!("Failed to create AppView client: {e}"))?;
+    // `init` runs the same createAccount path the server does, so it needs a
+    // complete AppState. The OAuth key is created here if absent, which means a
+    // freshly initialised PDS already has one before it first serves.
+    let store: Arc<dyn stelyph_core::storage::StorageBackend> = Arc::new(store);
+    let oauth = crate::xrpc::oauth::OAuthState::bootstrap(
+        store.as_ref(),
+        &passphrase,
+        &jwt,
+        format!("https://{hostname}"),
+        format!("did:web:{hostname}"),
+        Arc::new(crate::xrpc::oauth::HttpClientResolver::new()),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to initialize the OAuth server: {e}"))?;
+
     let state = AppState {
-        store: Arc::new(store),
+        store,
         jwt_secret: Arc::new(jwt),
         hostname: hostname.to_string(),
         pds_endpoint: format!("https://{hostname}"),
@@ -275,6 +290,7 @@ async fn add_user(
         ),
         did_locks: Arc::new(dashmap::DashMap::new()),
         signing_key_cache: Arc::new(dashmap::DashMap::new()),
+        oauth: Arc::new(oauth),
     };
 
     // Mint a single-use invite, then create the account through the normal gated path.
@@ -807,8 +823,20 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
     let passphrase_for_keychain = String::from_utf8_lossy(&key_passphrase).to_string();
     let hostname_for_keychain = hostname.clone();
 
+    let store: Arc<dyn stelyph_core::storage::StorageBackend> = Arc::new(store);
+    let oauth = crate::xrpc::oauth::OAuthState::bootstrap(
+        store.as_ref(),
+        &key_passphrase,
+        &jwt_secret_bytes,
+        format!("https://{hostname}"),
+        format!("did:web:{hostname}"),
+        Arc::new(crate::xrpc::oauth::HttpClientResolver::new()),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to initialize the OAuth server: {e}"))?;
+
     let state = AppState {
-        store: Arc::new(store),
+        store,
         jwt_secret: Arc::new(jwt_secret_bytes),
         hostname: hostname.clone(),
         pds_endpoint: format!("https://{hostname}"),
@@ -828,6 +856,7 @@ pub async fn run(args: InitArgs, config: Option<PathBuf>) -> anyhow::Result<()> 
         ),
         did_locks: Arc::new(dashmap::DashMap::new()),
         signing_key_cache: Arc::new(dashmap::DashMap::new()),
+        oauth: Arc::new(oauth),
     };
 
     // Build the remaining live clients (ip_client was created earlier for mode detection).
@@ -940,6 +969,7 @@ mod tests {
             )),
             did_locks: Arc::new(dashmap::DashMap::new()),
             signing_key_cache: Arc::new(dashmap::DashMap::new()),
+            oauth: crate::xrpc::oauth::test_oauth_state(),
         };
         (state, tmp)
     }

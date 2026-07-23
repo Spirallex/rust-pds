@@ -15,17 +15,47 @@ use axum::http::HeaderMap;
 use crate::auth::jwt::decode_jwt;
 use crate::xrpc::XrpcError;
 
-/// Extract the Bearer token string from the `Authorization` header.
-fn bearer_token(headers: &HeaderMap) -> Result<&str, XrpcError> {
+/// The authentication scheme a request presented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scheme {
+    /// Legacy `createSession` / app-password JWT.
+    Bearer,
+    /// OAuth access token, which must additionally carry a DPoP proof.
+    Dpop,
+}
+
+/// Split the `Authorization` header into its scheme and token.
+///
+/// Scheme matching is case-insensitive because RFC 7235 says the scheme is, and
+/// clients do send `dpop` and `DPoP` interchangeably.
+fn authorization(headers: &HeaderMap) -> Result<(Scheme, &str), XrpcError> {
     let header = headers
         .get("Authorization")
         .ok_or(XrpcError::AuthRequired)?
         .to_str()
         .map_err(|_| XrpcError::InvalidToken)?;
 
-    header
-        .strip_prefix("Bearer ")
-        .ok_or(XrpcError::InvalidToken)
+    let (scheme, token) = header.split_once(' ').ok_or(XrpcError::InvalidToken)?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(XrpcError::InvalidToken);
+    }
+
+    if scheme.eq_ignore_ascii_case("bearer") {
+        Ok((Scheme::Bearer, token))
+    } else if scheme.eq_ignore_ascii_case("dpop") {
+        Ok((Scheme::Dpop, token))
+    } else {
+        Err(XrpcError::InvalidToken)
+    }
+}
+
+/// Extract the Bearer token string from the `Authorization` header.
+fn bearer_token(headers: &HeaderMap) -> Result<&str, XrpcError> {
+    match authorization(headers)? {
+        (Scheme::Bearer, token) => Ok(token),
+        (Scheme::Dpop, _) => Err(XrpcError::InvalidToken),
+    }
 }
 
 /// Authenticate an access-scoped request.
@@ -85,9 +115,76 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let app_state: &crate::xrpc::AppState = state.as_ref();
-        let did = authenticate_access(&parts.headers, app_state.jwt_secret.as_ref())?;
-        Ok(AccessAuth(did))
+        match authorization(&parts.headers)? {
+            // Legacy app-password session. Still supported: atproto has not
+            // removed app passwords, and the user's existing clients rely on it.
+            (Scheme::Bearer, _) => {
+                let did = authenticate_access(&parts.headers, app_state.jwt_secret.as_ref())?;
+                Ok(AccessAuth(did))
+            }
+            (Scheme::Dpop, token) => {
+                let did = authenticate_dpop(app_state, parts, token).await?;
+                Ok(AccessAuth(did))
+            }
+        }
     }
+}
+
+/// Authenticate an OAuth access token plus its DPoP proof.
+///
+/// Three things must all hold, and checking only the first two is the common
+/// mistake that makes DPoP decorative:
+///
+/// 1. the access token verifies and has not expired;
+/// 2. the DPoP proof verifies against this method and URI, is fresh, carries a
+///    valid nonce, and has not been replayed;
+/// 3. the proof's key thumbprint equals the token's `cnf.jkt`, and the proof's
+///    `ath` covers this exact token.
+///
+/// Without (3) any valid proof from any key would authorize any token.
+async fn authenticate_dpop(
+    state: &crate::xrpc::AppState,
+    parts: &Parts,
+    access_token: &str,
+) -> Result<String, XrpcError> {
+    // Exactly one DPoP header (RFC 9449 §4.3).
+    let mut values = parts.headers.get_all("DPoP").iter();
+    let proof = values.next().ok_or(XrpcError::AuthRequired)?;
+    if values.next().is_some() {
+        return Err(XrpcError::InvalidToken);
+    }
+    let proof = proof.to_str().map_err(|_| XrpcError::InvalidToken)?;
+
+    let claims = state
+        .oauth
+        .issuer
+        .verify_access_token(access_token)
+        .map_err(|_| XrpcError::InvalidToken)?;
+
+    // Build the URI from the configured issuer plus the request path. `Host` and
+    // `X-Forwarded-*` are attacker-controlled; deriving `htu` from them would let
+    // a proof minted for one origin be replayed here.
+    let url = state.oauth.endpoint_url(parts.uri.path());
+
+    let verified = state
+        .oauth
+        .dpop
+        .verify(
+            state.store.as_ref(),
+            proof,
+            parts.method.as_str(),
+            &url,
+            Some(access_token),
+            true,
+        )
+        .await
+        .map_err(|_| XrpcError::InvalidToken)?;
+
+    if verified.jkt != claims.cnf.jkt {
+        return Err(XrpcError::InvalidToken);
+    }
+
+    Ok(claims.sub)
 }
 
 /// Axum extractor for refresh-scoped Bearer tokens.

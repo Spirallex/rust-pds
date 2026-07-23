@@ -28,6 +28,9 @@ use async_trait::async_trait;
 use cid::Cid;
 use tokio::sync::Mutex;
 
+use crate::oauth::store::{
+    AuthCode, ConsumeResult, OAuthStore, RefreshTokenRecord, StoredPushedRequest,
+};
 use crate::storage::{
     AccountStore, AccountSummary, BlobStore, BlockStore, KeyStore, RepoStore, Sequencer,
     StorageError,
@@ -79,6 +82,15 @@ struct Inner {
     keys: HashMap<String, Vec<u8>>,
     blobs: HashMap<(String, String), (String, Vec<u8>)>,
     prefs: HashMap<String, String>,
+
+    // --- OAuth server state ---
+    oauth_par: HashMap<String, StoredPushedRequest>,
+    oauth_codes: HashMap<String, AuthCode>,
+    /// Value is `(record, used)`. Spent tokens are retained until expiry so
+    /// reuse stays distinguishable from an unknown token.
+    oauth_refresh: HashMap<String, (RefreshTokenRecord, bool)>,
+    /// `jti` → expiry, for DPoP replay detection.
+    oauth_jti: HashMap<String, u64>,
 }
 
 impl Inner {
@@ -459,6 +471,156 @@ impl BlobStore for MemoryStore {
             .blobs
             .get(&(did.to_string(), cid.to_string()))
             .cloned())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OAuth server state
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl OAuthStore for MemoryStore {
+    async fn put_pushed_request(&self, req: StoredPushedRequest) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .await
+            .oauth_par
+            .insert(req.request_uri_hash.clone(), req);
+        Ok(())
+    }
+
+    async fn get_pushed_request(
+        &self,
+        request_uri_hash: &str,
+        now: u64,
+    ) -> Result<Option<StoredPushedRequest>, StorageError> {
+        Ok(self
+            .inner
+            .lock()
+            .await
+            .oauth_par
+            .get(request_uri_hash)
+            .filter(|r| r.expires_at > now)
+            .cloned())
+    }
+
+    async fn delete_pushed_request(&self, request_uri_hash: &str) -> Result<(), StorageError> {
+        self.inner.lock().await.oauth_par.remove(request_uri_hash);
+        Ok(())
+    }
+
+    async fn put_auth_code(&self, code: AuthCode) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .await
+            .oauth_codes
+            .insert(code.code_hash.clone(), code);
+        Ok(())
+    }
+
+    async fn consume_auth_code(
+        &self,
+        code_hash: &str,
+        now: u64,
+    ) -> Result<Option<AuthCode>, StorageError> {
+        // Remove first, then decide: one guard covers both, so a second caller
+        // finds nothing regardless of interleaving.
+        let mut g = self.inner.lock().await;
+        Ok(g.oauth_codes
+            .remove(code_hash)
+            .filter(|c| c.expires_at > now))
+    }
+
+    async fn put_refresh_token(&self, token: RefreshTokenRecord) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .await
+            .oauth_refresh
+            .insert(token.token_hash.clone(), (token, false));
+        Ok(())
+    }
+
+    async fn consume_refresh_token(
+        &self,
+        token_hash: &str,
+        now: u64,
+    ) -> Result<ConsumeResult, StorageError> {
+        let mut g = self.inner.lock().await;
+        let Some((rec, used)) = g.oauth_refresh.get_mut(token_hash) else {
+            return Ok(ConsumeResult::NotFound);
+        };
+        if rec.expires_at <= now {
+            return Ok(ConsumeResult::NotFound);
+        }
+        if *used {
+            return Ok(ConsumeResult::Reused {
+                session_id: rec.session_id.clone(),
+            });
+        }
+        *used = true;
+        Ok(ConsumeResult::Consumed(Box::new(rec.clone())))
+    }
+
+    async fn revoke_session(&self, session_id: &str) -> Result<u64, StorageError> {
+        let mut g = self.inner.lock().await;
+        let before = g.oauth_refresh.len();
+        g.oauth_refresh
+            .retain(|_, (r, _)| r.session_id != session_id);
+        Ok((before - g.oauth_refresh.len()) as u64)
+    }
+
+    async fn revoke_refresh_token(&self, token_hash: &str) -> Result<bool, StorageError> {
+        let mut g = self.inner.lock().await;
+        let Some((rec, _)) = g.oauth_refresh.get(token_hash) else {
+            return Ok(false);
+        };
+        // Revoke the whole chain — the caller is ending a session, not one token.
+        let session_id = rec.session_id.clone();
+        g.oauth_refresh
+            .retain(|_, (r, _)| r.session_id != session_id);
+        Ok(true)
+    }
+
+    async fn list_sessions_for_did(
+        &self,
+        did: &str,
+        now: u64,
+    ) -> Result<Vec<RefreshTokenRecord>, StorageError> {
+        let g = self.inner.lock().await;
+        let mut rows: Vec<RefreshTokenRecord> = g
+            .oauth_refresh
+            .values()
+            .filter(|(r, used)| !*used && r.did == did && r.expires_at > now)
+            .map(|(r, _)| r.clone())
+            .collect();
+        rows.sort_by(|a, b| {
+            b.issued_at
+                .cmp(&a.issued_at)
+                .then_with(|| a.token_hash.cmp(&b.token_hash))
+        });
+        Ok(rows)
+    }
+
+    async fn record_dpop_jti(&self, jti: &str, expires_at: u64) -> Result<bool, StorageError> {
+        let mut g = self.inner.lock().await;
+        if g.oauth_jti.contains_key(jti) {
+            return Ok(false);
+        }
+        g.oauth_jti.insert(jti.to_string(), expires_at);
+        Ok(true)
+    }
+
+    async fn purge_expired(&self, now: u64) -> Result<u64, StorageError> {
+        let mut g = self.inner.lock().await;
+        let before =
+            g.oauth_par.len() + g.oauth_codes.len() + g.oauth_refresh.len() + g.oauth_jti.len();
+        g.oauth_par.retain(|_, r| r.expires_at > now);
+        g.oauth_codes.retain(|_, c| c.expires_at > now);
+        g.oauth_refresh.retain(|_, (r, _)| r.expires_at > now);
+        g.oauth_jti.retain(|_, e| *e > now);
+        let after =
+            g.oauth_par.len() + g.oauth_codes.len() + g.oauth_refresh.len() + g.oauth_jti.len();
+        Ok((before - after) as u64)
     }
 }
 

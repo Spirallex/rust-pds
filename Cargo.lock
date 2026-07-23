@@ -1975,7 +1975,9 @@ dependencies = [
  "cfg-if",
  "ecdsa",
  "elliptic-curve",
+ "once_cell",
  "sha2",
+ "signature",
 ]
 
 [[package]]
@@ -3343,8 +3345,10 @@ dependencies = [
  "ipld-core",
  "iroh-car",
  "jsonwebtoken",
+ "k256",
  "libc",
  "mach2",
+ "p256",
  "rand 0.8.6",
  "rusqlite",
  "serde",
@@ -3357,6 +3361,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-rusqlite",
+ "url",
  "uuid",
  "zeroize",
 ]

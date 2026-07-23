@@ -263,8 +263,18 @@ pub trait BlobStore: Send + Sync {
 /// Everything a PDS needs from persistence, in one object-safe bundle.
 ///
 /// `AppState` holds an `Arc<dyn StorageBackend>`. The blanket impl below means
-/// any type implementing the four component traits is automatically a
+/// any type implementing the component traits is automatically a
 /// `StorageBackend` — implementors never name this trait.
-pub trait StorageBackend: RepoStore + AccountStore + KeyStore + BlobStore {}
+///
+/// [`crate::oauth::OAuthStore`] is included so the OAuth endpoints can reach
+/// their state through the same handle as everything else, rather than the
+/// server having to thread a second store around.
+pub trait StorageBackend:
+    RepoStore + AccountStore + KeyStore + BlobStore + crate::oauth::OAuthStore
+{
+}
 
-impl<T> StorageBackend for T where T: RepoStore + AccountStore + KeyStore + BlobStore {}
+impl<T> StorageBackend for T where
+    T: RepoStore + AccountStore + KeyStore + BlobStore + crate::oauth::OAuthStore
+{
+}

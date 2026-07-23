@@ -1,5 +1,5 @@
 /// Schema version tracked in schema_version table.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Full SQLite DDL for all Phase 1 tables and indexes.
 /// Defined here, frozen for Phases 2-4 — no migrations needed downstream.
@@ -86,11 +86,71 @@ CREATE TABLE IF NOT EXISTS blobs (
     PRIMARY KEY (did, cid)
 ) STRICT;
 
+-- ---------------------------------------------------------------------------
+-- OAuth authorization server state (schema v5).
+--
+-- Every table here is short-lived and expiring. Codes and tokens are keyed by
+-- SHA-256 of the secret, never the secret itself, so a database leak does not
+-- hand out live sessions.
+-- ---------------------------------------------------------------------------
+
+-- Pushed authorization requests (RFC 9126), awaiting the user's decision.
+CREATE TABLE IF NOT EXISTS oauth_par (
+    request_uri_hash TEXT PRIMARY KEY NOT NULL,
+    client_id        TEXT NOT NULL,
+    redirect_uri     TEXT NOT NULL,
+    scope            TEXT NOT NULL,
+    state            TEXT NOT NULL,
+    code_challenge   TEXT NOT NULL,
+    dpop_jkt         TEXT,
+    login_hint       TEXT,
+    expires_at       INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS oauth_par_expires_idx ON oauth_par (expires_at);
+
+-- Issued authorization codes. Deleted on redemption, so a code is single-use.
+CREATE TABLE IF NOT EXISTS oauth_auth_codes (
+    code_hash      TEXT PRIMARY KEY NOT NULL,
+    did            TEXT NOT NULL,
+    client_id      TEXT NOT NULL,
+    redirect_uri   TEXT NOT NULL,
+    scope          TEXT NOT NULL,
+    code_challenge TEXT NOT NULL,
+    dpop_jkt       TEXT,
+    expires_at     INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS oauth_auth_codes_expires_idx ON oauth_auth_codes (expires_at);
+
+-- Refresh tokens. `used` is kept rather than deleted so that presenting a spent
+-- token is distinguishable from presenting an unknown one — reuse must revoke
+-- the whole rotation chain (session_id), which requires remembering it.
+CREATE TABLE IF NOT EXISTS oauth_refresh_tokens (
+    token_hash TEXT PRIMARY KEY NOT NULL,
+    session_id TEXT NOT NULL,
+    did        TEXT NOT NULL,
+    client_id  TEXT NOT NULL,
+    scope      TEXT NOT NULL,
+    dpop_jkt   TEXT NOT NULL,
+    issued_at  INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    used       INTEGER NOT NULL DEFAULT 0
+) STRICT;
+CREATE INDEX IF NOT EXISTS oauth_refresh_session_idx ON oauth_refresh_tokens (session_id);
+CREATE INDEX IF NOT EXISTS oauth_refresh_did_idx     ON oauth_refresh_tokens (did);
+CREATE INDEX IF NOT EXISTS oauth_refresh_expires_idx ON oauth_refresh_tokens (expires_at);
+
+-- DPoP proof replay cache. Rows live only as long as a proof's `iat` window.
+CREATE TABLE IF NOT EXISTS oauth_dpop_jti (
+    jti        TEXT PRIMARY KEY NOT NULL,
+    expires_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS oauth_dpop_jti_expires_idx ON oauth_dpop_jti (expires_at);
+
 -- Schema version for future migrations.
 -- PRIMARY KEY ensures at most one row; INSERT OR REPLACE handles v1→v2 upgrades
 -- by replacing the old row rather than appending a duplicate.
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY NOT NULL
 ) STRICT;
-INSERT OR REPLACE INTO schema_version (version) VALUES (4);
+INSERT OR REPLACE INTO schema_version (version) VALUES (5);
 "#;
