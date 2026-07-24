@@ -40,9 +40,11 @@ Deployed to `stelyph-pds` (version `195c5c90`, 2026-07-24). Builds clean for
 - **Firehose carries the real commit:** `subscribeRepos?cursor=0` shows seq 5 =
   `repo=did:plc:36m62s3…`, `blocks=897B` (real CAR), `ops=[create
   app.bsky.feed.post/3mrf5f2xvfc22]` — seq 1–4 are the old empty-blocks injects.
-- `requestCrawl` to `bsky.network` → **200**; AppView resolves the account
-  (`getProfile` OK). AppView post indexing was still catching up at hand-off —
-  re-check `getAuthorFeed` for `did:plc:36m62s3…`.
+- `requestCrawl` to `bsky.network` → **200**. **Federation confirmed:** the relay
+  ingested the repo (`getHostStatus` → `accountCount:1`; `sync.getLatestCommit`
+  → 200), and the public AppView indexed both test posts (`getProfile`
+  `postsCount:2`; `getAuthorFeed` returns them). The account is visible
+  network-wide. Two test posts remain on c91's real feed (delete if unwanted).
 
 ### 1. Writes — `createRecord` / `putRecord` / `deleteRecord` / `applyWrites` — DONE
 - Reuses `stelyph-core`'s `RepoWriter` against `DoStore` (an `Arc<DoStore>`
