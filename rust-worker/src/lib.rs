@@ -108,9 +108,25 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpResponse
         }
     }
 
-    // --- everything else: forward to this host's PDS ------------------------
+    // --- repo-scoped data requests on the shared host ----------------------
+    // On the shared PDS host, a read like `getRecord?repo=alice.pds…` names its
+    // target account in a query param, not in the Host. Resolve that to the
+    // account's own hostname so the request reaches the right Durable Object;
+    // without this every such request would land on the DO named after the
+    // shared host, which holds no account. On an account host (`alice.pds…`) the
+    // Host already selects the DO, so this only applies at the shared host.
+    let target_host = if host == zone_suffix {
+        match repo_scoped_target(&env, &path, &zone_suffix).await {
+            Some(h) => h,
+            None => host.clone(),
+        }
+    } else {
+        host.clone()
+    };
+
+    // --- forward to the target account's PDS -------------------------------
     let namespace = env.durable_object(PDS_BINDING)?;
-    let stub = namespace.id_from_name(&host)?.get_stub()?;
+    let stub = namespace.id_from_name(&target_host)?.get_stub()?;
 
     // Rebuild the request for the DO. The authority must NOT be this Worker's
     // own hostname: the runtime treats a subrequest to the zone it is serving
@@ -129,10 +145,11 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpResponse
         _ => Method::Get,
     });
 
-    // The DO needs the real hostname to derive its issuer URL and DID, which
-    // the opaque forwarding URL has thrown away.
+    // The DO needs the target hostname (the account being addressed, which may
+    // differ from the request Host on the shared host) to resolve handles and
+    // identity, since the opaque forwarding URL has thrown it away.
     let headers = Headers::new();
-    headers.set("X-Stelyph-Host", &host)?;
+    headers.set("X-Stelyph-Host", &target_host)?;
     init.with_headers(headers);
 
     // Forward the body too. Discovery is all GET, so this went unnoticed until
@@ -148,6 +165,69 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpResponse
     let forwarded = Request::new_with_init(&url, &init)?;
     let resp = stub.fetch_with_request(forwarded).await?;
     resp.try_into()
+}
+
+/// For a repo-scoped XRPC path on the shared host, the hostname of the account
+/// its `repo` parameter names — or `None` if the path is not repo-scoped or the
+/// target cannot be resolved (in which case the caller falls back to the shared
+/// host, whose DO will return a proper not-found).
+///
+/// The `repo` identifier is either a handle (already a hostname here, used
+/// directly) or a DID (resolved to its label via the registry). This is the one
+/// place the shared host fans a flat XRPC surface back out to per-account DOs.
+async fn repo_scoped_target(env: &Env, path: &str, zone_suffix: &str) -> Option<String> {
+    // These are the read methods that carry a `repo`/`did` identifier. Writes
+    // are authenticated per-account and not served on the shared host.
+    const REPO_SCOPED: &[&str] = &[
+        "/xrpc/com.atproto.repo.getRecord",
+        "/xrpc/com.atproto.repo.listRecords",
+        "/xrpc/com.atproto.repo.describeRepo",
+        "/xrpc/com.atproto.sync.getRepo",
+        "/xrpc/com.atproto.sync.getLatestCommit",
+        "/xrpc/com.atproto.sync.getBlob",
+        "/xrpc/com.atproto.sync.listBlobs",
+    ];
+    let (route, query) = path.split_once('?')?;
+    if !REPO_SCOPED.contains(&route) {
+        return None;
+    }
+    // `repo` for repo.* methods, `did` for sync.* methods.
+    let ident = query_param(query, "repo").or_else(|| query_param(query, "did"))?;
+
+    if ident.starts_with("did:") {
+        // Resolve DID → label via the registry, then compose the hostname.
+        let registry = registry_stub(env).ok()?;
+        let res = call_do(
+            &registry,
+            "/resolve-did",
+            serde_json::json!({ "did": ident }),
+        )
+        .await
+        .ok()?;
+        let label = res.get("label").and_then(|v| v.as_str())?;
+        Some(format!("{label}.{zone_suffix}"))
+    } else {
+        // A handle. Accept it only if it is under this deployment's zone, so the
+        // shared host cannot be used to address arbitrary external hosts.
+        let h = ident.to_ascii_lowercase();
+        if h.ends_with(&format!(".{zone_suffix}")) {
+            Some(h)
+        } else {
+            None
+        }
+    }
+}
+
+/// Extract a query parameter value (percent-decoding the value).
+fn query_param(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        if k == key {
+            Some(v.replace('+', " ").to_string())
+        } else {
+            None
+        }
+    })
 }
 
 /// Handles are created under this suffix, e.g. `pds.example.net`.

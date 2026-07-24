@@ -78,6 +78,16 @@ struct BindReq {
 }
 
 #[derive(Deserialize)]
+struct ResolveDidReq {
+    did: String,
+}
+
+#[derive(Deserialize)]
+struct LabelRow {
+    label: String,
+}
+
+#[derive(Deserialize)]
 struct InviteReq {
     code: String,
     #[serde(default = "one")]
@@ -179,6 +189,10 @@ impl RegistryDurableObject {
                 let body: LabelReq = req.json().await?;
                 self.force_release(&body.label)
             }
+            "/resolve-did" => {
+                let body: ResolveDidReq = req.json().await?;
+                self.resolve_did(&body.did)
+            }
             _ => Response::error("unknown registry endpoint", 404),
         }
     }
@@ -199,6 +213,26 @@ impl RegistryDurableObject {
             ok: true,
             error: None,
         })
+    }
+
+    /// DID → the label (and hence hostname) of the account bound to it.
+    ///
+    /// The counterpart to handle resolution: a data request whose `repo` is a
+    /// DID needs the hostname to reach that account's Durable Object, and the
+    /// registry is the one place that holds the DID↔label binding for the whole
+    /// deployment.
+    fn resolve_did(&self, did: &str) -> Result<Response> {
+        let sql = self.sql()?;
+        let rows: Vec<LabelRow> = sql
+            .exec(
+                "SELECT label FROM claims WHERE did = ? AND state = 'active'",
+                vec![SqlStorageValue::from(did.to_string())],
+            )?
+            .to_array()?;
+        match rows.into_iter().next() {
+            Some(r) => Response::from_json(&serde_json::json!({ "label": r.label })),
+            None => Response::from_json(&serde_json::json!({ "label": null })),
+        }
     }
 
     fn is_taken(&self, sql: &SqlStorage, label: &str) -> Result<bool> {

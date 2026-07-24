@@ -189,6 +189,14 @@ impl PdsDurableObject {
                 h::describe_server(&ctx, &self.zone_suffix(), self.open_registration())
             }
 
+            // Repo-scoped read. The front Worker routes it here by `repo`; this
+            // DO holds one account and describes it. `ctx` is the shared service
+            // identity; `hostname` is this account's own host.
+            "/xrpc/com.atproto.repo.describeRepo" => {
+                let store = self.store()?;
+                h::describe_repo(&store, &ctx, &hostname).await
+            }
+
             // --- internal --------------------------------------------------
             // Reachable only from the front Worker: a DO stub cannot be
             // addressed from outside the network, and the Worker never routes a

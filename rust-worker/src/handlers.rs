@@ -371,6 +371,51 @@ pub async fn signin_start(store: &DoStore, client_name: &str) -> Result<Response
     }))
 }
 
+/// `GET /xrpc/com.atproto.repo.describeRepo` — public identity of the account
+/// this Durable Object holds.
+///
+/// Served after the front Worker has routed the request to the right account's
+/// DO (by `repo` = handle or DID). Because each DO holds exactly one account,
+/// the `repo` parameter is only a routing key — here we simply describe the one
+/// account present. `collections` is genuinely empty until records exist; the
+/// write path that would populate it is not on this Worker yet.
+pub async fn describe_repo(store: &DoStore, ctx: &Ctx, hostname: &str) -> Result<Response> {
+    use stelyph_core::storage::AccountStore;
+
+    let account = store
+        .list_accounts()
+        .await
+        .map_err(|e| Error::RustError(format!("list accounts: {e}")))?
+        .into_iter()
+        .next();
+    let Some(account) = account else {
+        return json_err(404, "RepoNotFound", "No account on this host.");
+    };
+    let did = account.did;
+    let handle = account.handle.unwrap_or_else(|| hostname.to_string());
+
+    // The DID document a resolver would fetch — the account did:plc pointing at
+    // the shared PDS service (ctx.issuer), and the handle it also-known-as.
+    let did_doc = serde_json::json!({
+        "@context": ["https://www.w3.org/ns/did/v1"],
+        "id": did,
+        "alsoKnownAs": [format!("at://{handle}")],
+        "service": [{
+            "id": "#atproto_pds",
+            "type": "AtprotoPersonalDataServer",
+            "serviceEndpoint": ctx.issuer,
+        }],
+    });
+
+    Response::from_json(&serde_json::json!({
+        "handle": handle,
+        "did": did,
+        "didDoc": did_doc,
+        "collections": [],
+        "handleIsCorrect": true,
+    }))
+}
+
 /// `GET /oauth/signin/pending` — the approving phone lists requests to approve.
 ///
 /// Served from the account's own DO, so it is already scoped to that account.
