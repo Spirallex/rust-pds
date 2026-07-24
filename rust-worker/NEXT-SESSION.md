@@ -25,11 +25,24 @@ each account in its own Durable Object, shared `serviceEndpoint`.
 - **Firehose sequencer**: central DO, global monotonic `seq`, `subscribeRepos`
   WebSocket with backfill + live fan-out. Verified with synthetic injects.
 
-## THE main task: the write path — LANDED (not yet deployed/verified live)
+## THE main task: the write path — DEPLOYED & VERIFIED LIVE ✅
 
-The write path is implemented on branch `wr-09-worker-crate`. Builds clean for
-`wasm32-unknown-unknown`; core + pds native tests green (227 + 23); clippy clean
-on both targets. **Not yet deployed, and not yet verified against a real client.**
+Implemented on branch `feat/worker-repo-writes` (off `wr-09-worker-crate`).
+Deployed to `stelyph-pds` (version `195c5c90`, 2026-07-24). Builds clean for
+`wasm32-unknown-unknown`; core (227) + pds (192) tests green; clippy clean.
+
+**Live verification against `pds.spirallex.com` (account c91,
+`did:plc:36m62s3jqi5tce3cz4ppexrf`):**
+- `createSession` → `createRecord` (app.bsky.feed.post) → **200**, real CID + TID.
+- `getRecord` / `listRecords` round-trip the exact record; `getLatestCommit`
+  returns the commit CID + rev; `getRepo` returns a valid 627-byte CARv1.
+- `applyWrites` (create+delete batch) → both results; the deleted record 404s.
+- **Firehose carries the real commit:** `subscribeRepos?cursor=0` shows seq 5 =
+  `repo=did:plc:36m62s3…`, `blocks=897B` (real CAR), `ops=[create
+  app.bsky.feed.post/3mrf5f2xvfc22]` — seq 1–4 are the old empty-blocks injects.
+- `requestCrawl` to `bsky.network` → **200**; AppView resolves the account
+  (`getProfile` OK). AppView post indexing was still catching up at hand-off —
+  re-check `getAuthorFeed` for `did:plc:36m62s3…`.
 
 ### 1. Writes — `createRecord` / `putRecord` / `deleteRecord` / `applyWrites` — DONE
 - Reuses `stelyph-core`'s `RepoWriter` against `DoStore` (an `Arc<DoStore>`
