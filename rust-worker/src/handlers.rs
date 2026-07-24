@@ -526,6 +526,76 @@ pub async fn get_session(
     }))
 }
 
+/// Proxy an `app.bsky.*` / `chat.bsky.*` request to the Bluesky AppView.
+///
+/// These are AppView methods, not PDS methods — the PDS's job is to forward them
+/// with an inter-service auth token so the AppView knows, and trusts, which
+/// account is asking. The token is a short-lived ES256K JWT signed by the
+/// account's own signing key (iss = account DID, aud = AppView DID, lxm = the
+/// method), which the AppView verifies against the account's DID document. This
+/// is what lets a self-hosted PDS use the shared Bluesky AppView.
+pub async fn proxy_appview(
+    store: &DoStore,
+    bearer: Option<&str>,
+    jwt_secret: &[u8],
+    passphrase: &[u8],
+    nsid: &str,
+    query: &str,
+) -> Result<Response> {
+    use atrium_crypto::keypair::Secp256k1Keypair;
+    use stelyph_core::auth::jwt::decode_jwt;
+    use stelyph_core::auth::service_auth::mint_service_auth_jwt_at;
+    use stelyph_core::storage::crypto;
+    use worker::send::SendFuture;
+
+    const APPVIEW_DID: &str = "did:web:api.bsky.app";
+    const APPVIEW_URL: &str = "https://api.bsky.app";
+
+    // Resolve the caller from the access token, and load their signing key.
+    let Some(did) = bearer
+        .and_then(|t| decode_jwt(t, jwt_secret).ok())
+        .map(|c| c.sub)
+    else {
+        return xrpc_err(401, "AuthenticationRequired", "Invalid token.");
+    };
+    let scalar = crypto::load_key(store, &format!("{did}#signing"), passphrase)
+        .await
+        .map_err(|e| Error::RustError(format!("load signing key: {e}")))?;
+    let key = Secp256k1Keypair::import(&scalar)
+        .map_err(|e| Error::RustError(format!("import key: {e}")))?;
+
+    let now = worker::Date::now().as_millis() / 1000;
+    let token = mint_service_auth_jwt_at(&key, &did, APPVIEW_DID, Some(nsid), now + 60, now)
+        .map_err(|e| Error::RustError(format!("mint service auth: {e}")))?;
+
+    let url = if query.is_empty() {
+        format!("{APPVIEW_URL}/xrpc/{nsid}")
+    } else {
+        format!("{APPVIEW_URL}/xrpc/{nsid}?{query}")
+    };
+
+    // Fetch the AppView with the minted token and relay the body back.
+    let (status, body, ctype) = SendFuture::new(async move {
+        let headers = worker::Headers::new();
+        headers.set("authorization", &format!("Bearer {token}"))?;
+        let mut init = worker::RequestInit::new();
+        init.with_method(worker::Method::Get).with_headers(headers);
+        let req = worker::Request::new_with_init(&url, &init)?;
+        let mut resp = worker::Fetch::Request(req).send().await?;
+        let ct = resp
+            .headers()
+            .get("content-type")?
+            .unwrap_or_else(|| "application/json".into());
+        let bytes = resp.bytes().await?;
+        Ok::<_, worker::Error>((resp.status_code(), bytes, ct))
+    })
+    .await?;
+
+    let mut resp = Response::from_bytes(body)?.with_status(status);
+    resp.headers_mut().set("content-type", &ctype)?;
+    Ok(resp)
+}
+
 /// XRPC-shaped error with a status code (createSession/getSession use it).
 fn xrpc_err(status: u16, error: &str, message: &str) -> Result<Response> {
     Ok(

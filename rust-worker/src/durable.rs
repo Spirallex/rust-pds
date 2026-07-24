@@ -278,6 +278,26 @@ impl PdsDurableObject {
             }
 
             "/_stelyph/health" => self.health().await,
+
+            // AppView proxy: app.bsky.* / chat.bsky.* are AppView methods; the
+            // PDS forwards them with account service auth. Matched last so it
+            // does not shadow the com.atproto.* handlers above.
+            p if p.starts_with("/xrpc/app.bsky.") || p.starts_with("/xrpc/chat.bsky.") => {
+                let nsid = p.trim_start_matches("/xrpc/").to_string();
+                let query = url.query().unwrap_or("").to_string();
+                let bearer = bearer(&req)?;
+                let store = self.store()?;
+                h::proxy_appview(
+                    &store,
+                    bearer.as_deref(),
+                    &self.jwt_secret()?,
+                    &self.key_passphrase()?,
+                    &nsid,
+                    &query,
+                )
+                .await
+            }
+
             _ => xrpc_error(404, "MethodNotImplemented", "unknown endpoint"),
         }
     }

@@ -232,12 +232,14 @@ async fn dispatch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpRespo
     // it) and resolve it to the account's hostname.
     if host == zone_suffix {
         let auth_route = path.split('?').next().unwrap_or("");
-        if matches!(
+        let is_auth = matches!(
             auth_route,
             "/xrpc/com.atproto.server.getSession"
                 | "/xrpc/app.bsky.actor.getPreferences"
                 | "/xrpc/app.bsky.actor.putPreferences"
-        ) {
+        ) || auth_route.starts_with("/xrpc/app.bsky.")
+            || auth_route.starts_with("/xrpc/chat.bsky.");
+        if is_auth {
             if let Some(did) = bearer.as_deref().and_then(jwt_sub) {
                 if let Some(h) = session_target(&env, &did, &zone_suffix).await {
                     target_host = h;
