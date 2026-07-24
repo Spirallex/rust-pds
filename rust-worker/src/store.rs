@@ -103,7 +103,7 @@ fn opt_s(v: Option<String>) -> Val {
 /// build does not have. Note that a Durable Object's clock is frozen within a
 /// single execution for determinism, which is fine for a timestamp column but
 /// is why the *sequencer* uses an explicit counter rather than time.
-fn now_iso() -> String {
+pub(crate) fn now_iso() -> String {
     let ms = worker::Date::now().as_millis();
     // Seconds since epoch, formatted by JS. Keeping the format identical to
     // `to_rfc3339()` matters because these strings are compared and sorted.

@@ -42,12 +42,23 @@ pub enum WriteOp {
 
 /// Outcome of a single applied write: the firehose op action, the MST key,
 /// the new record CID (None for deletes), and the resulting commit CID + rev.
+///
+/// `since` and `blocks_car` are everything a *remote* sequencer needs to build
+/// the `#commit` frame itself: on the in-process host the writer publishes to
+/// `firehose_tx` directly, but the Workers host has a separate sequencer Durable
+/// Object and hands these fields to it over the wire (the local broadcast there
+/// has no subscribers). They are populated for every write, and the in-process
+/// host simply ignores them.
 pub struct WriteOutcome {
     pub action: &'static str,
     pub key: String,
     pub record_cid: Option<Cid>,
     pub commit_cid: Cid,
     pub rev: String,
+    /// `rev` of the previous commit, or `None` on the first user write.
+    pub since: Option<String>,
+    /// CARv1 bytes of the blocks new in this commit, root = `commit_cid`.
+    pub blocks_car: Vec<u8>,
 }
 
 impl RepoWriter {
@@ -111,7 +122,25 @@ impl RepoWriter {
     ///
     /// The full read-modify-commit cycle is serialised by `write_lock` so that
     /// two concurrent callers for the same DID cannot fork the commit history.
+    ///
+    /// Thin wrapper over [`Self::apply_one_at`] reading the wall clock. Hosts
+    /// that cannot read `SystemTime` (wasm32) call `apply_one_at` with an
+    /// injected timestamp instead.
     pub async fn apply_one(&self, op: WriteOp) -> Result<WriteOutcome, RepoError> {
+        self.apply_one_at(op, chrono::Utc::now().to_rfc3339()).await
+    }
+
+    /// [`Self::apply_one`] with the commit `time` supplied by the caller.
+    ///
+    /// `now_rfc3339` is stamped into the `#commit` body's `time` field. Split out
+    /// so a wasm32 host — where `chrono::Utc::now()` panics — can pass a
+    /// runtime-provided clock, the same pattern as `encode_access_jwt_at` and
+    /// `mint_service_auth_jwt_at`.
+    pub async fn apply_one_at(
+        &self,
+        op: WriteOp,
+        now_rfc3339: String,
+    ) -> Result<WriteOutcome, RepoError> {
         // Acquire the per-writer logical lock FIRST, before touching repo state.
         // Held until the end of this function — guarantees load → commit is atomic
         // at the application level even when the SQLite writer lock is released
@@ -283,7 +312,11 @@ impl RepoWriter {
             path: key.clone(),
             cid: record_cid,
         }];
-        let time = chrono::Utc::now().to_rfc3339();
+        // Cloned out before the CAR and `since` are moved into the commit body,
+        // so [`WriteOutcome`] can hand them to a remote sequencer verbatim.
+        let blocks_car = car_buf.clone();
+        let since_out = since.clone();
+        let time = now_rfc3339;
         let mut body = CommitBody {
             seq: 0,
             rebase: false,
@@ -321,6 +354,8 @@ impl RepoWriter {
             record_cid,
             commit_cid,
             rev,
+            since: since_out,
+            blocks_car,
         })
     }
 

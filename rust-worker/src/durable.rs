@@ -211,6 +211,27 @@ impl PdsDurableObject {
                 h::describe_repo(&store, &ctx, &hostname).await
             }
 
+            // Repo-scoped read: the front Worker routed here by `repo`; the record
+            // is named by `collection` + `rkey` in the query.
+            "/xrpc/com.atproto.repo.getRecord" => {
+                let q = |k: &str| {
+                    url.query_pairs()
+                        .find(|(key, _)| key == k)
+                        .map(|(_, v)| v.into_owned())
+                };
+                match (q("collection"), q("rkey")) {
+                    (Some(collection), Some(rkey)) => {
+                        let store = self.store()?;
+                        h::get_record(&store, &collection, &rkey).await
+                    }
+                    _ => xrpc_error(
+                        400,
+                        "InvalidRequest",
+                        "collection and rkey are required",
+                    ),
+                }
+            }
+
             "/xrpc/com.atproto.server.createSession" => {
                 let b: CreateSessionInput = req.json().await?;
                 let store = self.store()?;
@@ -231,6 +252,18 @@ impl PdsDurableObject {
                 let body = req.text().await?;
                 let store = self.store()?;
                 h::put_preferences(&store, bearer.as_deref(), &self.jwt_secret()?, &body).await
+            }
+
+            // --- repo writes ----------------------------------------------
+            // Authenticated by the bearer token; the front Worker routed here by
+            // its `sub`. On commit, the write is enqueued to the sequencer so it
+            // reaches the PDS-wide firehose (see `apply_write`).
+            "/xrpc/com.atproto.repo.createRecord" => {
+                self.apply_write(req, h::WriteKind::Create).await
+            }
+            "/xrpc/com.atproto.repo.putRecord" => self.apply_write(req, h::WriteKind::Put).await,
+            "/xrpc/com.atproto.repo.deleteRecord" => {
+                self.apply_write(req, h::WriteKind::Delete).await
             }
 
             // --- internal --------------------------------------------------
@@ -300,6 +333,73 @@ impl PdsDurableObject {
 
             _ => xrpc_error(404, "MethodNotImplemented", "unknown endpoint"),
         }
+    }
+
+    /// Handle a repo write, then push the resulting commit to the sequencer.
+    ///
+    /// The commit lands atomically in this DO first (`repo_write`); only then is
+    /// it enqueued for the firehose. A failed enqueue does not undo the commit —
+    /// the record exists and this DO's `repo_seq` retains the event — so it is
+    /// logged rather than surfaced as a write failure, matching the best-effort
+    /// stance the in-process firehose already takes on a dropped subscriber.
+    async fn apply_write(&self, mut req: Request, kind: h::WriteKind) -> Result<Response> {
+        let bearer = bearer(&req)?;
+        let body = req.text().await?;
+        let store = self.store()?;
+        let result = h::repo_write(
+            store,
+            bearer.as_deref(),
+            &self.jwt_secret()?,
+            &self.key_passphrase()?,
+            kind,
+            &body,
+        )
+        .await?;
+
+        match result {
+            h::WriteResult::Committed { client, enqueue } => {
+                if let Err(e) = self.enqueue_to_sequencer(enqueue).await {
+                    // Best effort: the commit stands regardless of firehose reach.
+                    console_error!("firehose enqueue failed: {e}");
+                }
+                Response::from_json(&client)
+            }
+            h::WriteResult::NoOp { client } => Response::from_json(&client),
+            h::WriteResult::Error {
+                status,
+                error,
+                message,
+            } => xrpc_error(status, error, &message),
+        }
+    }
+
+    /// POST a commit to the single sequencer DO's `/enqueue`.
+    ///
+    /// The account DO shares the Worker's bindings, so it addresses the sequencer
+    /// by the same fixed name the front Worker uses; the opaque internal authority
+    /// avoids the self-loop the runtime would reject for the served zone.
+    async fn enqueue_to_sequencer(&self, payload: serde_json::Value) -> Result<()> {
+        let stub = self
+            .env
+            .durable_object(crate::SEQUENCER_BINDING)?
+            .id_from_name(crate::sequencer::SEQUENCER_DO_NAME)?
+            .get_stub()?;
+        let headers = Headers::new();
+        headers.set("content-type", "application/json")?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_headers(headers)
+            .with_body(Some(payload.to_string().into()));
+        let req = Request::new_with_init("https://stelyph.internal/enqueue", &init)?;
+        let mut resp = stub.fetch_with_request(req).await?;
+        if resp.status_code() != 200 {
+            let detail = resp.text().await.unwrap_or_default();
+            return Err(Error::RustError(format!(
+                "sequencer /enqueue returned {}: {detail}",
+                resp.status_code()
+            )));
+        }
+        Ok(())
     }
 
     /// Secret used to sign session JWTs.

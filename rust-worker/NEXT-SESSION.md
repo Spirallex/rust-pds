@@ -25,39 +25,52 @@ each account in its own Durable Object, shared `serviceEndpoint`.
 - **Firehose sequencer**: central DO, global monotonic `seq`, `subscribeRepos`
   WebSocket with backfill + live fan-out. Verified with synthetic injects.
 
-## THE main task: the write path
+## THE main task: the write path — LANDED (not yet deployed/verified live)
 
-Everything above lets an account log in and browse. It cannot **post** yet,
-because repo writes are not on the Worker. This is the highest-value next work
-and it lights up three things at once: posting, the heavy repo reads, and the
-firehose's real event source.
+The write path is implemented on branch `wr-09-worker-crate`. Builds clean for
+`wasm32-unknown-unknown`; core + pds native tests green (227 + 23); clippy clean
+on both targets. **Not yet deployed, and not yet verified against a real client.**
 
-### 1. `com.atproto.repo.createRecord` / `putRecord` / `deleteRecord` / `applyWrites`
-- Reuse `stelyph-core`'s `RepoWriter` (`repo/writer.rs::apply_one`) against
-  `DoStore`. The seam is already right: `load_repo_root` → build MST → **sign
-  with the account signing key** → `commit_blocks` (atomic append + seq + root).
-- The account DO holds the signing key (`{did}#signing`, encrypted) — load it
-  the same way the AppView proxy does.
-- `apply_one` uses `SystemTime` via nowhere critical? CHECK: the writer/firehose
-  path for any `SystemTime::now()` and thread an injected clock (pattern already
-  used in `encode_access_jwt_at`, `mint_service_auth_jwt_at`). This is the most
-  likely wasm panic.
-- Authenticated: bearer token → DID → must match the DO's account.
+### 1. `createRecord` / `putRecord` / `deleteRecord` — DONE
+- Reuses `stelyph-core`'s `RepoWriter` against `DoStore` (an `Arc<DoStore>`
+  coerced to `Arc<dyn StorageBackend>` — `DoStore`'s `SendWrapper` fields satisfy
+  the `Send + Sync` trait bounds).
+- **wasm clock fix (core):** `writer.rs` now splits `apply_one` into
+  `apply_one_at(op, now_rfc3339)` + a wall-clock wrapper. The single
+  `chrono::Utc::now()` (line 286) was the only wasm panic; the Worker passes
+  `crate::store::now_iso()`. `WriteOutcome` gained `since` + `blocks_car` so the
+  Worker can feed the sequencer without re-decoding.
+- Handlers in `handlers.rs` (`repo_write` + `commit_op`): bearer → DID (must
+  equal body `repo`), validates via `repo::util`, loads `{did}#signing` like the
+  AppView proxy, applies one signed commit. `putRecord` picks Create/Update by an
+  MST existence check; `deleteRecord` is idempotent (NoOp when absent).
+- Routed in `durable.rs::apply_write`; front Worker routes writes by bearer
+  `sub` (added to the `is_auth` set in `lib.rs`).
+- **Follow-ups:** `applyWrites` not implemented (loop `apply_one` per write, as
+  the server does — each is its own commit). Per-DID write serialisation: each
+  write builds a fresh `RepoWriter` with its own lock; if a single DO ever
+  processes two writes concurrently they could fork history. Fine for a personal
+  PDS; add a DO-held lock if it matters.
 
-### 2. On commit, POST to the sequencer `/enqueue`
-- After `commit_blocks` returns the local seq, hand the commit fields (repo,
-  commit CID, rev, since, blocks CAR, ops) to the sequencer DO `/enqueue`. The
-  sequencer already assigns the global seq, encodes the `#commit` frame, logs,
-  and broadcasts — this replaces the admin `firehose-inject` stand-in.
+### 2. On commit, POST to the sequencer `/enqueue` — DONE
+- `durable.rs::enqueue_to_sequencer` POSTs the `EnqueueReq`-shaped payload
+  (`enqueue_payload` in `handlers.rs`) to the sequencer DO. Best-effort: a failed
+  enqueue is logged, not surfaced — the commit already stands and this DO's
+  `repo_seq` retains the event.
 
-### 3. Heavy repo reads: `getRecord`, `listRecords`, `sync.getRepo` (CAR)
-- Routing already exists (data-plane). Implement the handlers in the DO reusing
-  `stelyph-core` MST walk + `Repository::open` over `DoStore` (a `BlockStore`).
-- `getRecord`: MST lookup of `{collection}/{rkey}` → read block → dag-cbor →
-  JSON. `getRepo`: CAR export.
+### 3. Heavy repo reads — `getRecord` DONE; `listRecords` / `sync.getRepo` TODO
+- `getRecord` implemented (`handlers.rs::get_record` + `lookup_record_cid`,
+  routed in `durable.rs`; already in the front Worker's `REPO_SCOPED` list).
+  MST lookup → read block → dag-cbor → JSON.
+- **Still TODO:** `listRecords` (MST prefix walk), `sync.getRepo` (CAR export),
+  `sync.getLatestCommit`, `sync.getBlob` / `listBlobs`. Routing already exists.
 
-After 1–3, a Bluesky account on this PDS can post, and the firehose carries real
-commits that a relay can crawl → the account becomes fully visible network-wide.
+### Next: deploy + verify + federate
+- `wrangler deploy`, then post from a real Bluesky client against
+  `pds.spirallex.com` and read it back via `getRecord`.
+- Watch the firehose: a subscriber on `subscribeRepos` should see the real
+  `#commit` with actual CAR blocks (not the empty-blocks admin inject).
+- Then `requestCrawl` to `bsky.network` so the account federates.
 
 ## Secondary / cleanup
 

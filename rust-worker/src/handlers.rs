@@ -810,6 +810,367 @@ pub async fn delete_account(store: &DoStore) -> Result<Response> {
     }))
 }
 
+// ---------------------------------------------------------------------------
+// Repo writes — createRecord / putRecord / deleteRecord
+// ---------------------------------------------------------------------------
+// The write path reuses `stelyph-core`'s `RepoWriter::apply_one_at` verbatim,
+// against the same `DoStore` every other handler uses. `apply_one_at` (rather
+// than `apply_one`) is what makes this wasm-safe: the wall-clock read that would
+// panic on wasm32 is supplied by the caller from `worker::Date::now()`.
+//
+// A commit here does two things: it lands atomically in this account's own
+// Durable Object (blocks + repo_seq row + root pointer, one transaction), and it
+// must also reach the PDS-wide firehose. The firehose lives in a *separate*
+// sequencer DO, so the in-process broadcast `RepoWriter` publishes to has no
+// subscribers here; instead this handler returns an [`EnqueuePayload`] and the
+// Durable Object POSTs it to the sequencer. See [`WriteResult`].
+
+use stelyph_core::repo::writer::{RepoWriter, WriteOp, WriteOutcome};
+
+/// Which repo write is being applied. `putRecord` resolves to Create or Update
+/// at apply time depending on whether the record already exists.
+pub enum WriteKind {
+    Create,
+    Put,
+    Delete,
+}
+
+/// The outcome of a repo write, as the Durable Object needs to act on it.
+///
+/// `Committed` carries both the client's XRPC response and the payload to hand
+/// the sequencer — the DO enqueues the latter, then returns the former.
+pub enum WriteResult {
+    Committed {
+        client: serde_json::Value,
+        /// JSON body for the sequencer's `/enqueue`, shaped as its `EnqueueReq`.
+        enqueue: serde_json::Value,
+    },
+    /// A committed-nothing success: an idempotent `deleteRecord` of a record that
+    /// was already absent. No firehose event, so nothing to enqueue.
+    NoOp { client: serde_json::Value },
+    Error {
+        status: u16,
+        error: &'static str,
+        message: String,
+    },
+}
+
+/// Apply one repo write to this account's repo.
+///
+/// Authenticates the bearer token, validates the request against the lexicon
+/// rules `stelyph-core` already enforces, applies the signed commit, and reports
+/// what the Durable Object must do next via [`WriteResult`].
+pub async fn repo_write(
+    store: DoStore,
+    bearer: Option<&str>,
+    jwt_secret: &[u8],
+    passphrase: &[u8],
+    kind: WriteKind,
+    body: &str,
+) -> Result<WriteResult> {
+    use stelyph_core::auth::jwt::decode_jwt;
+    use stelyph_core::repo::util::{
+        json_value_to_ipld, tid_from_micros, validate_collection, validate_rkey,
+    };
+
+    // Resolve and authorize the caller.
+    let Some(did) = bearer
+        .and_then(|t| decode_jwt(t, jwt_secret).ok())
+        .map(|c| c.sub)
+    else {
+        return Ok(WriteResult::Error {
+            status: 401,
+            error: "AuthenticationRequired",
+            message: "Invalid token.".into(),
+        });
+    };
+
+    let v: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => {
+            return Ok(WriteResult::Error {
+                status: 400,
+                error: "InvalidRequest",
+                message: "Body is not valid JSON.".into(),
+            })
+        }
+    };
+
+    // `repo` must name the authenticated account. The front Worker routed here by
+    // the token's `sub`, so a mismatch is a malformed or cross-account request.
+    if v["repo"].as_str() != Some(did.as_str()) {
+        return Ok(WriteResult::Error {
+            status: 400,
+            error: "InvalidRequest",
+            message: "repo must match the authenticated DID.".into(),
+        });
+    }
+
+    let Some(collection) = v["collection"].as_str().map(str::to_owned) else {
+        return Ok(WriteResult::Error {
+            status: 400,
+            error: "InvalidRequest",
+            message: "collection is required.".into(),
+        });
+    };
+    if let Err(msg) = validate_collection(&collection) {
+        return Ok(WriteResult::Error {
+            status: 400,
+            error: "InvalidRequest",
+            message: msg,
+        });
+    }
+
+    // createRecord may mint an rkey (TID); put/delete require one. Any supplied
+    // rkey is validated.
+    let rkey = match v["rkey"].as_str() {
+        Some(rk) => {
+            if let Err(msg) = validate_rkey(rk) {
+                return Ok(WriteResult::Error {
+                    status: 400,
+                    error: "InvalidRequest",
+                    message: msg,
+                });
+            }
+            rk.to_owned()
+        }
+        None => match kind {
+            WriteKind::Create => tid_from_micros(worker::Date::now().as_millis() * 1000),
+            WriteKind::Put | WriteKind::Delete => {
+                return Ok(WriteResult::Error {
+                    status: 400,
+                    error: "InvalidRequest",
+                    message: "rkey is required.".into(),
+                })
+            }
+        },
+    };
+    let mst_key = format!("{collection}/{rkey}");
+
+    // Build the write op. Create/Put carry the record; Delete resolves to a no-op
+    // when the key is already absent (idempotent, as the lexicon specifies).
+    let op = match kind {
+        WriteKind::Create | WriteKind::Put => {
+            let record = v["record"].clone();
+            if record.is_null() {
+                return Ok(WriteResult::Error {
+                    status: 400,
+                    error: "InvalidRequest",
+                    message: "record is required.".into(),
+                });
+            }
+            let ipld = match json_value_to_ipld(record) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(WriteResult::Error {
+                        status: 400,
+                        error: "InvalidRequest",
+                        message: "record could not be encoded.".into(),
+                    })
+                }
+            };
+            match kind {
+                // putRecord is create-or-update: pick the op by whether the key
+                // already resolves in the MST.
+                WriteKind::Put => {
+                    let exists = record_exists(&store, &did, &mst_key).await?;
+                    if exists {
+                        WriteOp::Update {
+                            key: mst_key.clone(),
+                            record: ipld,
+                        }
+                    } else {
+                        WriteOp::Create {
+                            key: mst_key.clone(),
+                            record: ipld,
+                        }
+                    }
+                }
+                _ => WriteOp::Create {
+                    key: mst_key.clone(),
+                    record: ipld,
+                },
+            }
+        }
+        WriteKind::Delete => {
+            if !record_exists(&store, &did, &mst_key).await? {
+                // Idempotent: deleting an absent record succeeds with no commit.
+                return Ok(WriteResult::NoOp {
+                    client: serde_json::json!({}),
+                });
+            }
+            WriteOp::Delete {
+                key: mst_key.clone(),
+            }
+        }
+    };
+
+    // Apply the commit through the shared writer.
+    let outcome = match commit_op(store, &did, passphrase, op).await {
+        Ok(o) => o,
+        Err(e) => {
+            return Ok(WriteResult::Error {
+                status: 500,
+                error: "InternalServerError",
+                message: format!("write failed: {e}"),
+            })
+        }
+    };
+
+    let client = match kind {
+        WriteKind::Create => serde_json::json!({
+            "uri": format!("at://{did}/{mst_key}"),
+            "cid": outcome.record_cid.map(|c| c.to_string()).unwrap_or_default(),
+        }),
+        WriteKind::Put => serde_json::json!({
+            "uri": format!("at://{did}/{mst_key}"),
+            "cid": outcome.record_cid.map(|c| c.to_string()).unwrap_or_default(),
+            "commit": { "cid": outcome.commit_cid.to_string(), "rev": outcome.rev },
+        }),
+        WriteKind::Delete => serde_json::json!({
+            "commit": { "cid": outcome.commit_cid.to_string(), "rev": outcome.rev },
+        }),
+    };
+
+    Ok(WriteResult::Committed {
+        client,
+        enqueue: enqueue_payload(&did, &outcome),
+    })
+}
+
+/// The record CID at `mst_key` (`collection/rkey`), or `None` if the repo has no
+/// commits yet or the key is absent.
+///
+/// Opens the repo read-only from the stored root and walks the MST — the shared
+/// core of both the put/delete existence check and the `getRecord` read.
+async fn lookup_record_cid(store: &DoStore, did: &str, mst_key: &str) -> Result<Option<cid::Cid>> {
+    use atrium_repo::blockstore::DiffBlockStore;
+    use atrium_repo::Repository;
+    use std::sync::Arc;
+    use stelyph_core::storage::{BlockStoreAdapter, StorageBackend};
+
+    let store_arc: Arc<dyn StorageBackend> = Arc::new(store.clone());
+    let root = match store_arc
+        .load_repo_root(did)
+        .await
+        .map_err(|e| Error::RustError(format!("load repo root: {e}")))?
+    {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let mut diff = DiffBlockStore::wrap(BlockStoreAdapter::new(store_arc));
+    let mut repo = Repository::open(&mut diff, root)
+        .await
+        .map_err(|e| Error::RustError(format!("open repo: {e}")))?;
+    let mut tree = repo.tree();
+    tree.get(mst_key)
+        .await
+        .map_err(|e| Error::RustError(format!("MST get: {e}")))
+}
+
+/// Whether `mst_key` resolves to a record in this repo.
+async fn record_exists(store: &DoStore, did: &str, mst_key: &str) -> Result<bool> {
+    Ok(lookup_record_cid(store, did, mst_key).await?.is_some())
+}
+
+/// `GET /xrpc/com.atproto.repo.getRecord` — public read of one record.
+///
+/// The front Worker routed here by the `repo` param, so this DO holds the target
+/// account; the record is looked up by `collection/rkey` in its MST. Returns the
+/// decoded record `value` alongside its `uri` and `cid`, matching the lexicon.
+pub async fn get_record(store: &DoStore, collection: &str, rkey: &str) -> Result<Response> {
+    use stelyph_core::storage::BlockStore;
+
+    let account = store
+        .list_accounts()
+        .await
+        .map_err(|e| Error::RustError(format!("list accounts: {e}")))?
+        .into_iter()
+        .next();
+    let Some(account) = account else {
+        return json_err(404, "RepoNotFound", "No account on this host.");
+    };
+    let did = account.did;
+    let mst_key = format!("{collection}/{rkey}");
+
+    let cid = match lookup_record_cid(store, &did, &mst_key).await? {
+        Some(c) => c,
+        None => return json_err(404, "RecordNotFound", "Could not locate record."),
+    };
+    let bytes = store
+        .read_block_bytes(cid)
+        .await
+        .map_err(|e| Error::RustError(format!("read record block: {e}")))?;
+    let value: serde_json::Value = serde_ipld_dagcbor::from_slice(&bytes)
+        .map_err(|e| Error::RustError(format!("decode record: {e}")))?;
+
+    Response::from_json(&serde_json::json!({
+        "uri": format!("at://{did}/{mst_key}"),
+        "cid": cid.to_string(),
+        "value": value,
+    }))
+}
+
+/// Build a `RepoWriter` over the account's signing key and apply one op.
+///
+/// The broadcast sender is a throwaway: on this host the firehose is a separate
+/// Durable Object fed via the enqueue path, so the writer's in-process publish
+/// has no subscribers and is discarded. The commit itself — blocks, repo_seq
+/// row, root pointer — still lands atomically in this DO's storage.
+async fn commit_op(
+    store: DoStore,
+    did: &str,
+    passphrase: &[u8],
+    op: WriteOp,
+) -> Result<WriteOutcome> {
+    use atrium_api::types::string::Did;
+    use atrium_crypto::keypair::Secp256k1Keypair;
+    use std::str::FromStr;
+    use std::sync::Arc;
+    use stelyph_core::storage::{crypto, StorageBackend};
+
+    let store_arc: Arc<DoStore> = Arc::new(store);
+    let scalar = crypto::load_key(store_arc.as_ref(), &format!("{did}#signing"), passphrase)
+        .await
+        .map_err(|e| Error::RustError(format!("load signing key: {e}")))?;
+    let key = Secp256k1Keypair::import(&scalar)
+        .map_err(|e| Error::RustError(format!("import signing key: {e}")))?;
+    let did_typed =
+        Did::from_str(did).map_err(|e| Error::RustError(format!("bad account did: {e}")))?;
+
+    // No subscribers on this host (see the doc comment); capacity 1 is enough for
+    // the single send `apply_one_at` makes before we drop the receiver.
+    let (tx, _rx) = tokio::sync::broadcast::channel(1);
+    let store_dyn: Arc<dyn StorageBackend> = store_arc;
+    let writer = RepoWriter::new(store_dyn, key, did_typed, tx);
+
+    writer
+        .apply_one_at(op, crate::store::now_iso())
+        .await
+        .map_err(|e| Error::RustError(format!("apply commit: {e}")))
+}
+
+/// Shape a committed write into the sequencer's `/enqueue` request body.
+///
+/// The sequencer assigns the PDS-wide `seq` and re-encodes the `#commit` frame;
+/// everything else it needs — repo, commit CID, rev, `since`, the CAR blocks, and
+/// the single op — comes from the [`WriteOutcome`].
+fn enqueue_payload(did: &str, outcome: &WriteOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "repo": did,
+        "commit": outcome.commit_cid.to_string(),
+        "rev": outcome.rev,
+        "since": outcome.since,
+        "blocks_b64": data_encoding::BASE64.encode(&outcome.blocks_car),
+        "ops": [{
+            "action": outcome.action,
+            "path": outcome.key,
+            "cid": outcome.record_cid.map(|c| c.to_string()),
+        }],
+        "too_big": false,
+    })
+}
+
 /// A JSON error body with an HTTP status, matching the app-facing error shape.
 fn json_err(status: u16, error: &str, message: &str) -> Result<Response> {
     Ok(Response::from_json(&serde_json::json!({

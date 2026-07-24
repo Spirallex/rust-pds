@@ -27,8 +27,9 @@ use worker::*;
 const PDS_BINDING: &str = "PDS";
 /// Registry Durable Object binding.
 const REGISTRY_BINDING: &str = "REGISTRY";
-/// Firehose sequencer Durable Object binding.
-const SEQUENCER_BINDING: &str = "SEQUENCER";
+/// Firehose sequencer Durable Object binding. `pub(crate)` so an account DO can
+/// reach the sequencer to enqueue its commits (see `durable.rs`).
+pub(crate) const SEQUENCER_BINDING: &str = "SEQUENCER";
 
 #[event(start)]
 fn start() {
@@ -237,6 +238,13 @@ async fn dispatch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpRespo
             "/xrpc/com.atproto.server.getSession"
                 | "/xrpc/app.bsky.actor.getPreferences"
                 | "/xrpc/app.bsky.actor.putPreferences"
+                // Repo writes: authenticated per-account, and the target account
+                // is the bearer token's `sub`. The `repo` in the body must match
+                // it (the DO re-checks), but routing keys off the token here so
+                // the shared host need not read the body to pick a destination.
+                | "/xrpc/com.atproto.repo.createRecord"
+                | "/xrpc/com.atproto.repo.putRecord"
+                | "/xrpc/com.atproto.repo.deleteRecord"
         ) || auth_route.starts_with("/xrpc/app.bsky.")
             || auth_route.starts_with("/xrpc/chat.bsky.");
         if is_auth {
