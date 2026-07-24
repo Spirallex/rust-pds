@@ -157,12 +157,15 @@ fn signup_host(env: &Env) -> Option<String> {
 
 /// Whether this host serves the registration surface.
 ///
-/// `*.workers.dev` is always included: it is the only hostname that works before
-/// the wildcard DNS record and its certificate exist, which makes it the one
-/// place the flow can be smoke-tested.
+/// Three hosts qualify:
+///   - the zone suffix itself (`pds.spirallex.com`) — the natural landing page,
+///     served here once its route points at this Worker;
+///   - the configured `PDS_SIGNUP_HOST` (e.g. `signup.pds.spirallex.com`), kept
+///     working so existing clients are not broken by the landing page moving;
+///   - `*.workers.dev`, the only host that works before any custom DNS/cert,
+///     which makes it the one place the flow can always be smoke-tested.
 fn is_signup_host(host: &str, zone_suffix: &str, configured: Option<&str>) -> bool {
-    let expected = configured.unwrap_or(zone_suffix);
-    host == expected || host.ends_with(".workers.dev")
+    host == zone_suffix || configured == Some(host) || host.ends_with(".workers.dev")
 }
 
 /// Drain a request body into a string.
