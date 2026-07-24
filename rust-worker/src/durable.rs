@@ -159,6 +159,10 @@ impl PdsDurableObject {
                 let store = self.store()?;
                 h::signin_poll(&store, &request_id).await
             }
+            "/oauth/signin/pending" => {
+                let store = self.store()?;
+                h::signin_pending(&store).await
+            }
             "/oauth/device/approve" => {
                 let b: DeviceDecisionInput = req.json().await?;
                 let sig = decode_b64(&b.signature)?;

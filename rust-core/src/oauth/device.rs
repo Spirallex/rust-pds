@@ -110,4 +110,24 @@ mod tests {
         assert!(!verify_approval(&key.did(), "req-123", "WXYZ-1234", &[0u8; 64]));
         assert!(!verify_approval(&key.did(), "req-123", "WXYZ-1234", &[]));
     }
+
+    /// iOS enrolls a P-256 device key (Secure Enclave / CryptoKit), so the
+    /// approval path must verify `did:key:zDna…` too — not only the secp256k1
+    /// keys the Rust signing helper produces. This mirrors exactly what the app
+    /// sends: a P-256 `did:key` and a 64-byte compact low-S signature.
+    #[test]
+    fn a_p256_device_key_approves() {
+        use atrium_crypto::keypair::P256Keypair;
+        let key = P256Keypair::create(&mut OsRng);
+        let did_key = key.did();
+        assert!(did_key.starts_with("did:key:zDn"), "P-256 did:key prefix");
+        // `sign` already yields a compact, low-S signature — the same shape the
+        // Swift side must normalize CryptoKit's output into.
+        let sig = key
+            .sign(&approval_challenge("req-p256", "ABCD-5678"))
+            .unwrap();
+        assert_eq!(sig.len(), 64, "compact r||s");
+        assert!(verify_approval(&did_key, "req-p256", "ABCD-5678", &sig));
+        assert!(!verify_approval(&did_key, "req-p256", "WRONG-0000", &sig));
+    }
 }

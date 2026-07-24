@@ -403,6 +403,17 @@ pub struct SigninRow {
     pub expires_at: i64,
 }
 
+/// A pending sign-in as the *approving phone* sees it — enough to show who is
+/// asking and to approve it, but none of the issued session (which only the
+/// requesting client polls for).
+#[derive(Deserialize, serde::Serialize)]
+pub struct PendingSignin {
+    pub request_id: String,
+    pub user_code: String,
+    pub client_name: String,
+    pub created_at: String,
+}
+
 impl DoStore {
     /// Enrol a device public key. `device_id` is caller-generated (random).
     pub fn register_device(
@@ -450,6 +461,20 @@ impl DoStore {
                 i(expires_at as i64),
             ],
         )
+    }
+
+    /// Pending, unexpired sign-in requests for this account — what the phone
+    /// polls to show "someone is trying to sign in". Newest first.
+    pub fn list_pending_signins(&self, now: u64) -> Result<Vec<PendingSignin>, StorageError> {
+        self.exec(
+            "SELECT request_id, user_code, client_name, created_at \
+             FROM signin_requests \
+             WHERE status = 'pending' AND expires_at > ? \
+             ORDER BY created_at DESC",
+            vec![i(now as i64)],
+        )?
+        .to_array()
+        .map_err(sql_err)
     }
 
     /// Fetch a sign-in request by id.

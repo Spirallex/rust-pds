@@ -371,6 +371,18 @@ pub async fn signin_start(store: &DoStore, client_name: &str) -> Result<Response
     }))
 }
 
+/// `GET /oauth/signin/pending` — the approving phone lists requests to approve.
+///
+/// Served from the account's own DO, so it is already scoped to that account.
+/// Returns only what the approver needs to decide; the issued session is never
+/// here — that goes only to the client that polls `signin/poll`.
+pub async fn signin_pending(store: &DoStore) -> Result<Response> {
+    let pending = store
+        .list_pending_signins(now_unix())
+        .map_err(|e| Error::RustError(format!("list pending: {e}")))?;
+    Response::from_json(&serde_json::json!({ "pending": pending }))
+}
+
 /// `GET /oauth/signin/poll?requestId=…` — the client waits here.
 pub async fn signin_poll(store: &DoStore, request_id: &str) -> Result<Response> {
     let Some(row) = store
