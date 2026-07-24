@@ -1,0 +1,124 @@
+name = "stelyph-pds"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-07-01"
+account_id = "9a497744238ab16a1060dc3ae8abd102"
+
+# One Worker serves every PDS on the zone. `*.pds.spirallex.net` is deliberately
+# a different zone from spirallex.com, which carries a catch-all persona Worker
+# route (`*.spirallex.com/*`) that would otherwise shadow this one.
+# Worker ROUTES are deliberately NOT declared here.
+#
+# The Cloudflare estate is Pulumi-managed (IdeaProjects/cloudflare), where the
+# split is: wrangler owns the script and its bindings; Pulumi owns routes, DNS,
+# and R2 buckets. Declaring routes here as well would make `wrangler deploy` and
+# `pulumi up` fight over the same resource, and in that repo drift is a bug.
+#
+# Routes, DNS, and the TLS certificate live in
+# src/accounts/primary/stelyph-pds.ts.
+#
+# Also publish on workers.dev. The custom route serves traffic only once BOTH a
+# proxied wildcard DNS record for *.pds.spirallex.net and an ACM advanced
+# certificate carrying that SAN exist — Universal SSL covers only one label, so
+# without the certificate the route matches and the handshake then fails. Both
+# are Pulumi's to create. This gives a reachable URL for smoke-testing in the
+# meantime, and it is the only URL that works if the certificate lapses.
+workers_dev = true
+
+[build]
+# worker-build must match the `worker` crate's wasm-bindgen requirement — a
+# mismatch fails at the bindgen step with an opaque schema-version error, so the
+# version is pinned to the crate's.
+command = "cargo install -q worker-build --version ^0.8 && worker-build --release"
+
+# --- Durable Objects -------------------------------------------------------
+#
+# One instance per PDS hostname. It is the single writer for that repo, which is
+# what makes `seq` monotonic and the root pointer safe to compare-and-swap — a
+# guarantee no amount of care in a fan-out of stateless isolates can provide.
+#
+# REGISTRY is a single instance for the whole deployment, holding claimed labels
+# and invite codes. It exists because the per-hostname objects cannot gate their
+# own creation: an unclaimed hostname resolves to an empty object, so a
+# first-account check inside one would pass for every registration. See
+# registry.rs.
+# SEQUENCER is a single instance for the whole deployment: the firehose merge
+# point. Every account's repo events flow through it to get one PDS-wide
+# monotonic `seq`, and relays subscribe to it. See sequencer.rs.
+[durable_objects]
+bindings = [
+  { name = "PDS", class_name = "PdsDurableObject" },
+  { name = "REGISTRY", class_name = "RegistryDurableObject" },
+  { name = "SEQUENCER", class_name = "SequencerDurableObject" },
+]
+
+[[migrations]]
+tag = "v1"
+# `new_sqlite_classes`, not `new_classes`: the SQLite-backed storage engine is
+# what lets the existing schema port over more or less intact, and it is the
+# only backend with a real transaction.
+new_sqlite_classes = ["PdsDurableObject"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["RegistryDurableObject"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["SequencerDurableObject"]
+
+# --- R2 --------------------------------------------------------------------
+#
+# Blobs (avatars, images, video) and cold CAR chunks. Both are large, immutable,
+# and content-addressed, which is exactly what R2 is good at — and exactly what
+# would be wasteful to keep in the DO's SQLite.
+[[r2_buckets]]
+binding = "BLOBS"
+bucket_name = "stelyph-pds-blobs"
+
+[vars]
+# The suffix new handles are created under, advertised as `availableUserDomains`
+# by com.atproto.server.describeServer. This is a real production value, not a
+# local-dev fallback — it is what clients read to decide what a new handle may
+# end in. The issuer and did:web are a separate matter: those come per-request
+# from the Host header, so this value does not determine which PDS is served.
+#
+# Second-level on purpose, and on .com rather than .net. Universal SSL stops at
+# one label, so `<label>.pds.<zone>` needs ACM either way — and spirallex.com
+# already has ACM with Total TLS enabled, while spirallex.net would have to buy
+# it. Total TLS issues the `*.pds.spirallex.com` certificate automatically from
+# the proxied wildcard DNS record; nothing orders it explicitly. If Total TLS is
+# ever turned off on that zone, every account here fails at the handshake.
+#
+# The DNS record and Worker route are declared in the Pulumi estate
+# (IdeaProjects/cloudflare, src/accounts/primary/stelyph-pds.ts).
+PDS_ZONE_SUFFIX = "pds.spirallex.com"
+
+# Where the registration page and createAccount are served.
+#
+# NOT the bare zone suffix. `pds.spirallex.com` already runs Statusphere on a
+# `pds.spirallex.com/` route, and taking it would displace a live app. This host
+# sits under `*.pds.spirallex.com`, so it is covered by the same wildcard
+# certificate and the same Worker route and needs no infrastructure of its own.
+#
+# It can never collide with an account: `signup` is in the reserved-label list in
+# register.rs, so nobody can claim it as a handle.
+PDS_SIGNUP_HOST = "signup.pds.spirallex.com"
+
+# Open registration: anyone reaching the signup host may create an account with
+# no invite code. On because the iOS app offers cloud hosting as a one-tap
+# option and cannot carry an operator credential to mint invites. The registry
+# still reserves each label, so handles stay unique; only the invite gate is
+# lifted. describeServer reflects this as `inviteCodeRequired: false`. Set to
+# anything other than "true" (or unset) to put the gate back.
+PDS_OPEN_REGISTRATION = "true"
+
+# Secrets (set with `wrangler secret put`, never in this file):
+#   PDS_JWT_SECRET       HMAC secret for legacy session JWTs; also the seed for
+#                        the derived DPoP nonce secret.
+#   PDS_KEY_PASSPHRASE   argon2id passphrase wrapping every signing key at rest.
+
+[dev]
+port = 8787
+
+[observability]
+enabled = true

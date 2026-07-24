@@ -1,5 +1,8 @@
 [workspace]
 members = ["rust-core", "rust-pds"]
+# wasm32-only; building it for the host (as `cargo test --workspace` would)
+# cannot work, so it is excluded and built via its own manifest.
+exclude = ["rust-worker"]
 resolver = "2"
 
 [workspace.dependencies]

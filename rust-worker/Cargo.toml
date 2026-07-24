@@ -1,0 +1,59 @@
+[package]
+name = "stelyph-worker"
+version = "0.1.0-alpha.3"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+description = "AT Protocol PDS on Cloudflare Workers: R2 + Durable Object storage behind stelyph-core."
+repository = "https://github.com/Spirallex/rust-pds"
+publish = false
+
+# Deliberately NOT a member of the root workspace: this crate only builds for
+# wasm32, and `cargo test --workspace` (what CI runs) would try to build it for
+# the host and fail. The root Cargo.toml lists it under `exclude`.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# `no-default-features` drops the SQLite backend and its bundled C library,
+# which cannot link on wasm32. `lean-auth` drops argon2id from 19 MiB to 4 MiB:
+# a Workers isolate is single-threaded, so the KDF runs inline and occupies the
+# isolate for its whole duration (see stelyph_core::task).
+stelyph-core = { path = "../rust-core", default-features = false, features = ["lean-auth"] }
+
+worker = { version = "0.8", features = ["http", "d1"] }
+worker-macros = { version = "0.8", features = ["http"] }
+http = "1"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+
+async-trait = "0.1"
+# `CoreError::Internal` wraps an `anyhow::Error`, so constructing one needs the
+# crate by name even though nothing here uses it for its own error handling.
+anyhow = "1"
+# `worker::Body` is a `Stream`, not a buffered body — reading a POST body means
+# draining it chunk by chunk.
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# DO SQLite hands BLOB columns back as a serde *byte array*, not a sequence, so
+# a plain Vec<u8> field fails to deserialize with "invalid type: byte array".
+serde_bytes = "0.11"
+cid = "0.11"
+# base32/base64 for opaque sign-in tokens and the approval challenge.
+data-encoding = "2"
+atrium-crypto = "0.1.3"
+atrium-api = "0.25.8"
+rand = "0.8"
+tokio = { version = "1", features = ["sync"] }
+
+[profile.release]
+# Workers bundles are size-capped (10 MB compressed on paid). `opt-level = "s"`
+# plus fat LTO and a single codegen unit is what keeps the .wasm small; `panic
+# = abort` drops the unwinding tables, which are dead weight in an isolate that
+# cannot catch a panic anyway.
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
