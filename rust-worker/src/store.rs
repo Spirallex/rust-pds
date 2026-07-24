@@ -527,6 +527,22 @@ impl DoStore {
         )
     }
 
+    /// The stored argon2 PHC string for an account, for password login.
+    pub async fn account_password_phc(&self, did: &str) -> Result<Option<String>, StorageError> {
+        #[derive(Deserialize)]
+        struct Row {
+            password_argon2: String,
+        }
+        let rows: Vec<Row> = self
+            .exec(
+                "SELECT password_argon2 FROM accounts WHERE did = ?",
+                vec![s(did)],
+            )?
+            .to_array()
+            .map_err(sql_err)?;
+        Ok(rows.into_iter().next().map(|r| r.password_argon2))
+    }
+
     /// Erase the account this Durable Object holds: the account row, its two
     /// signing keys, preferences, repo root, and any enrolled devices. Blocks and
     /// blob metadata are cleared too so a reused hostname starts genuinely empty.

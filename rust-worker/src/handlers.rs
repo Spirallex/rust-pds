@@ -371,6 +371,112 @@ pub async fn signin_start(store: &DoStore, client_name: &str) -> Result<Response
     }))
 }
 
+/// `POST /xrpc/com.atproto.server.createSession` — password login.
+///
+/// The legacy session path Bluesky uses: `identifier` (handle or DID) +
+/// `password` → access + refresh JWTs. Served from the account's own DO (the
+/// front Worker routes it by `identifier`), so this DO checks the one account it
+/// holds. The identifier is accepted whether it is the handle or the DID.
+pub async fn create_session(
+    store: &DoStore,
+    identifier: &str,
+    password: &str,
+    jwt_secret: &[u8],
+) -> Result<Response> {
+    use stelyph_core::auth::jwt::{encode_access_jwt_at, encode_refresh_jwt_at, verify_password};
+    use stelyph_core::storage::AccountStore;
+
+    let Some(account) = store
+        .list_accounts()
+        .await
+        .map_err(|e| Error::RustError(format!("list accounts: {e}")))?
+        .into_iter()
+        .next()
+    else {
+        return xrpc_err(
+            401,
+            "AuthenticationRequired",
+            "Invalid identifier or password.",
+        );
+    };
+    let did = account.did;
+    let handle = account.handle.clone().unwrap_or_default();
+
+    // The identifier must name this account (its handle or DID). Mismatch reads
+    // the same as a bad password — no oracle for which accounts exist.
+    let id = identifier.to_ascii_lowercase();
+    if id != handle.to_ascii_lowercase() && id != did.to_ascii_lowercase() {
+        return xrpc_err(
+            401,
+            "AuthenticationRequired",
+            "Invalid identifier or password.",
+        );
+    }
+
+    let phc = store
+        .account_password_phc(&did)
+        .await
+        .map_err(|e| Error::RustError(format!("load phc: {e}")))?;
+    let ok = phc
+        .as_deref()
+        .map(|p| verify_password(password, p).unwrap_or(false))
+        .unwrap_or(false);
+    if !ok {
+        return xrpc_err(
+            401,
+            "AuthenticationRequired",
+            "Invalid identifier or password.",
+        );
+    }
+
+    let now = worker::Date::now().as_millis() / 1000;
+    let access = encode_access_jwt_at(&did, jwt_secret, now)
+        .map_err(|e| Error::RustError(format!("access jwt: {e}")))?;
+    let refresh = encode_refresh_jwt_at(&did, jwt_secret, now)
+        .map_err(|e| Error::RustError(format!("refresh jwt: {e}")))?;
+
+    Response::from_json(&serde_json::json!({
+        "did": did,
+        "handle": handle,
+        "accessJwt": access,
+        "refreshJwt": refresh,
+        "active": true,
+    }))
+}
+
+/// `GET /xrpc/com.atproto.server.getSession` — who am I, from the bearer token.
+pub async fn get_session(
+    store: &DoStore,
+    bearer: Option<&str>,
+    jwt_secret: &[u8],
+) -> Result<Response> {
+    use stelyph_core::auth::jwt::decode_jwt;
+    use stelyph_core::storage::AccountStore;
+
+    let Some(token) = bearer else {
+        return xrpc_err(401, "AuthenticationRequired", "Missing bearer token.");
+    };
+    let Ok(claims) = decode_jwt(token, jwt_secret) else {
+        return xrpc_err(401, "AuthenticationRequired", "Invalid token.");
+    };
+    let handle = store
+        .get_handle_by_did(&claims.sub)
+        .await
+        .map_err(|e| Error::RustError(format!("handle lookup: {e}")))?
+        .unwrap_or_default();
+    Response::from_json(&serde_json::json!({
+        "did": claims.sub, "handle": handle, "active": true,
+    }))
+}
+
+/// XRPC-shaped error with a status code (createSession/getSession use it).
+fn xrpc_err(status: u16, error: &str, message: &str) -> Result<Response> {
+    Ok(
+        Response::from_json(&serde_json::json!({ "error": error, "message": message }))?
+            .with_status(status),
+    )
+}
+
 /// `GET /xrpc/com.atproto.repo.describeRepo` — public identity of the account
 /// this Durable Object holds.
 ///

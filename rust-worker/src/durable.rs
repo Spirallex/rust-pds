@@ -24,6 +24,12 @@ struct ProvisionInput {
 }
 
 #[derive(Deserialize)]
+struct CreateSessionInput {
+    identifier: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeviceRegisterInput {
     handle: String,
@@ -195,6 +201,20 @@ impl PdsDurableObject {
             "/xrpc/com.atproto.repo.describeRepo" => {
                 let store = self.store()?;
                 h::describe_repo(&store, &ctx, &hostname).await
+            }
+
+            "/xrpc/com.atproto.server.createSession" => {
+                let b: CreateSessionInput = req.json().await?;
+                let store = self.store()?;
+                h::create_session(&store, &b.identifier, &b.password, &self.jwt_secret()?).await
+            }
+            "/xrpc/com.atproto.server.getSession" => {
+                let bearer = req
+                    .headers()
+                    .get("authorization")?
+                    .and_then(|v| v.strip_prefix("Bearer ").map(|s| s.to_string()));
+                let store = self.store()?;
+                h::get_session(&store, bearer.as_deref(), &self.jwt_secret()?).await
             }
 
             // --- internal --------------------------------------------------

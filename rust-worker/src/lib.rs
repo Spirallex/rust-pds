@@ -38,7 +38,41 @@ fn start() {
 }
 
 #[event(fetch)]
-async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpResponse> {
+async fn fetch(req: HttpRequest, env: Env, ctx: Context) -> Result<HttpResponse> {
+    // CORS preflight: browser clients (bsky.app web) send an OPTIONS before any
+    // cross-origin XRPC call. Answer it here, before routing, or every call 404s
+    // at the preflight and never reaches the real endpoint.
+    if req.method() == http::Method::OPTIONS {
+        let mut r = http::Response::new(worker::Body::empty());
+        *r.status_mut() = http::StatusCode::NO_CONTENT;
+        add_cors(r.headers_mut());
+        return Ok(r);
+    }
+    let mut resp = dispatch(req, env, ctx).await?;
+    // Stamp CORS on every real response so the browser accepts it.
+    add_cors(resp.headers_mut());
+    Ok(resp)
+}
+
+/// Permissive CORS — atproto PDS endpoints are public reads and token-gated
+/// writes, so `*` is the standard posture (bsky.social answers the same).
+fn add_cors(h: &mut http::HeaderMap) {
+    use http::header::HeaderValue;
+    h.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+    h.insert(
+        "access-control-allow-methods",
+        HeaderValue::from_static("GET,POST,OPTIONS"),
+    );
+    h.insert(
+        "access-control-allow-headers",
+        HeaderValue::from_static(
+            "content-type,authorization,atproto-accept-labelers,atproto-proxy",
+        ),
+    );
+    h.insert("access-control-max-age", HeaderValue::from_static("86400"));
+}
+
+async fn dispatch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpResponse> {
     let host = req
         .headers()
         .get(http::header::HOST)
@@ -165,6 +199,48 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpResponse
         host.clone()
     };
 
+    // createSession on the shared host names its account in the body
+    // (`identifier`), not the Host. Read the body once, resolve the target, and
+    // reuse the same body when forwarding.
+    //
+    // `req` (and its body stream) can be consumed only once, so for any mutating
+    // method read the body here, up front, and reuse it below. The earlier
+    // WebSocket/GET paths returned already, so `req` is needed for nothing but
+    // its body from here on.
+    let mut target_host = target_host;
+    let prefetched_body: Option<String> = if matches!(
+        method,
+        http::Method::POST | http::Method::PUT | http::Method::PATCH
+    ) {
+        Some(read_body(req).await?)
+    } else {
+        None
+    };
+
+    // createSession on the shared host names its account in the body, not Host.
+    if host == zone_suffix
+        && method == http::Method::POST
+        && path
+            .split('?')
+            .next()
+            .unwrap_or("")
+            .ends_with("/xrpc/com.atproto.server.createSession")
+    {
+        if let Some(id) = prefetched_body
+            .as_deref()
+            .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+            .and_then(|v| {
+                v.get("identifier")
+                    .and_then(|i| i.as_str())
+                    .map(str::to_string)
+            })
+        {
+            if let Some(h) = session_target(&env, &id, &zone_suffix).await {
+                target_host = h;
+            }
+        }
+    }
+
     // --- forward to the target account's PDS -------------------------------
     let namespace = env.durable_object(PDS_BINDING)?;
     let stub = namespace.id_from_name(&target_host)?.get_stub()?;
@@ -194,18 +270,39 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpResponse
     init.with_headers(headers);
 
     // Forward the body too. Discovery is all GET, so this went unnoticed until
-    // there was a POST worth forwarding.
+    // there was a POST worth forwarding. If it was already read (createSession
+    // routing above), reuse it rather than draining the stream twice.
     if matches!(
         method,
         http::Method::POST | http::Method::PUT | http::Method::PATCH
     ) {
-        let body = read_body(req).await?;
-        init.with_body(Some(body.into()));
+        if let Some(body) = prefetched_body {
+            init.with_body(Some(body.into()));
+        }
     }
 
     let forwarded = Request::new_with_init(&url, &init)?;
     let resp = stub.fetch_with_request(forwarded).await?;
     resp.try_into()
+}
+
+/// The account hostname for a createSession `identifier` (handle or DID), on the
+/// shared host. Handle is the hostname; DID resolves via the registry.
+async fn session_target(env: &Env, identifier: &str, zone_suffix: &str) -> Option<String> {
+    let id = identifier.to_ascii_lowercase();
+    if id.starts_with("did:") {
+        let registry = registry_stub(env).ok()?;
+        let res = call_do(&registry, "/resolve-did", serde_json::json!({ "did": id }))
+            .await
+            .ok()?;
+        let label = res.get("label").and_then(|v| v.as_str())?;
+        Some(format!("{label}.{zone_suffix}"))
+    } else if id.ends_with(&format!(".{zone_suffix}")) {
+        Some(id)
+    } else {
+        // A bare handle label like "c91" — compose it under the zone.
+        Some(format!("{id}.{zone_suffix}"))
+    }
 }
 
 /// For a repo-scoped XRPC path on the shared host, the hostname of the account
