@@ -208,6 +208,14 @@ async fn dispatch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpRespo
     // WebSocket/GET paths returned already, so `req` is needed for nothing but
     // its body from here on.
     let mut target_host = target_host;
+    // Capture the bearer token before the body stream is consumed — auth'd
+    // endpoints on the shared host route by the token's account.
+    let bearer = req
+        .headers()
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string);
     let prefetched_body: Option<String> = if matches!(
         method,
         http::Method::POST | http::Method::PUT | http::Method::PATCH
@@ -216,6 +224,27 @@ async fn dispatch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpRespo
     } else {
         None
     };
+
+    // Authenticated per-account endpoints (getSession, get/putPreferences) carry
+    // no repo param — the account is the bearer token's `sub`. On the shared host
+    // decode the DID from the token (for routing only; the DO re-verifies the
+    // token, so an unverified DID just routes a bad token to a DO that rejects
+    // it) and resolve it to the account's hostname.
+    if host == zone_suffix {
+        let auth_route = path.split('?').next().unwrap_or("");
+        if matches!(
+            auth_route,
+            "/xrpc/com.atproto.server.getSession"
+                | "/xrpc/app.bsky.actor.getPreferences"
+                | "/xrpc/app.bsky.actor.putPreferences"
+        ) {
+            if let Some(did) = bearer.as_deref().and_then(jwt_sub) {
+                if let Some(h) = session_target(&env, &did, &zone_suffix).await {
+                    target_host = h;
+                }
+            }
+        }
+    }
 
     // createSession on the shared host names its account in the body, not Host.
     if host == zone_suffix
@@ -267,6 +296,12 @@ async fn dispatch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpRespo
     // identity, since the opaque forwarding URL has thrown it away.
     let headers = Headers::new();
     headers.set("X-Stelyph-Host", &target_host)?;
+    // Forward the bearer token, or authenticated endpoints (getSession,
+    // get/putPreferences) would reach the DO stripped of their credential and
+    // always 401. The opaque forwarding request otherwise carries no headers.
+    if let Some(b) = &bearer {
+        headers.set("authorization", &format!("Bearer {b}"))?;
+    }
     init.with_headers(headers);
 
     // Forward the body too. Discovery is all GET, so this went unnoticed until
@@ -284,6 +319,20 @@ async fn dispatch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpRespo
     let forwarded = Request::new_with_init(&url, &init)?;
     let resp = stub.fetch_with_request(forwarded).await?;
     resp.try_into()
+}
+
+/// The `sub` (DID) from a JWT payload, WITHOUT verifying the signature.
+///
+/// For routing only: the DO re-verifies the token, so a forged `sub` merely
+/// routes a bad token to a DO that rejects it. This avoids the front Worker
+/// needing the JWT secret just to pick a destination.
+fn jwt_sub(token: &str) -> Option<String> {
+    let payload_b64 = token.split('.').nth(1)?;
+    let bytes = data_encoding::BASE64URL_NOPAD
+        .decode(payload_b64.as_bytes())
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("sub").and_then(|s| s.as_str()).map(str::to_string)
 }
 
 /// The account hostname for a createSession `identifier` (handle or DID), on the

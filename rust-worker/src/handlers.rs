@@ -444,6 +444,63 @@ pub async fn create_session(
     }))
 }
 
+/// `GET /xrpc/app.bsky.actor.getPreferences` — the account's stored prefs.
+///
+/// Bearer-authenticated; the prefs are a private per-account JSON array (Bluesky
+/// stores birth date, content labels, feeds here). Returns `{preferences: []}`
+/// when none are set — a new account has none, which is correct, not an error.
+pub async fn get_preferences(
+    store: &DoStore,
+    bearer: Option<&str>,
+    jwt_secret: &[u8],
+) -> Result<Response> {
+    use stelyph_core::auth::jwt::decode_jwt;
+    let Some(did) = bearer
+        .and_then(|t| decode_jwt(t, jwt_secret).ok())
+        .map(|c| c.sub)
+    else {
+        return xrpc_err(401, "AuthenticationRequired", "Invalid token.");
+    };
+    let prefs = store
+        .get_preferences(&did)
+        .await
+        .map_err(|e| Error::RustError(format!("get prefs: {e}")))?;
+    // Stored value is the JSON array; wrap it as {preferences: [...]}.
+    let arr: serde_json::Value = prefs
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!([]));
+    Response::from_json(&serde_json::json!({ "preferences": arr }))
+}
+
+/// `POST /xrpc/app.bsky.actor.putPreferences` — replace the account's prefs.
+///
+/// This is the endpoint Bluesky's onboarding calls to save the birth date. The
+/// body is `{preferences: [...]}`; the array is stored verbatim.
+pub async fn put_preferences(
+    store: &DoStore,
+    bearer: Option<&str>,
+    jwt_secret: &[u8],
+    body: &str,
+) -> Result<Response> {
+    use stelyph_core::auth::jwt::decode_jwt;
+    let Some(did) = bearer
+        .and_then(|t| decode_jwt(t, jwt_secret).ok())
+        .map(|c| c.sub)
+    else {
+        return xrpc_err(401, "AuthenticationRequired", "Invalid token.");
+    };
+    let prefs = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("preferences").cloned())
+        .unwrap_or_else(|| serde_json::json!([]));
+    store
+        .upsert_preferences(&did, &prefs.to_string())
+        .await
+        .map_err(|e| Error::RustError(format!("put prefs: {e}")))?;
+    // putPreferences returns an empty 200 body.
+    Response::from_json(&serde_json::json!({}))
+}
+
 /// `GET /xrpc/com.atproto.server.getSession` — who am I, from the bearer token.
 pub async fn get_session(
     store: &DoStore,

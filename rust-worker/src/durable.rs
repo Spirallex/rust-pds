@@ -55,6 +55,14 @@ struct DeviceDecisionInput {
     signature: String,
 }
 
+/// The bearer token from an Authorization header, if present.
+fn bearer(req: &Request) -> Result<Option<String>> {
+    Ok(req
+        .headers()
+        .get("authorization")?
+        .and_then(|v| v.strip_prefix("Bearer ").map(|s| s.to_string())))
+}
+
 /// Decode a base64 approval signature, mapping a bad value to a 400 rather than
 /// a 500 — a malformed signature is a client error, not a server fault.
 fn decode_b64(s: &str) -> Result<Vec<u8>> {
@@ -209,12 +217,20 @@ impl PdsDurableObject {
                 h::create_session(&store, &b.identifier, &b.password, &self.jwt_secret()?).await
             }
             "/xrpc/com.atproto.server.getSession" => {
-                let bearer = req
-                    .headers()
-                    .get("authorization")?
-                    .and_then(|v| v.strip_prefix("Bearer ").map(|s| s.to_string()));
+                let bearer = bearer(&req)?;
                 let store = self.store()?;
                 h::get_session(&store, bearer.as_deref(), &self.jwt_secret()?).await
+            }
+            "/xrpc/app.bsky.actor.getPreferences" => {
+                let bearer = bearer(&req)?;
+                let store = self.store()?;
+                h::get_preferences(&store, bearer.as_deref(), &self.jwt_secret()?).await
+            }
+            "/xrpc/app.bsky.actor.putPreferences" => {
+                let bearer = bearer(&req)?;
+                let body = req.text().await?;
+                let store = self.store()?;
+                h::put_preferences(&store, bearer.as_deref(), &self.jwt_secret()?, &body).await
             }
 
             // --- internal --------------------------------------------------
