@@ -41,10 +41,14 @@ command = "cargo install -q worker-build --version ^0.8 && worker-build --releas
 # own creation: an unclaimed hostname resolves to an empty object, so a
 # first-account check inside one would pass for every registration. See
 # registry.rs.
+# SEQUENCER is a single instance for the whole deployment: the firehose merge
+# point. Every account's repo events flow through it to get one PDS-wide
+# monotonic `seq`, and relays subscribe to it. See sequencer.rs.
 [durable_objects]
 bindings = [
   { name = "PDS", class_name = "PdsDurableObject" },
   { name = "REGISTRY", class_name = "RegistryDurableObject" },
+  { name = "SEQUENCER", class_name = "SequencerDurableObject" },
 ]
 
 [[migrations]]
@@ -57,6 +61,10 @@ new_sqlite_classes = ["PdsDurableObject"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["RegistryDurableObject"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["SequencerDurableObject"]
 
 # --- R2 --------------------------------------------------------------------
 #

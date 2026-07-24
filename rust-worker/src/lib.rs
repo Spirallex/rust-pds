@@ -18,6 +18,7 @@ mod plc;
 mod register;
 mod registry;
 mod schema;
+mod sequencer;
 mod store;
 
 use worker::*;
@@ -26,6 +27,8 @@ use worker::*;
 const PDS_BINDING: &str = "PDS";
 /// Registry Durable Object binding.
 const REGISTRY_BINDING: &str = "REGISTRY";
+/// Firehose sequencer Durable Object binding.
+const SEQUENCER_BINDING: &str = "SEQUENCER";
 
 #[event(start)]
 fn start() {
@@ -104,8 +107,46 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpResponse
                     .await?
                     .try_into();
             }
+            (&http::Method::POST, "/_stelyph/admin/firehose-inject") => {
+                let token = req
+                    .headers()
+                    .get("x-stelyph-admin")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let body = read_body(req).await?;
+                return firehose_inject(&env, &token, &body).await?.try_into();
+            }
             _ => {}
         }
+    }
+
+    // --- firehose: one PDS-wide subscribeRepos, served by the sequencer ----
+    // Every account's events merge into a single ordered stream. A relay
+    // connects here (a WebSocket upgrade), and the request goes to the one
+    // sequencer DO regardless of which host it arrived on.
+    if path
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .ends_with("/xrpc/com.atproto.sync.subscribeRepos")
+    {
+        let stub = sequencer_stub(&env)?;
+        let url = format!("https://stelyph.internal{path}");
+        let mut init = RequestInit::new();
+        // Preserve the upgrade: forward the original request so the WebSocket
+        // handshake reaches the DO intact.
+        let headers = Headers::new();
+        if let Some(up) = req
+            .headers()
+            .get(http::header::UPGRADE)
+            .and_then(|v| v.to_str().ok())
+        {
+            headers.set("upgrade", up)?;
+        }
+        init.with_headers(headers);
+        let forwarded = Request::new_with_init(&url, &init)?;
+        return stub.fetch_with_request(forwarded).await?.try_into();
     }
 
     // --- repo-scoped data requests on the shared host ----------------------
@@ -296,6 +337,12 @@ fn registry_stub(env: &Env) -> Result<Stub> {
         .get_stub()
 }
 
+fn sequencer_stub(env: &Env) -> Result<Stub> {
+    env.durable_object(SEQUENCER_BINDING)?
+        .id_from_name(sequencer::SEQUENCER_DO_NAME)?
+        .get_stub()
+}
+
 /// POST a JSON body to a Durable Object stub and read the JSON back.
 async fn call_do(stub: &Stub, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
     let headers = Headers::new();
@@ -384,6 +431,28 @@ async fn mint_invite(env: &Env, presented: &str, body: &str) -> Result<Response>
     )
     .await?;
     Response::from_json(&serde_json::json!({ "ok": true, "code": req.code, "uses": req.uses }))
+}
+
+/// `POST /_stelyph/admin/firehose-inject` — push a synthetic commit into the
+/// sequencer, for verifying the firehose end to end.
+///
+/// A stand-in for the account-DO → sequencer path that will feed it for real
+/// once the write path (createRecord) lands on the Worker; the sequencer treats
+/// this identically. Admin-gated because it writes to the PDS-wide log.
+async fn firehose_inject(env: &Env, presented: &str, body: &str) -> Result<Response> {
+    let Ok(expected) = env.secret("PDS_ADMIN_TOKEN") else {
+        return json_error(503, "NotConfigured", "Admin actions are not configured.");
+    };
+    if !constant_time_eq(presented.as_bytes(), expected.to_string().as_bytes()) {
+        return json_error(401, "Unauthorized", "Not authorized.");
+    }
+    let payload: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return json_error(400, "InvalidRequest", "Malformed body."),
+    };
+    let stub = sequencer_stub(env)?;
+    let res = call_do(&stub, "/_test-inject", payload).await?;
+    Response::from_json(&res)
 }
 
 /// Compare two byte strings without an early exit.
