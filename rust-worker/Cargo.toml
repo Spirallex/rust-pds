@@ -43,6 +43,8 @@ serde_bytes = "0.11"
 cid = "0.11"
 # Decode stored record blocks (dag-cbor) back to JSON for getRecord.
 serde_ipld_dagcbor = "0.6"
+# CARv1 writer for sync.getRepo export. Pure Rust; already in-tree via core.
+iroh-car = "0.5.1"
 # base32/base64 for opaque sign-in tokens and the approval challenge.
 data-encoding = "2"
 atrium-crypto = "0.1.3"

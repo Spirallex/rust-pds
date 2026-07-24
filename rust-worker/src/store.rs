@@ -188,6 +188,11 @@ struct CidRow {
 }
 
 #[derive(Deserialize)]
+struct CidStrRow {
+    cid: String,
+}
+
+#[derive(Deserialize)]
 struct SeqRow {
     seq: i64,
     #[serde(with = "serde_bytes")]
@@ -854,6 +859,34 @@ impl KeyStore for DoStore {
 /// listed or deleted without touching another's.
 fn blob_key(did: &str, cid: &str) -> String {
     format!("{did}/{cid}")
+}
+
+impl DoStore {
+    /// The blob CIDs owned by `did`, in CID order, for `sync.listBlobs`.
+    ///
+    /// Reads the `blob_refs` metadata index rather than enumerating R2 — the
+    /// index is the authority on ownership, exactly as `get_blob` relies on.
+    /// `cursor` is exclusive: rows are returned with `cid > cursor`.
+    pub async fn list_blob_cids(
+        &self,
+        did: &str,
+        cursor: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>, StorageError> {
+        let rows: Vec<CidStrRow> = match cursor {
+            Some(c) => self.exec(
+                "SELECT cid FROM blob_refs WHERE did = ? AND cid > ? ORDER BY cid ASC LIMIT ?",
+                vec![s(did), s(c), i(limit)],
+            )?,
+            None => self.exec(
+                "SELECT cid FROM blob_refs WHERE did = ? ORDER BY cid ASC LIMIT ?",
+                vec![s(did), i(limit)],
+            )?,
+        }
+        .to_array()
+        .map_err(sql_err)?;
+        Ok(rows.into_iter().map(|r| r.cid).collect())
+    }
 }
 
 #[async_trait]

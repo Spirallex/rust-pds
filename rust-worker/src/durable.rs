@@ -83,11 +83,19 @@ const HOST_HEADER: &str = "X-Stelyph-Host";
 pub struct PdsDurableObject {
     state: State,
     env: Env,
+    /// One write lock for this account's repo. A DO can have several requests in
+    /// flight at once, so without this two concurrent writes could each load the
+    /// same root and fork history. Every write path holds it across load→commit.
+    write_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl DurableObject for PdsDurableObject {
     fn new(state: State, env: Env) -> Self {
-        Self { state, env }
+        Self {
+            state,
+            env,
+            write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
@@ -211,26 +219,53 @@ impl PdsDurableObject {
                 h::describe_repo(&store, &ctx, &hostname).await
             }
 
-            // Repo-scoped read: the front Worker routed here by `repo`; the record
-            // is named by `collection` + `rkey` in the query.
+            // Repo-scoped reads: the front Worker routed each here by `repo`/`did`.
             "/xrpc/com.atproto.repo.getRecord" => {
-                let q = |k: &str| {
-                    url.query_pairs()
-                        .find(|(key, _)| key == k)
-                        .map(|(_, v)| v.into_owned())
-                };
-                match (q("collection"), q("rkey")) {
+                match (qp(&url, "collection"), qp(&url, "rkey")) {
                     (Some(collection), Some(rkey)) => {
                         let store = self.store()?;
                         h::get_record(&store, &collection, &rkey).await
                     }
-                    _ => xrpc_error(
-                        400,
-                        "InvalidRequest",
-                        "collection and rkey are required",
-                    ),
+                    _ => xrpc_error(400, "InvalidRequest", "collection and rkey are required"),
                 }
             }
+            "/xrpc/com.atproto.repo.listRecords" => match qp(&url, "collection") {
+                Some(collection) => {
+                    let limit = qp(&url, "limit")
+                        .and_then(|l| l.parse::<usize>().ok())
+                        .unwrap_or(50);
+                    let cursor = qp(&url, "cursor");
+                    let store = self.store()?;
+                    h::list_records(&store, &collection, limit, cursor.as_deref()).await
+                }
+                None => xrpc_error(400, "InvalidRequest", "collection is required"),
+            },
+            "/xrpc/com.atproto.sync.getRepo" => {
+                let store = self.store()?;
+                h::get_repo(&store).await
+            }
+            "/xrpc/com.atproto.sync.getLatestCommit" => {
+                let store = self.store()?;
+                h::get_latest_commit(&store).await
+            }
+            "/xrpc/com.atproto.sync.getBlob" => match (qp(&url, "did"), qp(&url, "cid")) {
+                (Some(did), Some(cid)) => {
+                    let store = self.store()?;
+                    h::get_blob(&store, &did, &cid).await
+                }
+                _ => xrpc_error(400, "InvalidRequest", "did and cid are required"),
+            },
+            "/xrpc/com.atproto.sync.listBlobs" => match qp(&url, "did") {
+                Some(did) => {
+                    let limit = qp(&url, "limit")
+                        .and_then(|l| l.parse::<usize>().ok())
+                        .unwrap_or(500);
+                    let cursor = qp(&url, "cursor");
+                    let store = self.store()?;
+                    h::list_blobs(&store, &did, limit, cursor.as_deref()).await
+                }
+                None => xrpc_error(400, "InvalidRequest", "did is required"),
+            },
 
             "/xrpc/com.atproto.server.createSession" => {
                 let b: CreateSessionInput = req.json().await?;
@@ -256,15 +291,18 @@ impl PdsDurableObject {
 
             // --- repo writes ----------------------------------------------
             // Authenticated by the bearer token; the front Worker routed here by
-            // its `sub`. On commit, the write is enqueued to the sequencer so it
-            // reaches the PDS-wide firehose (see `apply_write`).
+            // its `sub`. On commit, each write is enqueued to the sequencer so it
+            // reaches the PDS-wide firehose (see `repo_write_route`).
             "/xrpc/com.atproto.repo.createRecord" => {
-                self.apply_write(req, h::WriteKind::Create).await
+                self.repo_write_route(req, h::WriteKind::Create).await
             }
-            "/xrpc/com.atproto.repo.putRecord" => self.apply_write(req, h::WriteKind::Put).await,
+            "/xrpc/com.atproto.repo.putRecord" => {
+                self.repo_write_route(req, h::WriteKind::Put).await
+            }
             "/xrpc/com.atproto.repo.deleteRecord" => {
-                self.apply_write(req, h::WriteKind::Delete).await
+                self.repo_write_route(req, h::WriteKind::Delete).await
             }
+            "/xrpc/com.atproto.repo.applyWrites" => self.apply_writes_route(req).await,
 
             // --- internal --------------------------------------------------
             // Reachable only from the front Worker: a DO stub cannot be
@@ -335,14 +373,12 @@ impl PdsDurableObject {
         }
     }
 
-    /// Handle a repo write, then push the resulting commit to the sequencer.
-    ///
-    /// The commit lands atomically in this DO first (`repo_write`); only then is
-    /// it enqueued for the firehose. A failed enqueue does not undo the commit —
-    /// the record exists and this DO's `repo_seq` retains the event — so it is
-    /// logged rather than surfaced as a write failure, matching the best-effort
-    /// stance the in-process firehose already takes on a dropped subscriber.
-    async fn apply_write(&self, mut req: Request, kind: h::WriteKind) -> Result<Response> {
+    /// `createRecord` / `putRecord` / `deleteRecord`: one write, then enqueue.
+    async fn repo_write_route(&self, mut req: Request, kind: h::WriteKind) -> Result<Response> {
+        // Serialise every write to this account so two concurrent requests cannot
+        // both load the same root and fork the commit history. Held across the
+        // whole commit + enqueue; released when this call returns.
+        let _guard = self.write_lock.lock().await;
         let bearer = bearer(&req)?;
         let body = req.text().await?;
         let store = self.store()?;
@@ -355,16 +391,43 @@ impl PdsDurableObject {
             &body,
         )
         .await?;
+        self.finish_write(result).await
+    }
 
+    /// `applyWrites`: a batch of writes as one call, each its own commit + enqueue.
+    async fn apply_writes_route(&self, mut req: Request) -> Result<Response> {
+        let _guard = self.write_lock.lock().await;
+        let bearer = bearer(&req)?;
+        let body = req.text().await?;
+        let store = self.store()?;
+        let result = h::apply_writes(
+            store,
+            bearer.as_deref(),
+            &self.jwt_secret()?,
+            &self.key_passphrase()?,
+            &body,
+        )
+        .await?;
+        self.finish_write(result).await
+    }
+
+    /// Push each commit to the sequencer, then return the client's response.
+    ///
+    /// The commit(s) already landed atomically in this DO; only then are they
+    /// enqueued for the firehose. A failed enqueue does not undo a commit — the
+    /// record exists and this DO's `repo_seq` retains the event — so it is logged
+    /// rather than surfaced as a write failure, matching the best-effort stance
+    /// the in-process firehose already takes on a dropped subscriber.
+    async fn finish_write(&self, result: h::WriteResult) -> Result<Response> {
         match result {
-            h::WriteResult::Committed { client, enqueue } => {
-                if let Err(e) = self.enqueue_to_sequencer(enqueue).await {
-                    // Best effort: the commit stands regardless of firehose reach.
-                    console_error!("firehose enqueue failed: {e}");
+            h::WriteResult::Committed { client, enqueues } => {
+                for enqueue in enqueues {
+                    if let Err(e) = self.enqueue_to_sequencer(enqueue).await {
+                        console_error!("firehose enqueue failed: {e}");
+                    }
                 }
                 Response::from_json(&client)
             }
-            h::WriteResult::NoOp { client } => Response::from_json(&client),
             h::WriteResult::Error {
                 status,
                 error,
@@ -529,6 +592,13 @@ impl PdsDurableObject {
         }
         Ok(resp)
     }
+}
+
+/// A query-string parameter from the request URL, decoded.
+fn qp(url: &Url, key: &str) -> Option<String> {
+    url.query_pairs()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.into_owned())
 }
 
 /// An XRPC error envelope: `{"error": ..., "message": ...}`.

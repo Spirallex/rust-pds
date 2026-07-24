@@ -837,17 +837,16 @@ pub enum WriteKind {
 
 /// The outcome of a repo write, as the Durable Object needs to act on it.
 ///
-/// `Committed` carries both the client's XRPC response and the payload to hand
-/// the sequencer — the DO enqueues the latter, then returns the former.
+/// `Committed` carries the client's XRPC response and one enqueue payload per
+/// commit — the DO enqueues each to the sequencer, then returns the response.
+/// `enqueues` is empty for a committed-nothing success (an idempotent
+/// `deleteRecord` of an absent record, or an empty `applyWrites`).
 pub enum WriteResult {
     Committed {
         client: serde_json::Value,
-        /// JSON body for the sequencer's `/enqueue`, shaped as its `EnqueueReq`.
-        enqueue: serde_json::Value,
+        /// JSON bodies for the sequencer's `/enqueue`, each an `EnqueueReq`.
+        enqueues: Vec<serde_json::Value>,
     },
-    /// A committed-nothing success: an idempotent `deleteRecord` of a record that
-    /// was already absent. No firehose event, so nothing to enqueue.
-    NoOp { client: serde_json::Value },
     Error {
         status: u16,
         error: &'static str,
@@ -995,8 +994,9 @@ pub async fn repo_write(
         WriteKind::Delete => {
             if !record_exists(&store, &did, &mst_key).await? {
                 // Idempotent: deleting an absent record succeeds with no commit.
-                return Ok(WriteResult::NoOp {
+                return Ok(WriteResult::Committed {
                     client: serde_json::json!({}),
+                    enqueues: vec![],
                 });
             }
             WriteOp::Delete {
@@ -1005,8 +1005,18 @@ pub async fn repo_write(
         }
     };
 
-    // Apply the commit through the shared writer.
-    let outcome = match commit_op(store, &did, passphrase, op).await {
+    // Apply the commit through the writer.
+    let writer = match build_repo_writer(store, &did, passphrase).await {
+        Ok(w) => w,
+        Err(e) => {
+            return Ok(WriteResult::Error {
+                status: 500,
+                error: "InternalServerError",
+                message: format!("writer init failed: {e}"),
+            })
+        }
+    };
+    let outcome = match writer.apply_one_at(op, crate::store::now_iso()).await {
         Ok(o) => o,
         Err(e) => {
             return Ok(WriteResult::Error {
@@ -1034,7 +1044,7 @@ pub async fn repo_write(
 
     Ok(WriteResult::Committed {
         client,
-        enqueue: enqueue_payload(&did, &outcome),
+        enqueues: vec![enqueue_payload(&did, &outcome)],
     })
 }
 
@@ -1111,18 +1121,248 @@ pub async fn get_record(store: &DoStore, collection: &str, rkey: &str) -> Result
     }))
 }
 
-/// Build a `RepoWriter` over the account's signing key and apply one op.
+/// The one account this DO holds, as a DID — or a 404 response if none.
+async fn sole_account_did(store: &DoStore) -> Result<std::result::Result<String, Response>> {
+    let account = store
+        .list_accounts()
+        .await
+        .map_err(|e| Error::RustError(format!("list accounts: {e}")))?
+        .into_iter()
+        .next();
+    Ok(match account {
+        Some(a) => Ok(a.did),
+        None => Err(json_err(404, "RepoNotFound", "No account on this host.")?),
+    })
+}
+
+/// `GET /xrpc/com.atproto.repo.listRecords` — page a collection by MST key.
+///
+/// Walks the MST for keys under `{collection}/`, `limit`-bounded and cursored on
+/// the last returned key (exclusive). The cursor is the MST key, so paging is
+/// stable across the sorted keyspace.
+pub async fn list_records(
+    store: &DoStore,
+    collection: &str,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<Response> {
+    use atrium_repo::blockstore::DiffBlockStore;
+    use atrium_repo::Repository;
+    use futures_util::TryStreamExt;
+    use std::sync::Arc;
+    use stelyph_core::storage::{BlockStoreAdapter, StorageBackend};
+
+    let did = match sole_account_did(store).await? {
+        Ok(d) => d,
+        Err(resp) => return Ok(resp),
+    };
+    let limit = limit.clamp(1, 100);
+
+    let store_arc: Arc<dyn StorageBackend> = Arc::new(store.clone());
+    let root = match store_arc
+        .load_repo_root(&did)
+        .await
+        .map_err(|e| Error::RustError(format!("load repo root: {e}")))?
+    {
+        Some(r) => r,
+        // An empty repo simply has no records to list.
+        None => return Response::from_json(&serde_json::json!({ "records": [], "cursor": null })),
+    };
+    let mut diff = DiffBlockStore::wrap(BlockStoreAdapter::new(store_arc.clone()));
+    let mut repo = Repository::open(&mut diff, root)
+        .await
+        .map_err(|e| Error::RustError(format!("open repo: {e}")))?;
+
+    let prefix = format!("{collection}/");
+    let mut tree = repo.tree();
+    let mut stream = Box::pin(tree.entries_prefixed(&prefix));
+
+    let mut records: Vec<serde_json::Value> = Vec::with_capacity(limit);
+    let mut last_key: Option<String> = None;
+    while let Some((key, cid)) = stream
+        .try_next()
+        .await
+        .map_err(|e| Error::RustError(format!("MST stream: {e}")))?
+    {
+        if let Some(c) = cursor {
+            if key.as_str() <= c {
+                continue;
+            }
+        }
+        let bytes = store_arc
+            .read_block_bytes(cid)
+            .await
+            .map_err(|e| Error::RustError(format!("read record block: {e}")))?;
+        let value: serde_json::Value = serde_ipld_dagcbor::from_slice(&bytes)
+            .map_err(|e| Error::RustError(format!("decode record: {e}")))?;
+        records.push(serde_json::json!({
+            "uri": format!("at://{did}/{key}"),
+            "cid": cid.to_string(),
+            "value": value,
+        }));
+        last_key = Some(key);
+        if records.len() >= limit {
+            break;
+        }
+    }
+
+    // Only advertise a cursor when the page filled — a short page is the end.
+    let next_cursor = if records.len() == limit { last_key } else { None };
+    Response::from_json(&serde_json::json!({ "records": records, "cursor": next_cursor }))
+}
+
+/// `GET /xrpc/com.atproto.sync.getRepo` — export the repo as a CARv1 archive.
+///
+/// Exports every block reachable from the signed root commit, with the root set
+/// to the commit CID — the shape a relay verifies. `did` is a routing key only;
+/// this DO holds one account and exports it.
+pub async fn get_repo(store: &DoStore) -> Result<Response> {
+    use atrium_repo::blockstore::DiffBlockStore;
+    use atrium_repo::Repository;
+    use std::sync::Arc;
+    use stelyph_core::storage::{BlockStoreAdapter, StorageBackend};
+
+    let did = match sole_account_did(store).await? {
+        Ok(d) => d,
+        Err(resp) => return Ok(resp),
+    };
+    let store_arc: Arc<dyn StorageBackend> = Arc::new(store.clone());
+    let root = match store_arc
+        .load_repo_root(&did)
+        .await
+        .map_err(|e| Error::RustError(format!("load repo root: {e}")))?
+    {
+        Some(r) => r,
+        None => return json_err(404, "RepoNotFound", "This repo has no commits yet."),
+    };
+
+    let mut diff = DiffBlockStore::wrap(BlockStoreAdapter::new(store_arc.clone()));
+    let mut repo = Repository::open(&mut diff, root)
+        .await
+        .map_err(|e| Error::RustError(format!("open repo: {e}")))?;
+    let cids: Vec<cid::Cid> = repo
+        .export()
+        .await
+        .map_err(|e| Error::RustError(format!("repo export: {e}")))?
+        .collect();
+
+    let header = iroh_car::CarHeader::new_v1(vec![root]);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut car = iroh_car::CarWriter::new(header, &mut buf);
+    for cid in cids {
+        let bytes = store_arc
+            .read_block_bytes(cid)
+            .await
+            .map_err(|e| Error::RustError(format!("read block: {e}")))?;
+        car.write(cid, &bytes)
+            .await
+            .map_err(|e| Error::RustError(format!("CAR write: {e}")))?;
+    }
+    car.finish()
+        .await
+        .map_err(|e| Error::RustError(format!("CAR finish: {e}")))?;
+
+    let mut resp = Response::from_bytes(buf)?;
+    resp.headers_mut()
+        .set("content-type", "application/vnd.ipld.car")?;
+    Ok(resp)
+}
+
+/// `GET /xrpc/com.atproto.sync.getLatestCommit` — the repo's current head.
+///
+/// Returns the signed root commit CID and its `rev`, read straight from the
+/// stored root pointer and the commit block it names.
+pub async fn get_latest_commit(store: &DoStore) -> Result<Response> {
+    use serde::Deserialize;
+    use std::sync::Arc;
+    use stelyph_core::storage::StorageBackend;
+
+    let did = match sole_account_did(store).await? {
+        Ok(d) => d,
+        Err(resp) => return Ok(resp),
+    };
+    let store_arc: Arc<dyn StorageBackend> = Arc::new(store.clone());
+    let root = match store_arc
+        .load_repo_root(&did)
+        .await
+        .map_err(|e| Error::RustError(format!("load repo root: {e}")))?
+    {
+        Some(r) => r,
+        None => return json_err(404, "RepoNotFound", "This repo has no commits yet."),
+    };
+
+    // The commit block carries `rev`; decode just that field (dag-cbor ignores
+    // the rest), the same way the writer reads it back after a commit.
+    #[derive(Deserialize)]
+    struct CommitHeader {
+        rev: atrium_api::types::string::Tid,
+    }
+    let bytes = store_arc
+        .read_block_bytes(root)
+        .await
+        .map_err(|e| Error::RustError(format!("read commit block: {e}")))?;
+    let header: CommitHeader = serde_ipld_dagcbor::from_slice(&bytes)
+        .map_err(|e| Error::RustError(format!("decode commit block: {e}")))?;
+
+    Response::from_json(&serde_json::json!({
+        "cid": root.to_string(),
+        "rev": header.rev.as_ref(),
+    }))
+}
+
+/// `GET /xrpc/com.atproto.sync.getBlob` — raw blob bytes with their mime type.
+///
+/// Ownership is decided by the `did` + `cid` metadata row, so a blob is only
+/// served to a request naming the account that uploaded it.
+pub async fn get_blob(store: &DoStore, did: &str, cid: &str) -> Result<Response> {
+    use stelyph_core::storage::BlobStore;
+
+    let blob = store
+        .get_blob(did, cid)
+        .await
+        .map_err(|e| Error::RustError(format!("get blob: {e}")))?;
+    let Some((mime, bytes)) = blob else {
+        return json_err(404, "BlobNotFound", "No such blob for this repo.");
+    };
+    let mut resp = Response::from_bytes(bytes)?;
+    resp.headers_mut().set("content-type", &mime)?;
+    Ok(resp)
+}
+
+/// `GET /xrpc/com.atproto.sync.listBlobs` — the blob CIDs owned by a repo.
+///
+/// Reads the blob metadata index (not R2), cursored on the CID. `since` (a rev
+/// filter in the lexicon) is not tracked per blob here and is accepted but
+/// ignored; paging is by `cursor`.
+pub async fn list_blobs(
+    store: &DoStore,
+    did: &str,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<Response> {
+    let limit = limit.clamp(1, 1000) as i64;
+    let cids = store
+        .list_blob_cids(did, cursor, limit)
+        .await
+        .map_err(|e| Error::RustError(format!("list blobs: {e}")))?;
+    let next_cursor = if cids.len() as i64 == limit {
+        cids.last().cloned()
+    } else {
+        None
+    };
+    Response::from_json(&serde_json::json!({ "cids": cids, "cursor": next_cursor }))
+}
+
+/// Build a `RepoWriter` over the account's signing key.
 ///
 /// The broadcast sender is a throwaway: on this host the firehose is a separate
 /// Durable Object fed via the enqueue path, so the writer's in-process publish
 /// has no subscribers and is discarded. The commit itself — blocks, repo_seq
 /// row, root pointer — still lands atomically in this DO's storage.
-async fn commit_op(
-    store: DoStore,
-    did: &str,
-    passphrase: &[u8],
-    op: WriteOp,
-) -> Result<WriteOutcome> {
+///
+/// A single writer serves any number of ops (`applyWrites` reuses one across the
+/// batch), so the signing key is loaded and imported just once per request.
+async fn build_repo_writer(store: DoStore, did: &str, passphrase: &[u8]) -> Result<RepoWriter> {
     use atrium_api::types::string::Did;
     use atrium_crypto::keypair::Secp256k1Keypair;
     use std::str::FromStr;
@@ -1139,15 +1379,202 @@ async fn commit_op(
         Did::from_str(did).map_err(|e| Error::RustError(format!("bad account did: {e}")))?;
 
     // No subscribers on this host (see the doc comment); capacity 1 is enough for
-    // the single send `apply_one_at` makes before we drop the receiver.
+    // the single send each `apply_one_at` makes before we drop the receiver.
     let (tx, _rx) = tokio::sync::broadcast::channel(1);
     let store_dyn: Arc<dyn StorageBackend> = store_arc;
-    let writer = RepoWriter::new(store_dyn, key, did_typed, tx);
+    Ok(RepoWriter::new(store_dyn, key, did_typed, tx))
+}
 
-    writer
-        .apply_one_at(op, crate::store::now_iso())
-        .await
-        .map_err(|e| Error::RustError(format!("apply commit: {e}")))
+/// `POST /xrpc/com.atproto.repo.applyWrites` — a batch of create/update/delete.
+///
+/// Each write is applied as its own signed commit (mirroring the in-process
+/// server), so the batch yields one enqueue per write. `validate`/`swapCommit`
+/// are accepted and ignored, as elsewhere on this Worker.
+pub async fn apply_writes(
+    store: DoStore,
+    bearer: Option<&str>,
+    jwt_secret: &[u8],
+    passphrase: &[u8],
+    body: &str,
+) -> Result<WriteResult> {
+    use stelyph_core::auth::jwt::decode_jwt;
+    use stelyph_core::repo::util::{json_value_to_ipld, tid_from_micros, validate_collection, validate_rkey};
+
+    let Some(did) = bearer
+        .and_then(|t| decode_jwt(t, jwt_secret).ok())
+        .map(|c| c.sub)
+    else {
+        return Ok(WriteResult::Error {
+            status: 401,
+            error: "AuthenticationRequired",
+            message: "Invalid token.".into(),
+        });
+    };
+    let v: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => {
+            return Ok(WriteResult::Error {
+                status: 400,
+                error: "InvalidRequest",
+                message: "Body is not valid JSON.".into(),
+            })
+        }
+    };
+    if v["repo"].as_str() != Some(did.as_str()) {
+        return Ok(WriteResult::Error {
+            status: 400,
+            error: "InvalidRequest",
+            message: "repo must match the authenticated DID.".into(),
+        });
+    }
+    let Some(writes) = v["writes"].as_array() else {
+        return Ok(WriteResult::Error {
+            status: 400,
+            error: "InvalidRequest",
+            message: "writes must be an array.".into(),
+        });
+    };
+    if writes.is_empty() {
+        return Ok(WriteResult::Committed {
+            client: serde_json::json!({ "commit": null, "results": [] }),
+            enqueues: vec![],
+        });
+    }
+
+    // A small typed error to unwind validation failures out of the loop into a
+    // single `WriteResult::Error` without a helper returning nested Results.
+    macro_rules! bail {
+        ($msg:expr) => {
+            return Ok(WriteResult::Error {
+                status: 400,
+                error: "InvalidRequest",
+                message: $msg,
+            })
+        };
+    }
+
+    let writer = match build_repo_writer(store, &did, passphrase).await {
+        Ok(w) => w,
+        Err(e) => {
+            return Ok(WriteResult::Error {
+                status: 500,
+                error: "InternalServerError",
+                message: format!("writer init failed: {e}"),
+            })
+        }
+    };
+
+    let mut results = Vec::with_capacity(writes.len());
+    let mut enqueues = Vec::with_capacity(writes.len());
+    let mut last_commit: Option<serde_json::Value> = None;
+
+    for write in writes {
+        let type_ = write["$type"].as_str().unwrap_or("");
+        let Some(collection) = write["collection"].as_str().map(str::to_owned) else {
+            bail!("write is missing collection.".into());
+        };
+        if let Err(msg) = validate_collection(&collection) {
+            bail!(msg);
+        }
+
+        // Parse the op for this write; `rkey`/`value` requirements differ by kind.
+        let (op, result_partial): (WriteOp, serde_json::Value) = match type_ {
+            "com.atproto.repo.applyWrites#create" => {
+                let rkey = match write["rkey"].as_str() {
+                    Some(rk) => {
+                        if let Err(msg) = validate_rkey(rk) {
+                            bail!(msg);
+                        }
+                        rk.to_owned()
+                    }
+                    None => tid_from_micros(worker::Date::now().as_millis() * 1000),
+                };
+                let ipld = match json_value_to_ipld(write["value"].clone()) {
+                    Ok(v) => v,
+                    Err(_) => bail!("record could not be encoded.".into()),
+                };
+                let mst_key = format!("{collection}/{rkey}");
+                (
+                    WriteOp::Create {
+                        key: mst_key,
+                        record: ipld,
+                    },
+                    serde_json::json!({
+                        "$type": "com.atproto.repo.applyWrites#createResult",
+                        "uri": format!("at://{did}/{collection}/{rkey}"),
+                        "validationStatus": "unknown",
+                    }),
+                )
+            }
+            "com.atproto.repo.applyWrites#update" => {
+                let Some(rkey) = write["rkey"].as_str() else {
+                    bail!("update write is missing rkey.".into());
+                };
+                if let Err(msg) = validate_rkey(rkey) {
+                    bail!(msg);
+                }
+                let ipld = match json_value_to_ipld(write["value"].clone()) {
+                    Ok(v) => v,
+                    Err(_) => bail!("record could not be encoded.".into()),
+                };
+                let mst_key = format!("{collection}/{rkey}");
+                (
+                    WriteOp::Update {
+                        key: mst_key,
+                        record: ipld,
+                    },
+                    serde_json::json!({
+                        "$type": "com.atproto.repo.applyWrites#updateResult",
+                        "uri": format!("at://{did}/{collection}/{rkey}"),
+                        "validationStatus": "unknown",
+                    }),
+                )
+            }
+            "com.atproto.repo.applyWrites#delete" => {
+                let Some(rkey) = write["rkey"].as_str() else {
+                    bail!("delete write is missing rkey.".into());
+                };
+                if let Err(msg) = validate_rkey(rkey) {
+                    bail!(msg);
+                }
+                (
+                    WriteOp::Delete {
+                        key: format!("{collection}/{rkey}"),
+                    },
+                    serde_json::json!({ "$type": "com.atproto.repo.applyWrites#deleteResult" }),
+                )
+            }
+            other => bail!(format!("unknown write $type: {other}")),
+        };
+
+        let outcome = match writer.apply_one_at(op, crate::store::now_iso()).await {
+            Ok(o) => o,
+            Err(e) => {
+                return Ok(WriteResult::Error {
+                    status: 500,
+                    error: "InternalServerError",
+                    message: format!("write failed: {e}"),
+                })
+            }
+        };
+
+        // The result echoes the record CID for create/update (deletes carry none).
+        let mut result = result_partial;
+        if let Some(cid) = outcome.record_cid {
+            result["cid"] = serde_json::json!(cid.to_string());
+        }
+        results.push(result);
+        last_commit = Some(serde_json::json!({
+            "cid": outcome.commit_cid.to_string(),
+            "rev": outcome.rev,
+        }));
+        enqueues.push(enqueue_payload(&did, &outcome));
+    }
+
+    Ok(WriteResult::Committed {
+        client: serde_json::json!({ "commit": last_commit, "results": results }),
+        enqueues,
+    })
 }
 
 /// Shape a committed write into the sequencer's `/enqueue` request body.

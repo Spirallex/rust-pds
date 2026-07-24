@@ -1900,6 +1900,7 @@ dependencies = [
  "data-encoding",
  "futures-util",
  "http",
+ "iroh-car",
  "js-sys",
  "rand",
  "serde",

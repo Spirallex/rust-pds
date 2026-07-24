@@ -31,26 +31,25 @@ The write path is implemented on branch `wr-09-worker-crate`. Builds clean for
 `wasm32-unknown-unknown`; core + pds native tests green (227 + 23); clippy clean
 on both targets. **Not yet deployed, and not yet verified against a real client.**
 
-### 1. `createRecord` / `putRecord` / `deleteRecord` — DONE
+### 1. Writes — `createRecord` / `putRecord` / `deleteRecord` / `applyWrites` — DONE
 - Reuses `stelyph-core`'s `RepoWriter` against `DoStore` (an `Arc<DoStore>`
   coerced to `Arc<dyn StorageBackend>` — `DoStore`'s `SendWrapper` fields satisfy
   the `Send + Sync` trait bounds).
-- **wasm clock fix (core):** `writer.rs` now splits `apply_one` into
+- **wasm clock fix (core):** `writer.rs` splits `apply_one` into
   `apply_one_at(op, now_rfc3339)` + a wall-clock wrapper. The single
-  `chrono::Utc::now()` (line 286) was the only wasm panic; the Worker passes
+  `chrono::Utc::now()` was the only wasm panic; the Worker passes
   `crate::store::now_iso()`. `WriteOutcome` gained `since` + `blocks_car` so the
-  Worker can feed the sequencer without re-decoding.
-- Handlers in `handlers.rs` (`repo_write` + `commit_op`): bearer → DID (must
-  equal body `repo`), validates via `repo::util`, loads `{did}#signing` like the
-  AppView proxy, applies one signed commit. `putRecord` picks Create/Update by an
-  MST existence check; `deleteRecord` is idempotent (NoOp when absent).
-- Routed in `durable.rs::apply_write`; front Worker routes writes by bearer
-  `sub` (added to the `is_auth` set in `lib.rs`).
-- **Follow-ups:** `applyWrites` not implemented (loop `apply_one` per write, as
-  the server does — each is its own commit). Per-DID write serialisation: each
-  write builds a fresh `RepoWriter` with its own lock; if a single DO ever
-  processes two writes concurrently they could fork history. Fine for a personal
-  PDS; add a DO-held lock if it matters.
+  Worker feeds the sequencer without re-decoding.
+- Handlers in `handlers.rs`: `repo_write` (create/put/delete) + `apply_writes`
+  (batch, one commit per write) share `build_repo_writer` (loads `{did}#signing`
+  once). bearer → DID must equal body `repo`; validates via `repo::util`.
+  `putRecord` picks Create/Update by an MST check; `deleteRecord` is idempotent.
+- `WriteResult::Committed { client, enqueues }` carries N enqueue payloads;
+  `durable.rs::finish_write` POSTs each to the sequencer, then returns the client
+  response. Front Worker routes all four writes by bearer `sub` (`is_auth`).
+- **Per-DID serialisation — DONE:** the account DO holds one
+  `write_lock: Arc<Mutex<()>>`, taken across every write's load→commit→enqueue,
+  so two concurrent requests to the same DO cannot fork history.
 
 ### 2. On commit, POST to the sequencer `/enqueue` — DONE
 - `durable.rs::enqueue_to_sequencer` POSTs the `EnqueueReq`-shaped payload
@@ -58,19 +57,31 @@ on both targets. **Not yet deployed, and not yet verified against a real client.
   enqueue is logged, not surfaced — the commit already stands and this DO's
   `repo_seq` retains the event.
 
-### 3. Heavy repo reads — `getRecord` DONE; `listRecords` / `sync.getRepo` TODO
-- `getRecord` implemented (`handlers.rs::get_record` + `lookup_record_cid`,
-  routed in `durable.rs`; already in the front Worker's `REPO_SCOPED` list).
-  MST lookup → read block → dag-cbor → JSON.
-- **Still TODO:** `listRecords` (MST prefix walk), `sync.getRepo` (CAR export),
-  `sync.getLatestCommit`, `sync.getBlob` / `listBlobs`. Routing already exists.
+### 3. Heavy repo reads — DONE (`getRecord`, `listRecords`, `getRepo`, `getLatestCommit`, `getBlob`, `listBlobs`)
+- All in `handlers.rs`, routed in `durable.rs`; already in the front Worker's
+  `REPO_SCOPED` list. `getRecord`/`listRecords` walk the MST (prefix stream) →
+  dag-cbor → JSON; `getRepo` exports a CARv1 (`repo.export()` → `iroh-car`);
+  `getLatestCommit` reads root CID + `rev`; `getBlob` streams R2 bytes; `listBlobs`
+  pages the `blob_refs` index.
+- **`sole_account_did` helper:** reads route by `repo`/`did` but each DO holds one
+  account, so reads resolve to that account rather than trusting the param.
+
+### Remaining gaps
+- **`uploadBlob` not on the Worker.** `getBlob`/`listBlobs` are correct but return
+  nothing until blobs can be stored, and image posts need it. Blocked on the front
+  Worker forwarding a **binary** body — it currently reads POST bodies as `String`
+  (`read_body`), which would corrupt blob bytes. Fixing that (forward raw bytes for
+  `uploadBlob`) is the real work; the handler itself mirrors the server's `upload_blob`.
+- `sync.getBlocks`, `sync.getRecord` (the sync-namespace proof read), account
+  status/deactivation — not implemented.
 
 ### Next: deploy + verify + federate
 - `wrangler deploy`, then post from a real Bluesky client against
-  `pds.spirallex.com` and read it back via `getRecord`.
+  `pds.spirallex.com` and read it back via `getRecord` / `listRecords`.
 - Watch the firehose: a subscriber on `subscribeRepos` should see the real
   `#commit` with actual CAR blocks (not the empty-blocks admin inject).
-- Then `requestCrawl` to `bsky.network` so the account federates.
+- Then `requestCrawl` to `bsky.network` so the account federates, and confirm the
+  relay can `getRepo` the CAR.
 
 ## Secondary / cleanup
 
