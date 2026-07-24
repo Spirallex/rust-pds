@@ -92,6 +92,18 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpResponse
                 let body = read_body(req).await?;
                 return mint_invite(&env, &token, &body).await?.try_into();
             }
+            (&http::Method::POST, "/_stelyph/admin/delete-account") => {
+                let token = req
+                    .headers()
+                    .get("x-stelyph-admin")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let body = read_body(req).await?;
+                return delete_account(&env, &zone_suffix, &token, &body)
+                    .await?
+                    .try_into();
+            }
             _ => {}
         }
     }
@@ -300,6 +312,76 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// `POST /_stelyph/admin/delete-account` — tear down an account.
+///
+/// Wipes the account's data from its Durable Object and frees its handle in the
+/// registry. The DID stays on the PLC ledger — it is immutable and can only be
+/// tombstoned (with the rotation key, which this deletes), so a deleted account
+/// leaves an orphaned DID pointing at nothing. That is inherent to did:plc, not
+/// a shortcut here.
+async fn delete_account(
+    env: &Env,
+    zone_suffix: &str,
+    presented: &str,
+    body: &str,
+) -> Result<Response> {
+    let Ok(expected) = env.secret("PDS_ADMIN_TOKEN") else {
+        return json_error(503, "NotConfigured", "Admin actions are not configured.");
+    };
+    if !constant_time_eq(presented.as_bytes(), expected.to_string().as_bytes()) {
+        return json_error(401, "Unauthorized", "Not authorized.");
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Req {
+        handle: String,
+    }
+    let req: Req = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return json_error(400, "InvalidRequest", "Expected {\"handle\"}."),
+    };
+    let handle = req.handle.trim().to_ascii_lowercase();
+    let suffix = format!(".{zone_suffix}");
+    let Some(label) = handle.strip_suffix(&suffix) else {
+        return json_error(
+            400,
+            "UnsupportedDomain",
+            &format!("Handles end in {suffix}"),
+        );
+    };
+
+    // Wipe the account's own Durable Object.
+    let wiped = call_pds_do(
+        env,
+        &handle,
+        "/_stelyph/delete-account",
+        serde_json::json!({}),
+    )
+    .await?;
+    let did = wiped
+        .get("did")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    // Free the handle regardless of whether an account row was present — the
+    // reservation must not outlive the account.
+    let registry = registry_stub(env)?;
+    let _ = call_do(
+        &registry,
+        "/force-release",
+        serde_json::json!({ "label": label }),
+    )
+    .await;
+
+    Response::from_json(&serde_json::json!({
+        "ok": wiped.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+        "handle": handle,
+        "did": did,
+        "note": "handle freed; DID remains on the PLC ledger (immutable)",
+    }))
 }
 
 /// `POST /register/check` — live availability for the handle field.

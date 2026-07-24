@@ -501,6 +501,35 @@ impl DoStore {
             vec![s(request_id)],
         )
     }
+
+    /// Erase the account this Durable Object holds: the account row, its two
+    /// signing keys, preferences, repo root, and any enrolled devices. Blocks and
+    /// blob metadata are cleared too so a reused hostname starts genuinely empty.
+    ///
+    /// The DID itself lives on the PLC ledger and cannot be erased from here —
+    /// only tombstoned, which needs the rotation key and is not done as part of
+    /// this wipe (and could not be, since the key is one of the things deleted).
+    pub fn delete_account_data(&self, did: &str) -> Result<(), StorageError> {
+        self.run("DELETE FROM accounts WHERE did = ?", vec![s(did)])?;
+        self.run(
+            "DELETE FROM keys WHERE id = ?",
+            vec![s(format!("{did}#signing"))],
+        )?;
+        self.run(
+            "DELETE FROM keys WHERE id = ?",
+            vec![s(format!("{did}#rotation"))],
+        )?;
+        self.run(
+            "DELETE FROM account_preferences WHERE did = ?",
+            vec![s(did)],
+        )?;
+        self.run("DELETE FROM repo_roots WHERE did = ?", vec![s(did)])?;
+        self.run("DELETE FROM repo_seq WHERE did = ?", vec![s(did)])?;
+        self.run("DELETE FROM blob_refs WHERE did = ?", vec![s(did)])?;
+        self.run("DELETE FROM device_keys", vec![])?;
+        self.run("DELETE FROM signin_requests", vec![])?;
+        Ok(())
+    }
 }
 
 // --- accounts --------------------------------------------------------------

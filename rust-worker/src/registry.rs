@@ -175,8 +175,30 @@ impl RegistryDurableObject {
                 let body: InviteReq = req.json().await?;
                 self.seed_invite(&body.code, body.uses)
             }
+            "/force-release" => {
+                let body: LabelReq = req.json().await?;
+                self.force_release(&body.label)
+            }
             _ => Response::error("unknown registry endpoint", 404),
         }
+    }
+
+    /// Delete a claim by label whatever its state, freeing the handle for reuse.
+    ///
+    /// Unlike `release`, which only undoes a still-`reserved` row, this removes
+    /// an `active` (bound) claim too — it exists for account deletion, where the
+    /// account behind the handle is being torn down deliberately. Admin-gated at
+    /// the front Worker; the registry never exposes this to clients.
+    fn force_release(&self, label: &str) -> Result<Response> {
+        let sql = self.sql()?;
+        sql.exec(
+            "DELETE FROM claims WHERE label = ?",
+            vec![SqlStorageValue::from(label.to_string())],
+        )?;
+        Response::from_json(&OkResp {
+            ok: true,
+            error: None,
+        })
     }
 
     fn is_taken(&self, sql: &SqlStorage, label: &str) -> Result<bool> {

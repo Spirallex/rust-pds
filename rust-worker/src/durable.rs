@@ -224,6 +224,11 @@ impl PdsDurableObject {
                 }
             }
 
+            "/_stelyph/delete-account" => {
+                let store = self.store()?;
+                h::delete_account(&store).await
+            }
+
             "/_stelyph/health" => self.health().await,
             _ => xrpc_error(404, "MethodNotImplemented", "unknown endpoint"),
         }

@@ -494,6 +494,32 @@ pub async fn device_deny(
     Response::from_json(&serde_json::json!({ "ok": true }))
 }
 
+/// Erase the single account this Durable Object holds, returning its DID and
+/// handle so the front Worker can free the registry label.
+///
+/// Internal: reachable only from the front Worker's admin path, never routed
+/// from a client request.
+pub async fn delete_account(store: &DoStore) -> Result<Response> {
+    use stelyph_core::storage::AccountStore;
+
+    let account = store
+        .list_accounts()
+        .await
+        .map_err(|e| Error::RustError(format!("list accounts: {e}")))?
+        .into_iter()
+        .next();
+    let Some(account) = account else {
+        return Response::from_json(&serde_json::json!({ "ok": false, "error": "NoAccount" }));
+    };
+    let handle = account.handle.clone().unwrap_or_default();
+    store
+        .delete_account_data(&account.did)
+        .map_err(|e| Error::RustError(format!("delete account data: {e}")))?;
+    Response::from_json(&serde_json::json!({
+        "ok": true, "did": account.did, "handle": handle,
+    }))
+}
+
 /// A JSON error body with an HTTP status, matching the app-facing error shape.
 fn json_err(status: u16, error: &str, message: &str) -> Result<Response> {
     Ok(Response::from_json(&serde_json::json!({
