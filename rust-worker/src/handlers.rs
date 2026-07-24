@@ -172,7 +172,7 @@ pub async fn provision_account(
     plc_directory: &str,
 ) -> Result<ProvisionOutcome> {
     use atrium_crypto::keypair::{Export, Secp256k1Keypair};
-    use stelyph_core::auth::jwt::{encode_access_jwt, encode_refresh_jwt, hash_password};
+    use stelyph_core::auth::jwt::{encode_access_jwt_at, encode_refresh_jwt_at, hash_password};
     use stelyph_core::identity::plc::register_did_plc;
     use stelyph_core::storage::crypto;
 
@@ -235,9 +235,9 @@ pub async fn provision_account(
             .map_err(|e| Error::RustError(format!("store {suffix} key: {e}")))?;
     }
 
-    let access_jwt = encode_access_jwt(&did, jwt_secret)
+    let access_jwt = encode_access_jwt_at(&did, jwt_secret, now_unix())
         .map_err(|e| Error::RustError(format!("access jwt: {e}")))?;
-    let refresh_jwt = encode_refresh_jwt(&did, jwt_secret)
+    let refresh_jwt = encode_refresh_jwt_at(&did, jwt_secret, now_unix())
         .map_err(|e| Error::RustError(format!("refresh jwt: {e}")))?;
 
     Ok(ProvisionOutcome::Created {
@@ -408,7 +408,7 @@ pub async fn device_approve(
     signature: &[u8],
     jwt_secret: &[u8],
 ) -> Result<Response> {
-    use stelyph_core::auth::jwt::{encode_access_jwt, encode_refresh_jwt};
+    use stelyph_core::auth::jwt::{encode_access_jwt_at, encode_refresh_jwt_at};
     use stelyph_core::storage::AccountStore;
 
     let Some(row) = store
@@ -451,9 +451,9 @@ pub async fn device_approve(
     // The issuer is this host; keep it in the tokens for parity with createAccount.
     let _ = &ctx.issuer;
 
-    let access = encode_access_jwt(&did, jwt_secret)
+    let access = encode_access_jwt_at(&did, jwt_secret, now_unix())
         .map_err(|e| Error::RustError(format!("access jwt: {e}")))?;
-    let refresh = encode_refresh_jwt(&did, jwt_secret)
+    let refresh = encode_refresh_jwt_at(&did, jwt_secret, now_unix())
         .map_err(|e| Error::RustError(format!("refresh jwt: {e}")))?;
 
     store

@@ -76,10 +76,19 @@ pub fn verify_password(password: &str, phc: &str) -> Result<bool, CoreError> {
         .is_ok())
 }
 
-/// Issue an access JWT.
-/// Scope: `"com.atproto.access"`, exp = now + 7200 s.
+/// Issue an access JWT. Scope: `"com.atproto.access"`, exp = now + 7200 s.
 pub fn encode_access_jwt(did: &str, secret: &[u8]) -> Result<String, CoreError> {
-    let now = current_unix();
+    encode_access_jwt_at(did, secret, current_unix())
+}
+
+/// Issue an access JWT with the current time supplied by the caller.
+///
+/// `current_unix()` reads `SystemTime::now()`, which is **not implemented on
+/// wasm32 and panics** ("time not implemented on this platform"). The Worker has
+/// no such clock in Rust — it must pass `worker::Date`-derived seconds — so token
+/// issuance takes the time as an argument rather than reaching for a system
+/// clock that may not exist. Native callers use the wrapper above.
+pub fn encode_access_jwt_at(did: &str, secret: &[u8], now: u64) -> Result<String, CoreError> {
     let claims = AuthClaims {
         sub: did.to_string(),
         scope: "com.atproto.access".to_string(),
@@ -95,10 +104,13 @@ pub fn encode_access_jwt(did: &str, secret: &[u8]) -> Result<String, CoreError> 
     .map_err(|e| CoreError::Internal(anyhow::anyhow!("JWT encode error: {e}")))
 }
 
-/// Issue a refresh JWT.
-/// Scope: `"com.atproto.refresh"`, exp = now + 7_776_000 s (90 days), jti = uuid v4.
+/// Issue a refresh JWT. Scope: `"com.atproto.refresh"`, exp = now + 90 days.
 pub fn encode_refresh_jwt(did: &str, secret: &[u8]) -> Result<String, CoreError> {
-    let now = current_unix();
+    encode_refresh_jwt_at(did, secret, current_unix())
+}
+
+/// Refresh JWT with a caller-supplied time. See [`encode_access_jwt_at`] for why.
+pub fn encode_refresh_jwt_at(did: &str, secret: &[u8], now: u64) -> Result<String, CoreError> {
     let claims = AuthClaims {
         sub: did.to_string(),
         scope: "com.atproto.refresh".to_string(),
