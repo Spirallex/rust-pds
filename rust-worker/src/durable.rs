@@ -106,11 +106,23 @@ impl PdsDurableObject {
 
     async fn route(&self, mut req: Request) -> Result<Response> {
         let url = req.url()?;
-        let hostname = req
+        // The host this request arrived on, e.g. `alice.pds.spirallex.com`. Used
+        // only to resolve *which handle* is being asked about — its own DO.
+        let request_host = req
             .headers()
             .get(HOST_HEADER)?
             .unwrap_or_else(|| "unknown.invalid".to_string());
-        let ctx = Ctx::from_host(&hostname);
+
+        // Multi-tenant: every account presents the SAME service identity, the
+        // shared PDS host `pds.spirallex.com`, not its own subdomain. So the
+        // service context — describeServer's `did`, the OAuth issuer, and the
+        // `serviceEndpoint` written into each new account's DID document — is
+        // built from the zone suffix, not from `request_host`. The account data
+        // still lives in this account's own Durable Object; only the advertised
+        // address is shared. Handle resolution (atproto-did) is the one thing
+        // that stays per-host, because it answers "who is THIS subdomain?".
+        let hostname = request_host;
+        let ctx = Ctx::from_host(&self.zone_suffix());
 
         match url.path() {
             // --- discovery -------------------------------------------------
