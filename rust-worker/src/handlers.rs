@@ -402,10 +402,17 @@ pub async fn create_session(
     let did = account.did;
     let handle = account.handle.clone().unwrap_or_default();
 
-    // The identifier must name this account (its handle or DID). Mismatch reads
-    // the same as a bad password — no oracle for which accounts exist.
+    // The identifier must name this account: its full handle, its DID, or the
+    // bare handle label (the leading segment). A client that logs in with just
+    // "c91" is routed here by the front Worker exactly as "c91.pds.spirallex.com"
+    // is, so accepting the label keeps the two login forms consistent — this DO
+    // already holds a single account, so there is no cross-account ambiguity.
+    // Mismatch reads the same as a bad password — no oracle for which accounts
+    // exist.
     let id = identifier.to_ascii_lowercase();
-    if id != handle.to_ascii_lowercase() && id != did.to_ascii_lowercase() {
+    let handle_lc = handle.to_ascii_lowercase();
+    let bare_label = handle_lc.split('.').next().unwrap_or_default();
+    if id != handle_lc && id != did.to_ascii_lowercase() && id != bare_label {
         return xrpc_err(
             401,
             "AuthenticationRequired",
