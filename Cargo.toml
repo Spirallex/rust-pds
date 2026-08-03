@@ -1,7 +1,10 @@
 [workspace]
 members = ["rust-core", "rust-pds"]
-# wasm32-only; building it for the host (as `cargo test --workspace` would)
-# cannot work, so it is excluded and built via its own manifest.
+# wasm32-only. As a member it would share this workspace's feature unification,
+# which resolves `stelyph-core` with its default SQLite backend — the one thing
+# that cannot cross-compile to wasm32 — so it is excluded and built via its own
+# manifest. On that manifest it builds for the host fine, which is how CI runs
+# its unit tests; see the `rust-worker` steps in .github/workflows/ci.yml.
 exclude = ["rust-worker"]
 resolver = "2"
 

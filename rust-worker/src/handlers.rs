@@ -153,6 +153,31 @@ pub async fn atproto_did(store: &DoStore, hostname: &str) -> Result<Response> {
     }
 }
 
+/// `GET /xrpc/com.atproto.identity.resolveHandle?handle=<h>` — handle → DID.
+///
+/// The XRPC twin of [`atproto_did`]: same question, same answer, different
+/// callers. A resolver following the identity spec fetches `atproto-did` at the
+/// handle's own host, but a client that already has a PDS configured — the iOS
+/// app, and every atproto SDK's login path — calls this method on that PDS and
+/// never looks at the well-known. Serving only the former means login fails at
+/// its first step against a handle that is otherwise perfectly resolvable.
+///
+/// This object holds exactly one account, so an unknown `handle` — including a
+/// real handle belonging to a *different* account, whose request landed here
+/// because it named a host this deployment does not serve — simply misses the
+/// store and gets `HandleNotFound`. Routing a shared-host request to the right
+/// object is the front Worker's job (`resolve_handle_target`), not this one's.
+pub async fn resolve_handle(store: &DoStore, handle: &str) -> Result<Response> {
+    let did = store
+        .get_did_by_handle(&handle.to_ascii_lowercase())
+        .await
+        .map_err(|e| Error::RustError(format!("handle lookup: {e}")))?;
+    match did {
+        Some(did) => Response::from_json(&serde_json::json!({ "did": did })),
+        None => xrpc_err(404, "HandleNotFound", "Unable to resolve handle"),
+    }
+}
+
 /// Create the single account this Durable Object exists to serve.
 ///
 /// Called only by the front Worker, and only after the registry has reserved the
