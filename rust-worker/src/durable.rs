@@ -203,6 +203,24 @@ impl PdsDurableObject {
                 h::describe_server(&ctx, &self.zone_suffix(), self.open_registration())
             }
 
+            // Handle → DID. On the shared host the front Worker routed this
+            // here by the `handle` query param; on an account host the Host
+            // header already picked the object. Either way the handle is
+            // checked against *this* object's account, never trusted blindly.
+            "/xrpc/com.atproto.identity.resolveHandle" => {
+                let handle = url
+                    .query_pairs()
+                    .find(|(k, _)| k == "handle")
+                    .map(|(_, v)| v.into_owned());
+                match handle {
+                    Some(handle) => {
+                        let store = self.store()?;
+                        h::resolve_handle(&store, &handle).await
+                    }
+                    None => xrpc_error(400, "InvalidRequest", "handle is required"),
+                }
+            }
+
             // Repo-scoped read. The front Worker routes it here by `repo`; this
             // DO holds one account and describes it. `ctx` is the shared service
             // identity; `hostname` is this account's own host.

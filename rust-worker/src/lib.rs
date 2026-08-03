@@ -193,7 +193,9 @@ async fn dispatch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpRespo
     let target_host = if host == zone_suffix {
         match repo_scoped_target(&env, &path, &zone_suffix).await {
             Some(h) => h,
-            None => host.clone(),
+            // `resolveHandle` names its target the same way, in a `handle`
+            // param, and needs the same fan-out for the same reason.
+            None => resolve_handle_target(&path, &zone_suffix).unwrap_or_else(|| host.clone()),
         }
     } else {
         host.clone()
@@ -405,6 +407,28 @@ async fn repo_scoped_target(env: &Env, path: &str, zone_suffix: &str) -> Option<
             None
         }
     }
+}
+
+/// For `resolveHandle` on the shared host, the hostname of the account its
+/// `handle` parameter names — or `None` if the path is not `resolveHandle` or
+/// the handle is not one this deployment could host.
+///
+/// Unlike [`repo_scoped_target`] the identifier is always a handle and never a
+/// DID — turning a handle into a DID is the very thing the caller is asking for
+/// — so there is no registry lookup to do. A handle outside this zone yields
+/// `None` and so falls back to the shared host's own object, which holds no
+/// account and answers `HandleNotFound`. That is the right answer: this PDS has
+/// no authority to resolve handles it does not host, and guessing would let the
+/// shared host be used as an open resolver for arbitrary external names.
+fn resolve_handle_target(path: &str, zone_suffix: &str) -> Option<String> {
+    let (route, query) = path.split_once('?')?;
+    if route != "/xrpc/com.atproto.identity.resolveHandle" {
+        return None;
+    }
+    let handle = query_param(query, "handle")?.to_ascii_lowercase();
+    handle
+        .ends_with(&format!(".{zone_suffix}"))
+        .then_some(handle)
 }
 
 /// Extract a query parameter value (percent-decoding the value).
@@ -856,4 +880,70 @@ async fn create_account(env: &Env, zone_suffix: &str, body: &str) -> Result<Resp
         handle,
         did,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_handle_target;
+
+    const ZONE: &str = "pds.spirallex.com";
+
+    /// The case that was broken: the shared host must fan a `resolveHandle` out
+    /// to the named account's own object, since its own holds no account.
+    #[test]
+    fn routes_to_the_account_named_by_the_handle_param() {
+        let path = "/xrpc/com.atproto.identity.resolveHandle?handle=web1.pds.spirallex.com";
+        assert_eq!(
+            resolve_handle_target(path, ZONE).as_deref(),
+            Some("web1.pds.spirallex.com")
+        );
+    }
+
+    #[test]
+    fn uppercase_handles_normalize_to_the_same_object() {
+        let path = "/xrpc/com.atproto.identity.resolveHandle?handle=WEB1.PDS.Spirallex.com";
+        assert_eq!(
+            resolve_handle_target(path, ZONE).as_deref(),
+            Some("web1.pds.spirallex.com")
+        );
+    }
+
+    /// The open-resolver guard. Falling back to `None` lands the request on the
+    /// shared host's object, which answers HandleNotFound — this PDS must not
+    /// resolve names it does not host.
+    #[test]
+    fn refuses_handles_outside_the_zone() {
+        for foreign in [
+            "alice.bsky.social",
+            "pds.spirallex.com.evil.example",
+            "pds.spirallex.com",
+        ] {
+            let path = format!("/xrpc/com.atproto.identity.resolveHandle?handle={foreign}");
+            assert_eq!(
+                resolve_handle_target(&path, ZONE),
+                None,
+                "should not have routed {foreign}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_other_paths_and_a_missing_handle() {
+        assert_eq!(
+            resolve_handle_target(
+                "/xrpc/com.atproto.repo.getRecord?repo=web1.pds.spirallex.com",
+                ZONE
+            ),
+            None
+        );
+        // No query string at all, and a query without `handle`.
+        assert_eq!(
+            resolve_handle_target("/xrpc/com.atproto.identity.resolveHandle", ZONE),
+            None
+        );
+        assert_eq!(
+            resolve_handle_target("/xrpc/com.atproto.identity.resolveHandle?foo=bar", ZONE),
+            None
+        );
+    }
 }

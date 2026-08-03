@@ -44,8 +44,16 @@ jobs:
       # review, so keep this job's failure message in mind when adding either.
       - run: rustup target add wasm32-unknown-unknown
       - run: cargo build -p stelyph-core --no-default-features --target wasm32-unknown-unknown
+      # `rust-worker` is excluded from the workspace, so every step above skips
+      # it entirely — the deployed Worker could stop compiling and CI would stay
+      # green. Build it on its own manifest, and run its host-side unit tests
+      # (the request-routing helpers are pure functions and need no isolate).
+      - run: cargo build --manifest-path rust-worker/Cargo.toml --target wasm32-unknown-unknown
+      - run: cargo test --manifest-path rust-worker/Cargo.toml
+      - run: cargo clippy --manifest-path rust-worker/Cargo.toml --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-features -- -D warnings
       - run: cargo fmt --all --check
+      - run: cargo fmt --manifest-path rust-worker/Cargo.toml --check
 
   docker:
     name: Docker build
