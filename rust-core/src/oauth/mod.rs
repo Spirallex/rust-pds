@@ -29,6 +29,7 @@
 //! - **Refresh tokens rotate** on every use, and are DPoP-bound.
 
 pub mod client;
+pub mod device;
 pub mod dpop;
 pub mod jwk;
 pub mod jws;
@@ -40,6 +41,7 @@ pub mod store;
 pub mod token;
 
 pub use client::{ClientId, ClientMetadata};
+pub use device::{approval_challenge, verify_approval, SigninStatus};
 pub use dpop::{DpopProof, DpopVerifier};
 pub use jwk::{Alg, JwkSet, PublicJwk, SigningKey};
 pub use metadata::{AuthorizationServerMetadata, ProtectedResourceMetadata};

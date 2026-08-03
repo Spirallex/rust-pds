@@ -1,0 +1,5 @@
+# wasm-bindgen's catch wrappers need an externref table, which only exists when
+# the reference-types proposal is enabled. Target-scoped rather than under
+# [build] so it is not superseded by a more specific key.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+reference-types,+multivalue"]

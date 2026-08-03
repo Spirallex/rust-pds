@@ -42,6 +42,22 @@ pub fn mint_service_auth_jwt_with(
         .duration_since(UNIX_EPOCH)
         .expect("system clock before epoch")
         .as_secs();
+    mint_service_auth_jwt_at(signing_key, iss, aud, lxm, exp_unix, now)
+}
+
+/// Mint a service-auth JWT with the current time supplied by the caller.
+///
+/// `mint_service_auth_jwt_with` reads `SystemTime::now()` for `iat`, which
+/// panics on wasm32 (see the JWT module). The Worker passes `Date`-derived
+/// seconds so it can proxy to the AppView without a system clock.
+pub fn mint_service_auth_jwt_at(
+    signing_key: &Secp256k1Keypair,
+    iss: &str,
+    aud: &str,
+    lxm: Option<&str>,
+    exp_unix: u64,
+    now: u64,
+) -> Result<String, String> {
     let jti = format!("{:032x}", rand::random::<u128>());
     let header_json = r#"{"typ":"JWT","alg":"ES256K"}"#.to_string();
     let mut claims = serde_json::Map::new();
