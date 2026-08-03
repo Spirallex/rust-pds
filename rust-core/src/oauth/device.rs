@@ -101,13 +101,23 @@ mod tests {
             .sign(&approval_challenge("req-123", "WXYZ-1234"))
             .unwrap();
         // Verified against the *enrolled* device's key, not the signer's.
-        assert!(!verify_approval(&enrolled.did(), "req-123", "WXYZ-1234", &sig));
+        assert!(!verify_approval(
+            &enrolled.did(),
+            "req-123",
+            "WXYZ-1234",
+            &sig
+        ));
     }
 
     #[test]
     fn a_garbage_signature_does_not_panic_and_is_rejected() {
         let key = Secp256k1Keypair::create(&mut OsRng);
-        assert!(!verify_approval(&key.did(), "req-123", "WXYZ-1234", &[0u8; 64]));
+        assert!(!verify_approval(
+            &key.did(),
+            "req-123",
+            "WXYZ-1234",
+            &[0u8; 64]
+        ));
         assert!(!verify_approval(&key.did(), "req-123", "WXYZ-1234", &[]));
     }
 
