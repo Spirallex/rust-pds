@@ -8,8 +8,18 @@ use cid::Cid;
 use ipld_core::ipld::Ipld;
 use tokio::sync::Mutex;
 
+use crate::firehose::CommitBody;
 use crate::repo::RepoError;
 use crate::storage::{BlockStoreAdapter, StorageBackend};
+
+/// Whether [`RepoWriter::commit_op`] publishes the encoded frame to `firehose_tx`.
+#[derive(Clone, Copy)]
+enum Publish {
+    /// Encode the frame and broadcast it — the single-process server path.
+    Broadcast,
+    /// Do not publish; the caller owns sequencing and will encode its own frame.
+    Never,
+}
 
 /// Minimal typed repo writer. Phase 3's createRecord handler calls this.
 /// Stateless across calls: re-opens the repo from the stored root CID each time.
@@ -112,6 +122,47 @@ impl RepoWriter {
     /// The full read-modify-commit cycle is serialised by `write_lock` so that
     /// two concurrent callers for the same DID cannot fork the commit history.
     pub async fn apply_one(&self, op: WriteOp) -> Result<WriteOutcome, RepoError> {
+        Ok(self.commit_op(op, Publish::Broadcast).await?.0)
+    }
+
+    /// Like [`Self::apply_one`], but returns the unencoded [`CommitBody`] instead
+    /// of broadcasting an encoded frame — and does not publish to `firehose_tx`.
+    ///
+    /// This exists for deployments where **something other than this writer owns
+    /// the sequence number**. The single-process server lets the per-repo
+    /// `repo_seq` counter be the firehose sequence, so `apply_one` can encode the
+    /// final frame itself. A distributed deployment (e.g. one Durable Object per
+    /// repo, with a separate sequencer object merging every repo into one stream)
+    /// cannot: the PDS-wide `seq` is not known here, and a frame encoded with the
+    /// repo-local `seq` would be wrong on the wire.
+    ///
+    /// Such a caller should overwrite `body.seq` with the authoritative sequence
+    /// and encode with [`crate::firehose::encode_message_frame`]. The returned
+    /// `seq` is this repo's local one, which is a valid fallback only when the
+    /// repo *is* the whole PDS.
+    ///
+    /// Ordering note: the commit is durable when this returns. A caller that then
+    /// fails to publish drops the event from the firehose without rolling the
+    /// commit back, exactly as a dropped broadcast would today.
+    pub async fn apply_one_parts(
+        &self,
+        op: WriteOp,
+    ) -> Result<(WriteOutcome, CommitBody), RepoError> {
+        self.commit_op(op, Publish::Never).await
+    }
+
+    /// The locked commit core behind [`Self::apply_one`] and
+    /// [`Self::apply_one_parts`].
+    ///
+    /// `publish` is handled *inside* the lock deliberately. Broadcasting after
+    /// releasing it would let two concurrent writers for the same DID emit frames
+    /// in an order that disagrees with their `seq`, which a consumer treating the
+    /// stream as ordered would see as the firehose going backwards.
+    async fn commit_op(
+        &self,
+        op: WriteOp,
+        publish: Publish,
+    ) -> Result<(WriteOutcome, CommitBody), RepoError> {
         // Acquire the per-writer logical lock FIRST, before touching repo state.
         // Held until the end of this function — guarantees load → commit is atomic
         // at the application level even when the SQLite writer lock is released
@@ -277,7 +328,7 @@ impl RepoWriter {
         // Build the #commit body. seq=0 is a placeholder — Plan 05's backfill path
         // decodes this blob and injects the real seq from repo_seq.seq at stream time.
         // The broadcast publish below injects the real seq before sending on the wire.
-        use crate::firehose::{encode_message_frame, CommitBody, FirehoseEvent, RepoOp};
+        use crate::firehose::{encode_message_frame, FirehoseEvent, RepoOp};
         let ops = vec![RepoOp {
             action: action.to_string(),
             path: key.clone(),
@@ -309,19 +360,28 @@ impl RepoWriter {
             .commit_blocks(blocks, self.did.as_str(), commit_cid, event_body)
             .await?;
 
-        // Build the full frame with the real seq and publish to the broadcast channel.
-        // Err (no subscribers) is intentionally ignored — not a fault.
+        // Stamp the real seq. For `apply_one` this is the firehose sequence; for
+        // `apply_one_parts` it is the repo-local one the caller is expected to
+        // overwrite with its own authoritative sequence.
         body.seq = seq;
-        let frame = encode_message_frame("#commit", &body);
-        let _ = self.firehose_tx.send(FirehoseEvent { seq, frame });
 
-        Ok(WriteOutcome {
-            action,
-            key,
-            record_cid,
-            commit_cid,
-            rev,
-        })
+        if matches!(publish, Publish::Broadcast) {
+            // Build the full frame with the real seq and publish to the broadcast
+            // channel. Err (no subscribers) is intentionally ignored — not a fault.
+            let frame = encode_message_frame("#commit", &body);
+            let _ = self.firehose_tx.send(FirehoseEvent { seq, frame });
+        }
+
+        Ok((
+            WriteOutcome {
+                action,
+                key,
+                record_cid,
+                commit_cid,
+                rev,
+            },
+            body,
+        ))
     }
 
     /// Return the current MST root CID for the repo, by opening the repo from
@@ -684,6 +744,103 @@ mod tests {
     /// A subscriber created before create_record receives exactly
     /// one FirehoseEvent whose `seq` matches the seq returned by commit_blocks, and
     /// whose `frame` decodes to a #commit with the injected seq.
+    #[tokio::test]
+    async fn apply_one_parts_does_not_publish() {
+        let (writer, _store, mut rx) = writer_with_store().await;
+
+        let (outcome, body) = writer
+            .apply_one_parts(WriteOp::Create {
+                key: "app.bsky.feed.post/3kaaaa".to_string(),
+                record: post("no broadcast"),
+            })
+            .await
+            .expect("apply_one_parts");
+
+        // The whole point: sequencing belongs to the caller, so nothing is put on
+        // the wire here. A stray broadcast would double-publish the commit in a
+        // deployment that also encodes its own frame.
+        assert!(
+            rx.try_recv().is_err(),
+            "apply_one_parts must not publish to the broadcast channel"
+        );
+
+        // The parts must describe the commit that was actually written.
+        assert_eq!(outcome.action, "create");
+        assert_eq!(outcome.key, "app.bsky.feed.post/3kaaaa");
+        assert_eq!(body.repo, writer.did.as_str());
+        assert_eq!(body.commit, outcome.commit_cid);
+        assert_eq!(body.rev, outcome.rev);
+        assert_eq!(body.ops.len(), 1, "one write must yield one op");
+        assert_eq!(body.ops[0].action, "create");
+        assert_eq!(body.ops[0].path, "app.bsky.feed.post/3kaaaa");
+        assert_eq!(body.ops[0].cid, outcome.record_cid);
+        assert!(
+            body.since.is_none(),
+            "first write in a repo has no `since` rev"
+        );
+        assert!(!body.blocks.is_empty(), "CAR blocks must be present");
+    }
+
+    #[tokio::test]
+    async fn apply_one_parts_body_is_re_encodable_with_a_foreign_seq() {
+        let (writer, _store, _rx) = writer_with_store().await;
+
+        let (_outcome, mut body) = writer
+            .apply_one_parts(WriteOp::Create {
+                key: "app.bsky.feed.post/3kbbbb".to_string(),
+                record: post("re-encode"),
+            })
+            .await
+            .expect("apply_one_parts");
+
+        // Stand in for a sequencer that owns a PDS-wide counter: overwrite the
+        // repo-local seq with an unrelated one and encode the wire frame.
+        let foreign_seq = 987_654_i64;
+        assert_ne!(body.seq, foreign_seq);
+        body.seq = foreign_seq;
+        let frame = crate::firehose::encode_message_frame("#commit", &body);
+
+        // It must survive the library's own decoder, carrying the foreign seq.
+        let decoded =
+            crate::firehose::decode_commit_frame(&frame).expect("frame must decode as #commit");
+        assert_eq!(
+            decoded.seq, foreign_seq,
+            "re-encoded frame must carry the caller's seq, not the repo-local one"
+        );
+        assert_eq!(decoded.commit, body.commit);
+        assert_eq!(decoded.rev, body.rev);
+        assert_eq!(decoded.blocks, body.blocks, "CAR must survive re-encoding");
+    }
+
+    #[tokio::test]
+    async fn apply_one_parts_second_write_carries_since() {
+        let (writer, _store, _rx) = writer_with_store().await;
+
+        let (first, _) = writer
+            .apply_one_parts(WriteOp::Create {
+                key: "app.bsky.feed.post/3kaaaa".to_string(),
+                record: post("first"),
+            })
+            .await
+            .expect("first write");
+
+        let (_second, body) = writer
+            .apply_one_parts(WriteOp::Create {
+                key: "app.bsky.feed.post/3kbbbb".to_string(),
+                record: post("second"),
+            })
+            .await
+            .expect("second write");
+
+        // `since` chains the stream: a relay uses it to detect a gap. On the second
+        // write it must be the first commit's rev, not None.
+        assert_eq!(
+            body.since.as_deref(),
+            Some(first.rev.as_str()),
+            "second write must chain `since` to the previous commit's rev"
+        );
+    }
+
     #[tokio::test]
     async fn create_record_publishes_to_broadcast() {
         let (writer, _store, mut rx) = writer_with_store().await;
