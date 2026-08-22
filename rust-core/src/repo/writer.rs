@@ -741,9 +741,9 @@ mod tests {
         assert_eq!(header.roots(), &[commit_cid], "CAR root must be commit_cid");
     }
 
-    /// A subscriber created before create_record receives exactly
-    /// one FirehoseEvent whose `seq` matches the seq returned by commit_blocks, and
-    /// whose `frame` decodes to a #commit with the injected seq.
+    /// `apply_one_parts` commits but stays off the wire: the caller owns
+    /// sequencing, so nothing is broadcast and the returned parts describe the
+    /// commit that was written.
     #[tokio::test]
     async fn apply_one_parts_does_not_publish() {
         let (writer, _store, mut rx) = writer_with_store().await;
@@ -841,6 +841,9 @@ mod tests {
         );
     }
 
+    /// A subscriber created before create_record receives exactly
+    /// one FirehoseEvent whose `seq` matches the seq returned by commit_blocks, and
+    /// whose `frame` decodes to a #commit with the injected seq.
     #[tokio::test]
     async fn create_record_publishes_to_broadcast() {
         let (writer, _store, mut rx) = writer_with_store().await;
