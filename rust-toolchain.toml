@@ -1,0 +1,15 @@
+# Pin the toolchain so a Rust release cannot turn a green `main` red on its own.
+#
+# CI previously used `dtolnay/rust-toolchain@stable`, which follows whatever
+# stable is on the day it runs. When 1.98 shipped a stricter `result_large_err`,
+# every job started failing on untouched code, and a contributor on an older
+# local toolchain saw a clean `cargo clippy` that CI rejected.
+#
+# Pinning here rather than only in the workflow means local `cargo` picks the
+# same version up automatically, so "clean locally" and "clean in CI" mean the
+# same thing. Bumping is now a deliberate PR that carries any new lint fixes
+# with it.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32-unknown-unknown"]
