@@ -239,6 +239,10 @@ async fn dispatch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpRespo
             "/xrpc/com.atproto.server.getSession"
                 | "/xrpc/app.bsky.actor.getPreferences"
                 | "/xrpc/app.bsky.actor.putPreferences"
+                // A repo write names its repo in the body, but the body is not
+                // trusted for routing: the token's `sub` decides which DO it
+                // reaches, and the DO re-checks that `repo` matches.
+                | "/xrpc/com.atproto.repo.createRecord"
         ) || auth_route.starts_with("/xrpc/app.bsky.")
             || auth_route.starts_with("/xrpc/chat.bsky.");
         if is_auth {

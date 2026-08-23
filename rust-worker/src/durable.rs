@@ -225,8 +225,41 @@ impl PdsDurableObject {
             // DO holds one account and describes it. `ctx` is the shared service
             // identity; `hostname` is this account's own host.
             "/xrpc/com.atproto.repo.describeRepo" => {
-                let store = self.store()?;
-                h::describe_repo(&store, &ctx, &hostname).await
+                let store = std::sync::Arc::new(self.store()?);
+                h::describe_repo(store, &ctx, &hostname).await
+            }
+
+            // Repo-scoped reads. Like describeRepo, `repo` was already consumed
+            // by the front Worker to pick this DO, so it is not re-read here.
+            "/xrpc/com.atproto.repo.getRecord" => {
+                let q = |k: &str| {
+                    url.query_pairs()
+                        .find(|(n, _)| n == k)
+                        .map(|(_, v)| v.into_owned())
+                };
+                match (q("collection"), q("rkey")) {
+                    (Some(collection), Some(rkey)) => {
+                        let store = std::sync::Arc::new(self.store()?);
+                        h::get_record(store, &collection, &rkey).await
+                    }
+                    _ => xrpc_error(400, "InvalidRequest", "collection and rkey are required"),
+                }
+            }
+            "/xrpc/com.atproto.repo.listRecords" => {
+                let q = |k: &str| {
+                    url.query_pairs()
+                        .find(|(n, _)| n == k)
+                        .map(|(_, v)| v.into_owned())
+                };
+                match q("collection") {
+                    Some(collection) => {
+                        let limit = q("limit").and_then(|l| l.parse::<usize>().ok());
+                        let cursor = q("cursor");
+                        let store = std::sync::Arc::new(self.store()?);
+                        h::list_records(store, &collection, limit, cursor.as_deref()).await
+                    }
+                    None => xrpc_error(400, "InvalidRequest", "collection is required"),
+                }
             }
 
             "/xrpc/com.atproto.server.createSession" => {
@@ -243,6 +276,40 @@ impl PdsDurableObject {
                 let bearer = bearer(&req)?;
                 let store = self.store()?;
                 h::get_preferences(&store, bearer.as_deref(), &self.jwt_secret()?).await
+            }
+            "/xrpc/com.atproto.repo.createRecord" => {
+                let bearer = bearer(&req)?;
+                let body = req.text().await?;
+                let store = std::sync::Arc::new(self.store()?);
+                match h::create_record(
+                    store,
+                    bearer.as_deref(),
+                    &self.jwt_secret()?,
+                    &self.key_passphrase()?,
+                    &body,
+                )
+                .await?
+                {
+                    Err(resp) => Ok(resp),
+                    Ok(sequenced) => {
+                        // The commit is already durable. Sequencing is what puts
+                        // it on the firehose, and only the sequencer knows the
+                        // PDS-wide seq, so hand it the parts here.
+                        //
+                        // A failure to enqueue is logged, not surfaced: the
+                        // record exists, so a 5xx would invite a retry that
+                        // wrote it twice. The cost is a firehose gap, which is
+                        // the same failure mode an in-process dropped broadcast
+                        // already has upstream.
+                        if let Err(e) = self.enqueue_commit(&sequenced.body).await {
+                            console_error!("firehose enqueue failed: {e}");
+                        }
+                        Response::from_json(&serde_json::json!({
+                            "uri": sequenced.uri,
+                            "cid": sequenced.cid,
+                        }))
+                    }
+                }
             }
             "/xrpc/app.bsky.actor.putPreferences" => {
                 let bearer = bearer(&req)?;
@@ -321,6 +388,40 @@ impl PdsDurableObject {
     }
 
     /// Secret used to sign session JWTs.
+    /// Hand a fresh commit to the sequencer, which assigns the PDS-wide `seq`
+    /// and encodes the wire `#commit` frame.
+    ///
+    /// The writer deliberately returns the commit *parts* rather than an encoded
+    /// frame: each account is its own Durable Object with its own local
+    /// sequence, and a frame stamped with that local number would be wrong on a
+    /// stream that merges every account (see `sequencer.rs`).
+    async fn enqueue_commit(&self, body: &stelyph_core::firehose::CommitBody) -> Result<()> {
+        let stub = crate::sequencer_stub(&self.env)?;
+        let ops: Vec<serde_json::Value> = body
+            .ops
+            .iter()
+            .map(|op| {
+                serde_json::json!({
+                    "action": op.action,
+                    "path": op.path,
+                    "cid": op.cid.map(|c| c.to_string()),
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "repo": body.repo,
+            "commit": body.commit.to_string(),
+            "rev": body.rev,
+            "since": body.since,
+            // The CAR is bytes and the hop is JSON, so it rides as base64.
+            "blocks_b64": data_encoding::BASE64.encode(&body.blocks),
+            "ops": ops,
+            "too_big": body.too_big,
+        });
+        crate::call_do(&stub, "/enqueue", payload).await?;
+        Ok(())
+    }
+
     fn jwt_secret(&self) -> Result<Vec<u8>> {
         self.env
             .secret("PDS_JWT_SECRET")

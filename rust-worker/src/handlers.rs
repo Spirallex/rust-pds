@@ -635,9 +635,13 @@ fn xrpc_err(status: u16, error: &str, message: &str) -> Result<Response> {
 /// Served after the front Worker has routed the request to the right account's
 /// DO (by `repo` = handle or DID). Because each DO holds exactly one account,
 /// the `repo` parameter is only a routing key — here we simply describe the one
-/// account present. `collections` is genuinely empty until records exist; the
-/// write path that would populate it is not on this Worker yet.
-pub async fn describe_repo(store: &DoStore, ctx: &Ctx, hostname: &str) -> Result<Response> {
+/// account present. `collections` is computed by walking the repo, so it is
+/// empty only when the account really has written nothing.
+pub async fn describe_repo(
+    store: std::sync::Arc<DoStore>,
+    ctx: &Ctx,
+    hostname: &str,
+) -> Result<Response> {
     use stelyph_core::storage::AccountStore;
 
     let account = store
@@ -665,11 +669,15 @@ pub async fn describe_repo(store: &DoStore, ctx: &Ctx, hostname: &str) -> Result
         }],
     });
 
+    let collections = stelyph_core::repo::list_collections(store, &did)
+        .await
+        .map_err(|e| Error::RustError(format!("list_collections: {e}")))?;
+
     Response::from_json(&serde_json::json!({
         "handle": handle,
         "did": did,
         "didDoc": did_doc,
-        "collections": [],
+        "collections": collections,
         "handleIsCorrect": true,
     }))
 }
@@ -865,5 +873,216 @@ pub fn did_web_document(ctx: &Ctx) -> Result<Response> {
             "type": "AtprotoPersonalDataServer",
             "serviceEndpoint": ctx.issuer,
         }],
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// createRecord
+// ---------------------------------------------------------------------------
+
+/// What a successful write needs handed to the sequencer.
+///
+/// The commit is already durable when this exists — the sequencer only decides
+/// what the *firehose* says about it, and it owns the PDS-wide `seq` that a
+/// repo-local writer cannot know (see `sequencer.rs`).
+pub struct Sequenced {
+    pub uri: String,
+    pub cid: String,
+    pub body: stelyph_core::firehose::CommitBody,
+}
+
+/// `POST /xrpc/com.atproto.repo.createRecord` — a signed write into the caller's
+/// repo.
+///
+/// Returns `Ok(Err(response))` for every client-visible rejection so the caller
+/// can send it unchanged, and `Ok(Ok(Sequenced))` once the commit is durable.
+/// Splitting it this way keeps the sequencer call in the Durable Object, which
+/// is the only place with the `env` needed to reach the sequencer binding.
+pub async fn create_record(
+    store: std::sync::Arc<DoStore>,
+    bearer: Option<&str>,
+    jwt_secret: &[u8],
+    passphrase: &[u8],
+    body: &str,
+) -> Result<std::result::Result<Sequenced, Response>> {
+    use atrium_api::types::string::Did;
+    use atrium_crypto::keypair::Secp256k1Keypair;
+    use stelyph_core::auth::jwt::decode_jwt;
+    use stelyph_core::repo::util::{
+        json_value_to_ipld, tid_from_micros, validate_collection, validate_rkey,
+    };
+    use stelyph_core::repo::writer::WriteOp;
+    use stelyph_core::repo::RepoWriter;
+    use stelyph_core::storage::crypto;
+
+    // The DID comes from the access token, never the body: `repo` is checked
+    // against it below so a valid token cannot write into someone else's repo.
+    let Some(did) = bearer
+        .and_then(|t| decode_jwt(t, jwt_secret).ok())
+        .map(|c| c.sub)
+    else {
+        return Ok(Err(xrpc_err(
+            401,
+            "AuthenticationRequired",
+            "Invalid token.",
+        )?));
+    };
+
+    let Ok(input) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Ok(Err(xrpc_err(400, "InvalidRequest", "Malformed body.")?));
+    };
+
+    if input["repo"].as_str() != Some(did.as_str()) {
+        return Ok(Err(xrpc_err(
+            400,
+            "InvalidRequest",
+            "repo must match the authenticated DID.",
+        )?));
+    }
+
+    let Some(collection) = input["collection"].as_str().map(str::to_owned) else {
+        return Ok(Err(xrpc_err(
+            400,
+            "InvalidRequest",
+            "collection is required.",
+        )?));
+    };
+    if let Err(msg) = validate_collection(&collection) {
+        return Ok(Err(xrpc_err(400, "InvalidRequest", &msg)?));
+    }
+
+    // An absent rkey is normal: most records are keyed by creation time. A
+    // supplied one is validated, since it becomes part of the AT-URI.
+    let rkey = match input["rkey"].as_str() {
+        Some(rk) => {
+            if let Err(msg) = validate_rkey(rk) {
+                return Ok(Err(xrpc_err(400, "InvalidRequest", &msg)?));
+            }
+            rk.to_owned()
+        }
+        None => tid_from_micros(Date::now().as_millis() * 1_000),
+    };
+
+    let record = input["record"].clone();
+    if record.is_null() {
+        return Ok(Err(xrpc_err(400, "InvalidRequest", "record is required.")?));
+    }
+    let Ok(ipld) = json_value_to_ipld(record) else {
+        return Ok(Err(xrpc_err(
+            400,
+            "InvalidRequest",
+            "record is not encodable as IPLD.",
+        )?));
+    };
+
+    // Unwrap the account's signing key. Every commit is signed with it, so a
+    // failure here is a server fault, not a bad request.
+    let scalar = crypto::load_key(store.as_ref(), &format!("{did}#signing"), passphrase)
+        .await
+        .map_err(|e| Error::RustError(format!("load signing key: {e}")))?;
+    let key = Secp256k1Keypair::import(&scalar)
+        .map_err(|e| Error::RustError(format!("import signing key: {e}")))?;
+
+    let did_typed =
+        Did::new(did.clone()).map_err(|e| Error::RustError(format!("bad account DID: {e}")))?;
+
+    // The broadcast sender is required by the constructor but never fires:
+    // `apply_one_parts` deliberately does not publish, because this deployment's
+    // firehose is the sequencer Durable Object, not an in-process channel.
+    let (tx, _rx) = tokio::sync::broadcast::channel(1);
+    let writer = RepoWriter::new(store.clone(), key, did_typed, tx);
+
+    let mst_key = format!("{collection}/{rkey}");
+    let (_outcome, commit) = writer
+        .apply_one_parts(WriteOp::Create {
+            key: mst_key,
+            record: ipld,
+        })
+        .await
+        .map_err(|e| Error::RustError(format!("repo write failed: {e}")))?;
+
+    let record_cid = commit
+        .ops
+        .first()
+        .and_then(|op| op.cid)
+        .ok_or_else(|| Error::RustError("create op yielded no record cid".into()))?;
+
+    Ok(Ok(Sequenced {
+        uri: format!("at://{did}/{collection}/{rkey}"),
+        cid: record_cid.to_string(),
+        body: commit,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// repo reads
+// ---------------------------------------------------------------------------
+
+/// The DID of the one account this Durable Object holds.
+///
+/// The `repo` query parameter is only a routing key — the front Worker already
+/// used it to pick this DO — so reads answer for the account present here
+/// rather than trusting the parameter a second time.
+async fn sole_account_did(store: &DoStore) -> Result<Option<String>> {
+    Ok(store
+        .list_accounts()
+        .await
+        .map_err(|e| Error::RustError(format!("list accounts: {e}")))?
+        .into_iter()
+        .next()
+        .map(|a| a.did))
+}
+
+/// `GET /xrpc/com.atproto.repo.getRecord`
+pub async fn get_record(
+    store: std::sync::Arc<DoStore>,
+    collection: &str,
+    rkey: &str,
+) -> Result<Response> {
+    let Some(did) = sole_account_did(store.as_ref()).await? else {
+        return xrpc_err(404, "RepoNotFound", "No account on this host.");
+    };
+    let mst_key = format!("{collection}/{rkey}");
+    let found = stelyph_core::repo::get_record(store, &did, &mst_key)
+        .await
+        .map_err(|e| Error::RustError(format!("get_record: {e}")))?;
+    let Some(entry) = found else {
+        return xrpc_err(404, "RecordNotFound", "Record not found.");
+    };
+    Response::from_json(&serde_json::json!({
+        "uri": format!("at://{did}/{}", entry.key),
+        "cid": entry.cid.to_string(),
+        "value": entry.value,
+    }))
+}
+
+/// `GET /xrpc/com.atproto.repo.listRecords`
+pub async fn list_records(
+    store: std::sync::Arc<DoStore>,
+    collection: &str,
+    limit: Option<usize>,
+    cursor: Option<&str>,
+) -> Result<Response> {
+    let Some(did) = sole_account_did(store.as_ref()).await? else {
+        return xrpc_err(404, "RepoNotFound", "No account on this host.");
+    };
+    let page =
+        stelyph_core::repo::list_records(store, &did, collection, limit.unwrap_or(50), cursor)
+            .await
+            .map_err(|e| Error::RustError(format!("list_records: {e}")))?;
+    let records: Vec<serde_json::Value> = page
+        .records
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "uri": format!("at://{did}/{}", r.key),
+                "cid": r.cid.to_string(),
+                "value": r.value,
+            })
+        })
+        .collect();
+    Response::from_json(&serde_json::json!({
+        "records": records,
+        "cursor": page.cursor,
     }))
 }
