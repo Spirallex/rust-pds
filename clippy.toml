@@ -1,0 +1,9 @@
+# `Result<T, Response<Full<Bytes>>>` is a deliberate pattern in the server crates:
+# internal helpers return either a value or a ready-made HTTP error response, so
+# handlers can early-return one with `?`. hyper's Response is 144 bytes, which
+# trips clippy's `result_large_err` default of 128.
+#
+# Boxing those six error variants would add an allocation and call-site churn to
+# cold error paths purely to satisfy the threshold. Raising it to 160 keeps the
+# lint meaningful for genuinely oversized error types while accepting this one.
+large-error-threshold = 160

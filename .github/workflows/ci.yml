@@ -23,7 +23,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned, not `@stable`: an unpinned toolchain lets a Rust release turn a
+      # green `main` red with no code change. Keep this in sync with the channel
+      # in rust-toolchain.toml, which is what local builds resolve.
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
