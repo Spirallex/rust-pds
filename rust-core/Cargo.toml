@@ -68,7 +68,9 @@ hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }
 bytes = { version = "1", optional = true }
 # MST prefix streams (`entries_prefixed`) are futures Streams; util-only, no exec.
-futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
+# Not optional: `repo::read` walks those streams, and repo reads are core to
+# every deployment rather than a server-only extra.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # RFC 6455 handshake accept key is SHA-1 by spec (subscribeRepos WS host only).
 sha1 = { version = "0.10", optional = true }
 # Only pulled in when the `testing` feature is on (in-memory store + seed helpers
@@ -109,7 +111,6 @@ embedded-server = [
     "dep:hyper-util",
     "dep:http-body-util",
     "dep:bytes",
-    "dep:futures-util",
     "dep:sha1",
     "tokio/net",
     "tokio/io-util",
