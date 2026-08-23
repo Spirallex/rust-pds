@@ -175,6 +175,102 @@ pub async fn list_collections(
     Ok(out)
 }
 
+/// A whole repo as a relay asks for it: the CARv1 bytes plus the commit they
+/// are rooted at.
+pub struct RepoExport {
+    pub root: Cid,
+    pub rev: String,
+    pub car: Vec<u8>,
+}
+
+/// The current commit CID and `rev` for a repo, or `None` if it has never been
+/// written to.
+///
+/// This is `com.atproto.sync.getLatestCommit`, and it is also how a consumer
+/// decides whether its own copy is stale before paying for a full export.
+pub async fn latest_commit(
+    store: Arc<dyn StorageBackend>,
+    did: &str,
+) -> Result<Option<(Cid, String)>, RepoError> {
+    let Some(root) = store.load_repo_root(did).await? else {
+        return Ok(None);
+    };
+    let rev = commit_rev(&store, root).await?;
+    Ok(Some((root, rev)))
+}
+
+/// Read the `rev` out of a commit block.
+///
+/// `CommitBuilder` does not expose `rev`, so the stored block is decoded. Extra
+/// map keys are ignored by dag-cbor deserialisation, so this struct needs only
+/// the one field.
+async fn commit_rev(store: &Arc<dyn StorageBackend>, commit: Cid) -> Result<String, RepoError> {
+    #[derive(serde::Deserialize)]
+    struct CommitHeader {
+        rev: atrium_api::types::string::Tid,
+    }
+    let bytes = store.read_block_bytes(commit).await?;
+    let header: CommitHeader = serde_ipld_dagcbor::from_slice(&bytes)
+        .map_err(|e| RepoError::Repo(format!("decode commit {commit}: {e}")))?;
+    Ok(header.rev.as_ref().to_string())
+}
+
+/// Export an entire repo as CARv1 bytes, rooted at its current commit.
+///
+/// This is `com.atproto.sync.getRepo` — how a relay backfills a repo it has no
+/// copy of, or has fallen behind on. Without it, a consumer that disconnects
+/// can never catch up, because the firehose only carries what happens next.
+///
+/// **The CAR is built in memory.** That is fine at the sizes a personal PDS
+/// reaches and keeps this usable from a Worker isolate, but it does mean the
+/// whole repo is resident for the duration of the call. A repo large enough for
+/// that to matter needs a streaming export, which is a different signature.
+pub async fn export_car(
+    store: Arc<dyn StorageBackend>,
+    did: &str,
+) -> Result<Option<RepoExport>, RepoError> {
+    use iroh_car::{CarHeader, CarWriter};
+
+    let Some(root) = store.load_repo_root(did).await? else {
+        return Ok(None);
+    };
+    let rev = commit_rev(&store, root).await?;
+
+    let mut diff = DiffBlockStore::wrap(BlockStoreAdapter::new(store.clone()));
+    let mut repo = Repository::open(&mut diff, root)
+        .await
+        .map_err(|e| RepoError::Repo(e.to_string()))?;
+
+    // `export` yields the commit root, every MST node, and every record it
+    // references. Deduplicated because a CAR must not carry a block twice and
+    // the walk can reach a block by more than one path.
+    let cids: Vec<Cid> = repo
+        .export()
+        .await
+        .map_err(|e| RepoError::Repo(e.to_string()))?
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    // Root MUST be the commit CID: that is what a relay verifies the signature
+    // against after reading the CAR.
+    let mut car: Vec<u8> = Vec::new();
+    let mut writer = CarWriter::new(CarHeader::new_v1(vec![root]), &mut car);
+    for cid in cids {
+        let bytes = store.read_block_bytes(cid).await?;
+        writer
+            .write(cid, bytes)
+            .await
+            .map_err(|e| RepoError::Repo(format!("car write {cid}: {e}")))?;
+    }
+    writer
+        .finish()
+        .await
+        .map_err(|e| RepoError::Repo(format!("car finish: {e}")))?;
+
+    Ok(Some(RepoExport { root, rev, car }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +395,84 @@ mod tests {
         .expect("page 3");
         assert_eq!(third.records.len(), 1);
         assert!(third.cursor.is_none(), "short page must not yield a cursor");
+    }
+
+    #[tokio::test]
+    async fn export_car_round_trips_through_a_car_reader() {
+        let (writer, store) = writer_with_store().await;
+        writer
+            .create_record("app.bsky.feed.post/3kaaaa", post("exported"))
+            .await
+            .expect("write");
+
+        let export = export_car(store, DID)
+            .await
+            .expect("export_car")
+            .expect("repo exists");
+
+        // A relay reads the CAR and verifies the commit signature against the
+        // root, so the root must be the commit -- not the MST root.
+        use iroh_car::CarReader;
+        let reader = CarReader::new(tokio::io::BufReader::new(std::io::Cursor::new(export.car)))
+            .await
+            .expect("CAR must be valid CARv1");
+        assert_eq!(reader.header().roots(), &[export.root]);
+
+        // Every block must appear exactly once: a CAR carrying a duplicate is
+        // malformed, and the export walk can reach a block by several paths.
+        let mut seen = std::collections::BTreeSet::new();
+        let mut reader = reader;
+        while let Some((cid, _bytes)) = reader.next_block().await.expect("block must decode") {
+            assert!(seen.insert(cid), "duplicate block in CAR: {cid}");
+        }
+        assert!(
+            seen.contains(&export.root),
+            "CAR must contain the commit block it is rooted at"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_and_latest_commit_are_none_for_an_unwritten_repo() {
+        let (_writer, store) = writer_with_store().await;
+        assert!(export_car(store.clone(), DID)
+            .await
+            .expect("export")
+            .is_none());
+        assert!(latest_commit(store, DID).await.expect("latest").is_none());
+    }
+
+    #[tokio::test]
+    async fn latest_commit_tracks_the_newest_write() {
+        let (writer, store) = writer_with_store().await;
+        writer
+            .create_record("app.bsky.feed.post/3kaaaa", post("one"))
+            .await
+            .expect("write 1");
+        let (root1, rev1) = latest_commit(store.clone(), DID)
+            .await
+            .expect("latest")
+            .expect("exists");
+
+        writer
+            .create_record("app.bsky.feed.post/3kbbbb", post("two"))
+            .await
+            .expect("write 2");
+        let (root2, rev2) = latest_commit(store.clone(), DID)
+            .await
+            .expect("latest")
+            .expect("exists");
+
+        assert_ne!(root1, root2, "a second write must move the commit");
+        assert!(rev2 > rev1, "rev must advance: {rev1} -> {rev2}");
+
+        // The export must be rooted at the newest commit, or a backfilling relay
+        // would reconstruct a stale repo.
+        let export = export_car(store, DID)
+            .await
+            .expect("export")
+            .expect("exists");
+        assert_eq!(export.root, root2);
+        assert_eq!(export.rev, rev2);
     }
 
     #[tokio::test]
