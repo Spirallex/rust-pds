@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in with Stelyph — passwordless demo</title>
+<style>
+  :root {
+    --ground:#100E0B; --surface:#18140F; --surface2:#221C14; --raise:#2A2318;
+    --line:#2E2820; --line-soft:#231E17;
+    --amber:#F5A83C; --amber-strong:#FFB84D;
+    --glow:rgba(245,168,60,.13);
+    --text:#F3EEE4; --text2:#ADA596; --text3:#726A5C;
+    --good:#63C97C; --bad:#E5686A; --wait:#E0B34A;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    --ui:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--ground); color:var(--text); font-family:var(--ui);
+    line-height:1.5; -webkit-font-smoothing:antialiased; padding:clamp(18px,4vw,44px); }
+  .wrap { max-width:1000px; margin:0 auto; }
+  h1 { font-size:clamp(24px,3.5vw,34px); letter-spacing:-.02em; margin:0 0 6px; font-weight:640; }
+  h1 .a { color:var(--amber); }
+  .sub { color:var(--text2); margin:0 0 26px; max-width:62ch; font-size:15px; }
+
+  .acct { display:flex; align-items:center; gap:12px; background:var(--surface); border:1px solid var(--line);
+    border-radius:12px; padding:12px 14px; margin-bottom:24px; flex-wrap:wrap; }
+  .acct label { font-family:var(--mono); font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--text3); }
+  .acct input { flex:1; min-width:200px; background:var(--surface2); border:1px solid var(--line); border-radius:9px;
+    padding:10px 12px; color:var(--amber); font-family:var(--mono); font-size:14px; }
+  .acct .host { font-family:var(--mono); font-size:12px; color:var(--text3); }
+
+  .cols { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+  @media (max-width:760px){ .cols { grid-template-columns:1fr; } }
+
+  .card { background:var(--surface); border:1px solid var(--line); border-radius:16px; padding:22px; }
+  .card h2 { margin:0 0 3px; font-size:17px; display:flex; align-items:center; gap:9px; }
+  .card h2 .n { width:24px; height:24px; border-radius:50%; background:var(--glow); color:var(--amber);
+    display:grid; place-items:center; font-size:13px; font-weight:700; flex:none; }
+  .card .lead { color:var(--text2); font-size:13px; margin:0 0 18px; }
+
+  input.txt, input.pw { width:100%; background:var(--surface2); border:1px solid var(--line); border-radius:9px;
+    padding:11px 12px; color:var(--text); font-size:14px; margin-bottom:10px; font-family:var(--ui); }
+  input.txt { font-family:var(--mono); }
+
+  button { font-family:var(--ui); font-weight:640; font-size:14px; border:none; border-radius:10px;
+    padding:11px 16px; cursor:pointer; transition:filter .1s; }
+  button:hover { filter:brightness(1.08); }
+  button:disabled { opacity:.45; cursor:not-allowed; filter:none; }
+  .btn-primary { background:var(--amber); color:#1a1206; width:100%; }
+  .btn-ghost { background:transparent; border:1px solid var(--line); color:var(--text2); }
+  .btn-good { background:var(--good); color:#08240f; }
+  .btn-bad { background:transparent; border:1px solid var(--bad); color:var(--bad); }
+  .row { display:flex; gap:8px; }
+
+  .code { font-family:var(--mono); font-size:34px; letter-spacing:.12em; color:var(--amber); text-align:center;
+    padding:18px; background:var(--surface2); border:1px dashed var(--amber); border-radius:12px; margin:6px 0 12px; }
+  .status { display:flex; align-items:center; gap:9px; font-size:13.5px; padding:10px 0; }
+  .dot { width:9px; height:9px; border-radius:50%; flex:none; }
+  .dot.wait { background:var(--wait); box-shadow:0 0 8px var(--wait); animation:pulse 1.2s infinite; }
+  .dot.good { background:var(--good); box-shadow:0 0 8px var(--good); }
+  .dot.bad { background:var(--bad); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+
+  .session { background:var(--surface2); border:1px solid var(--line); border-radius:11px; padding:14px; margin-top:8px; }
+  .session .who { font-size:16px; font-weight:640; margin-bottom:8px; }
+  .kv { font-family:var(--mono); font-size:11px; color:var(--text2); word-break:break-all; margin:6px 0; }
+  .kv b { color:var(--text3); font-weight:500; }
+  details summary { font-size:12px; color:var(--amber); cursor:pointer; margin-top:6px; }
+
+  .pending { border:1px solid var(--line-soft); border-radius:11px; padding:12px 13px; margin-bottom:9px; background:var(--surface2); }
+  .pending .cn { font-weight:640; font-size:14px; }
+  .pending .uc { font-family:var(--mono); color:var(--amber); font-size:15px; letter-spacing:.08em; margin:2px 0 10px; }
+  .pending .row { margin-top:2px; }
+  .pending .row button { flex:1; }
+  .muted { color:var(--text3); font-size:12.5px; }
+
+  .enrolled { display:flex; align-items:center; gap:9px; background:var(--glow); border:1px solid var(--amber);
+    border-radius:10px; padding:10px 12px; font-size:13px; margin-bottom:14px; }
+  .enrolled .k { font-family:var(--mono); font-size:11px; color:var(--text3); }
+  .err { color:var(--bad); font-size:12.5px; margin:6px 0; min-height:1em; }
+  .foot { margin-top:30px; color:var(--text3); font-size:12px; font-family:var(--mono); line-height:1.7;
+    border-top:1px solid var(--line); padding-top:16px; }
+  .badge { font-family:var(--mono); font-size:9.5px; letter-spacing:.1em; text-transform:uppercase; color:var(--amber);
+    background:var(--glow); border:1px solid var(--amber); padding:2px 7px; border-radius:6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Sign in with <span class="a">Stelyph</span></h1>
+  <p class="sub">Passwordless sign-in, approved on your phone. The website starts a request and shows a code; your
+    phone (or the simulated one here) confirms it with a signature from an enrolled device key — no password is
+    ever typed into the website.</p>
+
+  <div class="acct">
+    <label for="handle">Account</label>
+    <input id="handle" type="text" placeholder="c91.pds.spirallex.com" autocapitalize="off" autocorrect="off" spellcheck="false">
+    <span class="host" id="hostPreview"></span>
+  </div>
+
+  <div class="cols">
+    <!-- ============ WEBSITE (client) ============ -->
+    <div class="card">
+      <h2><span class="n">1</span> The website</h2>
+      <p class="lead">A site you want to log in to. It never sees your password.</p>
+
+      <div id="clientIdle">
+        <input id="clientName" class="txt" value="Graysky (demo)" placeholder="client name">
+        <button class="btn-primary" id="startBtn">Sign in with Stelyph</button>
+      </div>
+
+      <div id="clientWaiting" hidden>
+        <p class="muted">Approve this on your phone — it should show the same code:</p>
+        <div class="code" id="userCode">····-····</div>
+        <div class="status"><span class="dot wait"></span><span id="waitMsg">Waiting for approval…</span></div>
+        <button class="btn-ghost" id="cancelBtn" style="width:100%">Cancel</button>
+      </div>
+
+      <div id="clientDone" hidden></div>
+      <div class="err" id="clientErr"></div>
+    </div>
+
+    <!-- ============ PHONE (approver) ============ -->
+    <div class="card">
+      <h2><span class="n">2</span> Your phone <span class="badge">simulated</span></h2>
+      <p class="lead">Stands in for the Stelyph iOS app. Enroll this browser once with your password; after that it
+        approves sign-ins with its device key — exactly what the app does behind Face&nbsp;ID.</p>
+
+      <div id="enrollBox">
+        <input id="enrollPw" class="pw" type="password" placeholder="account password (used once to enroll)">
+        <input id="enrollLabel" class="txt" value="Demo browser" placeholder="device label">
+        <button class="btn-primary" id="enrollBtn">Enroll this browser as a device</button>
+      </div>
+
+      <div id="enrolledBox" hidden>
+        <div class="enrolled">
+          <span class="dot good"></span>
+          <div>Enrolled · <span id="enrolledLabel"></span><br><span class="k" id="enrolledId"></span></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+          <span class="muted">Pending sign-ins</span>
+          <button class="btn-ghost" id="forgetBtn" style="padding:5px 10px;font-size:12px">Forget device</button>
+        </div>
+        <div id="pendingList"><p class="muted" id="noPending">None right now.</p></div>
+      </div>
+      <div class="err" id="phoneErr"></div>
+    </div>
+  </div>
+
+  <div class="foot" id="foot">
+    start → poll → approve(sign challenge) → session &nbsp;·&nbsp; endpoints on the account host, CORS open<br>
+    P-256 device key · did:key:zDn… · challenge = "stelyph-signin-approval:v1:{requestId}:{userCode}"
+  </div>
+</div>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------------------
+// Config / account host
+// ---------------------------------------------------------------------------
+const handleEl = document.getElementById("handle");
+const hostPreview = document.getElementById("hostPreview");
+const ZONE = "pds.spirallex.com";
+
+function accountHost() {
+  const h = handleEl.value.trim().toLowerCase();
+  if (!h) return null;
+  return h.includes(".") ? h : `${h}.${ZONE}`;
+}
+function baseURL() { const h = accountHost(); return h ? `https://${h}` : null; }
+function refreshHost() {
+  const h = accountHost();
+  hostPreview.textContent = h ? `→ https://${h}` : "";
+}
+handleEl.addEventListener("input", refreshHost);
+handleEl.value = ""; refreshHost();
+
+async function api(path, opts) {
+  const b = baseURL();
+  if (!b) throw new Error("Enter your account handle first.");
+  const res = await fetch(b + path, opts);
+  let body = null;
+  try { body = await res.json(); } catch (_) {}
+  if (!res.ok) {
+    const msg = (body && (body.message || body.error)) || `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+  return body;
+}
+
+// ---------------------------------------------------------------------------
+// Encoding helpers
+// ---------------------------------------------------------------------------
+const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+function base58btc(bytes) {
+  let digits = [0];
+  for (const byte of bytes) {
+    let carry = byte;
+    for (let j = 0; j < digits.length; j++) {
+      carry += digits[j] << 8;
+      digits[j] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry) { digits.push(carry % 58); carry = (carry / 58) | 0; }
+  }
+  let out = "";
+  for (const b of bytes) { if (b === 0) out += "1"; else break; }
+  for (let k = digits.length - 1; k >= 0; k--) out += B58[digits[k]];
+  return out;
+}
+function b64(bytes) {
+  let s = ""; for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s);
+}
+const enc = new TextEncoder();
+
+// P-256 (secp256r1) group order, for low-S normalization.
+const P256_N    = BigInt("0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551");
+const P256_HALF = P256_N >> 1n;
+function bytesToBig(b) { let x = 0n; for (const v of b) x = (x << 8n) | BigInt(v); return x; }
+function bigTo32(x) { const out = new Uint8Array(32); for (let i = 31; i >= 0; i--) { out[i] = Number(x & 0xffn); x >>= 8n; } return out; }
+
+// ---------------------------------------------------------------------------
+// Device key (WebCrypto P-256), persisted in IndexedDB — non-extractable,
+// the closest a browser gets to the phone's Secure Enclave.
+// ---------------------------------------------------------------------------
+function idb() {
+  return new Promise((resolve, reject) => {
+    const r = indexedDB.open("stelyph-signin-demo", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("kv");
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+async function idbGet(key) {
+  const db = await idb();
+  return new Promise((res, rej) => {
+    const t = db.transaction("kv").objectStore("kv").get(key);
+    t.onsuccess = () => res(t.result); t.onerror = () => rej(t.error);
+  });
+}
+async function idbSet(key, val) {
+  const db = await idb();
+  return new Promise((res, rej) => {
+    const t = db.transaction("kv", "readwrite").objectStore("kv").put(val, key);
+    t.onsuccess = () => res(); t.onerror = () => rej(t.error);
+  });
+}
+async function idbDel(key) {
+  const db = await idb();
+  return new Promise((res, rej) => {
+    const t = db.transaction("kv", "readwrite").objectStore("kv").delete(key);
+    t.onsuccess = () => res(); t.onerror = () => rej(t.error);
+  });
+}
+
+// Compress a WebCrypto raw public key (65B: 04|X|Y) → 33B compressed, then
+// wrap in the p256-pub multicodec (0x1200 → varint 80 24) and base58btc as a
+// did:key. Matches what stelyph-core's verify_approval decodes.
+function rawPubToDidKey(raw) {
+  const x = raw.slice(1, 33), y = raw.slice(33, 65);
+  const prefix = (y[31] & 1) === 0 ? 0x02 : 0x03;
+  const compressed = new Uint8Array(33); compressed[0] = prefix; compressed.set(x, 1);
+  const mc = new Uint8Array(35); mc[0] = 0x80; mc[1] = 0x24; mc.set(compressed, 2);
+  return "did:key:z" + base58btc(mc);
+}
+
+async function generateDeviceKey() {
+  const pair = await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+  const raw = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+  return { pair, didKey: rawPubToDidKey(raw) };
+}
+
+// Sign the approval challenge, normalized to low-S, as a 64-byte r||s.
+async function signChallenge(privateKey, requestId, userCode) {
+  const msg = enc.encode(`stelyph-signin-approval:v1:${requestId}:${userCode}`);
+  const sig = new Uint8Array(await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" }, privateKey, msg));
+  const r = sig.slice(0, 32);
+  let s = bytesToBig(sig.slice(32, 64));
+  if (s > P256_HALF) s = P256_N - s;      // enforce low-S
+  const out = new Uint8Array(64); out.set(r, 0); out.set(bigTo32(s), 32);
+  return b64(out);
+}
+
+// ---------------------------------------------------------------------------
+// Website (client): start → poll → session
+// ---------------------------------------------------------------------------
+const startBtn = document.getElementById("startBtn");
+const clientIdle = document.getElementById("clientIdle");
+const clientWaiting = document.getElementById("clientWaiting");
+const clientDone = document.getElementById("clientDone");
+const clientErr = document.getElementById("clientErr");
+const userCodeEl = document.getElementById("userCode");
+const waitMsg = document.getElementById("waitMsg");
+let pollTimer = null, currentRequestId = null;
+
+function showClient(state) {
+  clientIdle.hidden = state !== "idle";
+  clientWaiting.hidden = state !== "waiting";
+  clientDone.hidden = state !== "done";
+}
+
+startBtn.onclick = async () => {
+  clientErr.textContent = "";
+  try {
+    const clientName = document.getElementById("clientName").value.trim() || "Demo";
+    const r = await api("/oauth/signin/start", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ clientName }),
+    });
+    currentRequestId = r.requestId;
+    userCodeEl.textContent = r.userCode || "————";
+    showClient("waiting");
+    poll();
+  } catch (e) { clientErr.textContent = e.message; }
+};
+
+document.getElementById("cancelBtn").onclick = () => {
+  clearTimeout(pollTimer); currentRequestId = null; showClient("idle");
+};
+
+async function poll() {
+  if (!currentRequestId) return;
+  try {
+    const r = await api(`/oauth/signin/poll?requestId=${encodeURIComponent(currentRequestId)}`);
+    if (r.status === "approved") {
+      showClient("done");
+      clientDone.innerHTML = `
+        <div class="status"><span class="dot good"></span><b>Signed in — no password used.</b></div>
+        <div class="session">
+          <div class="who">@${r.handle || ""}</div>
+          <div class="kv"><b>did </b>${r.did || ""}</div>
+          <details><summary>session tokens</summary>
+            <div class="kv"><b>accessJwt </b>${r.accessJwt || ""}</div>
+            <div class="kv"><b>refreshJwt </b>${r.refreshJwt || ""}</div>
+          </details>
+        </div>
+        <button class="btn-ghost" style="width:100%;margin-top:12px" onclick="location.reload()">Start over</button>`;
+      return;
+    }
+    if (r.status === "denied" || r.status === "expired") {
+      waitMsg.textContent = r.status === "denied" ? "Denied on the phone." : "Request expired.";
+      document.querySelector("#clientWaiting .dot").className = "dot bad";
+      return;
+    }
+    waitMsg.textContent = "Waiting for approval…";
+  } catch (e) { waitMsg.textContent = e.message; }
+  pollTimer = setTimeout(poll, 1500);
+}
+
+// ---------------------------------------------------------------------------
+// Phone (approver): enroll → list pending → approve/deny
+// ---------------------------------------------------------------------------
+const enrollBox = document.getElementById("enrollBox");
+const enrolledBox = document.getElementById("enrolledBox");
+const enrollBtn = document.getElementById("enrollBtn");
+const phoneErr = document.getElementById("phoneErr");
+const pendingListEl = document.getElementById("pendingList");
+let device = null;   // { deviceId, label, privateKey }
+
+async function loadDevice() {
+  const saved = await idbGet("device");
+  if (saved && saved.deviceId && saved.privateKey) {
+    device = saved;
+    document.getElementById("enrolledLabel").textContent = saved.label || "device";
+    document.getElementById("enrolledId").textContent = saved.deviceId;
+    enrollBox.hidden = true; enrolledBox.hidden = false;
+    pollPending();
+  }
+}
+
+enrollBtn.onclick = async () => {
+  phoneErr.textContent = "";
+  const handle = accountHost();
+  const password = document.getElementById("enrollPw").value;
+  const label = document.getElementById("enrollLabel").value.trim() || "Demo browser";
+  if (!handle) { phoneErr.textContent = "Enter your account handle up top."; return; }
+  if (!password) { phoneErr.textContent = "Enter your password (used only to enroll)."; return; }
+  enrollBtn.disabled = true; enrollBtn.textContent = "Enrolling…";
+  try {
+    const { pair, didKey } = await generateDeviceKey();
+    const r = await api("/oauth/device/register", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ handle, password, deviceDidKey: didKey, label }),
+    });
+    device = { deviceId: r.deviceId, label, privateKey: pair.privateKey };
+    await idbSet("device", device);   // CryptoKey stores natively in IndexedDB
+    document.getElementById("enrollPw").value = "";
+    document.getElementById("enrolledLabel").textContent = label;
+    document.getElementById("enrolledId").textContent = r.deviceId;
+    enrollBox.hidden = true; enrolledBox.hidden = false;
+    pollPending();
+  } catch (e) {
+    phoneErr.textContent = e.message;
+  } finally {
+    enrollBtn.disabled = false; enrollBtn.textContent = "Enroll this browser as a device";
+  }
+};
+
+document.getElementById("forgetBtn").onclick = async () => {
+  await idbDel("device"); device = null;
+  enrolledBox.hidden = true; enrollBox.hidden = false;
+};
+
+let pendingTimer = null;
+async function pollPending() {
+  if (!device) return;
+  try {
+    const r = await api("/oauth/signin/pending");
+    renderPending(r.pending || []);
+  } catch (e) { phoneErr.textContent = e.message; }
+  pendingTimer = setTimeout(pollPending, 2000);
+}
+
+function renderPending(list) {
+  if (!list.length) { pendingListEl.innerHTML = `<p class="muted">None right now.</p>`; return; }
+  pendingListEl.innerHTML = "";
+  for (const p of list) {
+    const el = document.createElement("div");
+    el.className = "pending";
+    el.innerHTML = `
+      <div class="cn">${escapeHtml(p.client_name || "A website")} wants to sign in</div>
+      <div class="uc">${p.user_code}</div>
+      <div class="row">
+        <button class="btn-good">Approve</button>
+        <button class="btn-bad">Deny</button>
+      </div>
+      <div class="err"></div>`;
+    const [approveB, denyB] = el.querySelectorAll("button");
+    const errEl = el.querySelector(".err");
+    approveB.onclick = () => decide(p, true, approveB, denyB, errEl);
+    denyB.onclick = () => decide(p, false, approveB, denyB, errEl);
+    pendingListEl.appendChild(el);
+  }
+}
+
+async function decide(p, approve, aB, dB, errEl) {
+  aB.disabled = dB.disabled = true; errEl.textContent = "";
+  try {
+    const signature = await signChallenge(device.privateKey, p.request_id, p.user_code);
+    await api(`/oauth/device/${approve ? "approve" : "deny"}`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ requestId: p.request_id, deviceId: device.deviceId, signature }),
+    });
+    errEl.style.color = "var(--good)";
+    errEl.textContent = approve ? "Approved ✓" : "Denied";
+  } catch (e) {
+    errEl.style.color = "var(--bad)";
+    errEl.textContent = e.message;
+    aB.disabled = dB.disabled = false;
+  }
+}
+
+function escapeHtml(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+
+loadDevice();
+</script>
+</body>
+</html>
