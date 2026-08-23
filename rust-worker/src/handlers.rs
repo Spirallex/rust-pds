@@ -1086,3 +1086,54 @@ pub async fn list_records(
         "cursor": page.cursor,
     }))
 }
+
+// ---------------------------------------------------------------------------
+// sync: repo backfill
+// ---------------------------------------------------------------------------
+
+/// `GET /xrpc/com.atproto.sync.getLatestCommit` — the repo's head.
+///
+/// The cheap half of backfill: a consumer calls this to decide whether its copy
+/// is stale before paying for a full [`get_repo`].
+pub async fn get_latest_commit(store: std::sync::Arc<DoStore>) -> Result<Response> {
+    let Some(did) = sole_account_did(store.as_ref()).await? else {
+        return xrpc_err(404, "RepoNotFound", "No account on this host.");
+    };
+    let found = stelyph_core::repo::latest_commit(store, &did)
+        .await
+        .map_err(|e| Error::RustError(format!("latest_commit: {e}")))?;
+    let Some((cid, rev)) = found else {
+        return xrpc_err(400, "RepoNotFound", "Repo has no commits.");
+    };
+    Response::from_json(&serde_json::json!({ "cid": cid.to_string(), "rev": rev }))
+}
+
+/// `GET /xrpc/com.atproto.sync.getRepo` — the whole repo as CARv1.
+///
+/// This is how a relay obtains a repo it has never seen, or has fallen behind
+/// on. Without it the firehose is the only source, and a firehose only carries
+/// what happens next — so a consumer that disconnects can never catch up.
+///
+/// The `since` parameter is accepted and ignored: this always returns the full
+/// repo. A full CAR is a superset of any incremental one, so the answer stays
+/// correct, it is merely larger than a caller with a partial copy needs.
+/// Honouring `since` requires walking commit history, which this repo layout
+/// does not retain.
+pub async fn get_repo(store: std::sync::Arc<DoStore>) -> Result<Response> {
+    let Some(did) = sole_account_did(store.as_ref()).await? else {
+        return xrpc_err(404, "RepoNotFound", "No account on this host.");
+    };
+    let found = stelyph_core::repo::export_car(store, &did)
+        .await
+        .map_err(|e| Error::RustError(format!("export_car: {e}")))?;
+    let Some(export) = found else {
+        return xrpc_err(400, "RepoNotFound", "Repo has no commits.");
+    };
+    let mut resp = Response::from_bytes(export.car)?;
+    let headers = resp.headers_mut();
+    // The CAR media type atproto clients and relays expect.
+    headers.set("content-type", "application/vnd.ipld.car")?;
+    // Lets a caller check the head it just fetched without a second request.
+    headers.set("atproto-repo-rev", &export.rev)?;
+    Ok(resp)
+}
