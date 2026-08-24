@@ -263,6 +263,10 @@ async fn dispatch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpRespo
                 // An upload names no account at all -- its body is raw bytes --
                 // so the token is the only thing that can say whose blob it is.
                 | "/xrpc/com.atproto.repo.uploadBlob"
+                // Same reasoning as createRecord: the token picks the DO, and
+                // the handler rejects a `repo` that disagrees with it.
+                | "/xrpc/com.atproto.repo.putRecord"
+                | "/xrpc/com.atproto.repo.deleteRecord"
         ) || auth_route.starts_with("/xrpc/app.bsky.")
             || auth_route.starts_with("/xrpc/chat.bsky.");
         if is_auth {

@@ -245,6 +245,55 @@ impl PdsDurableObject {
                     _ => xrpc_error(400, "InvalidRequest", "collection and rkey are required"),
                 }
             }
+            "/xrpc/com.atproto.repo.putRecord" => {
+                let bearer = bearer(&req)?;
+                let body = req.text().await?;
+                let store = std::sync::Arc::new(self.store()?);
+                match h::put_record(
+                    store,
+                    bearer.as_deref(),
+                    &self.jwt_secret()?,
+                    &self.key_passphrase()?,
+                    &body,
+                )
+                .await?
+                {
+                    Err(resp) => Ok(resp),
+                    Ok(sequenced) => {
+                        if let Err(e) = self.enqueue_commit(&sequenced.body).await {
+                            console_error!("firehose enqueue failed: {e}");
+                        }
+                        Response::from_json(&serde_json::json!({
+                            "uri": sequenced.uri,
+                            "cid": sequenced.cid,
+                        }))
+                    }
+                }
+            }
+            "/xrpc/com.atproto.repo.deleteRecord" => {
+                let bearer = bearer(&req)?;
+                let body = req.text().await?;
+                let store = std::sync::Arc::new(self.store()?);
+                match h::delete_record(
+                    store,
+                    bearer.as_deref(),
+                    &self.jwt_secret()?,
+                    &self.key_passphrase()?,
+                    &body,
+                )
+                .await?
+                {
+                    Err(resp) => Ok(resp),
+                    // Nothing to delete: success, but no commit and so no event.
+                    Ok(None) => Response::from_json(&serde_json::json!({})),
+                    Ok(Some(sequenced)) => {
+                        if let Err(e) = self.enqueue_commit(&sequenced.body).await {
+                            console_error!("firehose enqueue failed: {e}");
+                        }
+                        Response::from_json(&serde_json::json!({}))
+                    }
+                }
+            }
             "/xrpc/com.atproto.repo.uploadBlob" => {
                 let bearer = bearer(&req)?;
                 let mime_type = req
