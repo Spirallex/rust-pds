@@ -106,7 +106,10 @@ async fn dispatch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpRespo
         let route = path.split('?').next().unwrap_or("/");
         match (&method, route) {
             (&http::Method::GET, "/") => {
-                let mut resp = Response::ok(register::registration_page(&zone_suffix))?;
+                let mut resp = Response::ok(register::registration_page(
+                    &zone_suffix,
+                    open_registration(&env),
+                ))?;
                 resp.headers_mut()
                     .set("content-type", "text/html; charset=utf-8")?;
                 return resp.try_into();

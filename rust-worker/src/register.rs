@@ -182,8 +182,21 @@ button:focus-visible { outline: 2px solid AccentColor; outline-offset: 2px; }
 
 /// Render the registration page for a deployment whose handles end in
 /// `zone_suffix`.
-pub fn registration_page(zone_suffix: &str) -> String {
+pub fn registration_page(zone_suffix: &str, open_registration: bool) -> String {
     let suffix = escape(&format!(".{zone_suffix}"));
+    // With open registration the API does not check an invite code, so asking
+    // for one would block users the server would otherwise accept. The field is
+    // dropped entirely rather than made optional: an input nobody must fill is
+    // just a question the form cannot answer.
+    let invite_field = if open_registration {
+        String::new()
+    } else {
+        r#"      <label for="invite">Invite code</label>
+      <input id="invite" name="invite" type="text" autocomplete="off"
+             autocapitalize="none" spellcheck="false" required>
+"#
+        .to_string()
+    };
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -210,9 +223,7 @@ pub fn registration_page(zone_suffix: &str) -> String {
       </div>
       <p class="hint" id="handle-hint" aria-live="polite"></p>
 
-      <label for="invite">Invite code</label>
-      <input id="invite" name="invite" type="text" autocomplete="off"
-             autocapitalize="none" spellcheck="false" required>
+{invite_field}
 
       <label for="email">Email <span class="opt">(optional)</span></label>
       <input id="email" name="email" type="email" autocomplete="email">
@@ -321,7 +332,11 @@ pub fn registration_page(zone_suffix: &str) -> String {
       headers: {{ 'content-type': 'application/json' }},
       body: JSON.stringify({{
         handle: handle,
-        inviteCode: document.getElementById('invite').value.trim(),
+        // The invite input is absent under open registration; omitting the
+        // key lets the server treat it as the optional field it is.
+        ...(document.getElementById('invite')
+              ? {{ inviteCode: document.getElementById('invite').value.trim() }}
+              : {{}}),
         // Omitted when blank: the API takes email as optional, and sending ""
         // would record an empty address as though one had been supplied.
         // Braces are doubled because this page is built with format!.
