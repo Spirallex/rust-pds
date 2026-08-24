@@ -18,6 +18,7 @@
 //! into its HTTP-facing `XrpcError` via a `From` impl.
 
 pub mod auth;
+pub mod blob;
 pub mod error;
 pub mod firehose;
 pub mod identity;

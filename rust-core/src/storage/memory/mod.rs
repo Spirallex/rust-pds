@@ -472,6 +472,29 @@ impl BlobStore for MemoryStore {
             .get(&(did.to_string(), cid.to_string()))
             .cloned())
     }
+
+    async fn list_blobs(
+        &self,
+        did: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Vec<String>, StorageError> {
+        let inner = self.inner.lock().await;
+        // The map is not ordered by CID, so sort before paginating: the cursor
+        // is only meaningful against a stable order.
+        let mut cids: Vec<String> = inner
+            .blobs
+            .keys()
+            .filter(|(d, _)| d == did)
+            .map(|(_, c)| c.clone())
+            .collect();
+        cids.sort();
+        Ok(cids
+            .into_iter()
+            .filter(|c| cursor.is_none_or(|cur| c.as_str() > cur))
+            .take(limit)
+            .collect())
+    }
 }
 
 // ---------------------------------------------------------------------------

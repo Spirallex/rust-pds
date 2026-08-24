@@ -11,14 +11,13 @@ use std::sync::Arc;
 
 use atrium_api::types::string::Did;
 use atrium_crypto::keypair::{Did as KeypairDid, Secp256k1Keypair};
-use atrium_repo::blockstore::{DiffBlockStore, SHA2_256};
+use atrium_repo::blockstore::DiffBlockStore;
 use atrium_repo::Repository;
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
-use sha2::{Digest, Sha256};
 
 use crate::repo::util::{json_value_to_ipld, tid_from_micros, validate_collection, validate_rkey};
 use crate::repo::writer::{RepoWriter, WriteOp};
@@ -26,10 +25,6 @@ use crate::storage::crypto::load_key;
 use crate::storage::BlockStoreAdapter;
 
 use super::{authed_did, json_response, query_param, read_json_body, xrpc_error, AppState};
-
-/// Cap on an uploadBlob body. Matches the production server (axum's default
-/// body limit), so a blob accepted on desktop is accepted on-device.
-const MAX_BLOB_BYTES: usize = 2 * 1024 * 1024;
 
 fn internal(msg: &str) -> Response<Full<Bytes>> {
     xrpc_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", msg)
@@ -710,46 +705,33 @@ pub(super) async fn upload_blob(
         Ok(collected) => collected.to_bytes(),
         Err(_) => return invalid("could not read body"),
     };
-    if body.is_empty() {
-        return invalid("empty blob");
-    }
-    if body.len() > MAX_BLOB_BYTES {
-        return xrpc_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "InvalidRequest",
-            "blob too large",
-        );
-    }
-
-    let digest = Sha256::digest(&body);
-    let mh = match cid::multihash::Multihash::wrap(SHA2_256, digest.as_slice()) {
-        Ok(m) => m,
-        Err(_) => return internal("multihash wrap failed"),
-    };
-    let cid = cid::Cid::new_v1(0x55, mh);
-    let cid_str = cid.to_string();
-    let size = body.len() as i64;
-
-    if state
-        .store
-        .put_blob(&did, &cid_str, &mime_type, size, body.to_vec())
-        .await
-        .is_err()
+    // Content-addressing, the size ceiling and the returned lexicon shape all
+    // live in `crate::blob`, so this server and the Workers port cannot derive
+    // a blob's identity differently and end up unable to reference each other's
+    // blobs.
+    let stored = match crate::blob::store_blob(
+        state.store.as_ref(),
+        &did,
+        &mime_type,
+        body.to_vec(),
+    )
+    .await
     {
-        return internal("store error");
-    }
+        Ok(r) => r,
+        Err(crate::blob::BlobError::Empty) => return invalid("empty blob"),
+        Err(crate::blob::BlobError::TooLarge(_)) => {
+            return xrpc_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "InvalidRequest",
+                "blob too large",
+            )
+        }
+        Err(crate::blob::BlobError::Storage(_)) => return internal("store error"),
+    };
 
     json_response(
         StatusCode::OK,
-        serde_json::json!({
-            "blob": {
-                "$type": "blob",
-                "ref": { "$link": cid_str },
-                "mimeType": mime_type,
-                "size": size,
-            }
-        })
-        .to_string(),
+        serde_json::json!({ "blob": stored.to_lex_json() }).to_string(),
     )
 }
 

@@ -56,4 +56,32 @@ impl BlobStore for SqliteStore {
             .map_err(StorageError::Sqlite)?;
         Ok(row)
     }
+    async fn list_blobs(
+        &self,
+        did: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Vec<String>, StorageError> {
+        let did = did.to_string();
+        let cursor = cursor.map(str::to_string);
+        let conn = self.reader().await?;
+        let rows: Vec<String> = conn
+            .interact(move |c| {
+                // ORDER BY cid is load-bearing: the cursor is the previous
+                // page's last CID, so an unstable order would drop or repeat
+                // blobs between pages.
+                let mut stmt = c.prepare(
+                    "SELECT cid FROM blobs WHERE did = ?1 AND (?2 IS NULL OR cid > ?2) \
+                     ORDER BY cid ASC LIMIT ?3",
+                )?;
+                let out = stmt
+                    .query_map(rusqlite::params![did, cursor, limit as i64], |r| r.get(0))?
+                    .collect::<Result<Vec<String>, _>>()?;
+                Ok(out)
+            })
+            .await
+            .map_err(|e| StorageError::Pool(e.to_string()))?
+            .map_err(StorageError::Sqlite)?;
+        Ok(rows)
+    }
 }
