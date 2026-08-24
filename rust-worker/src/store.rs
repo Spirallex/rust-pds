@@ -251,6 +251,11 @@ struct BlobMetaRow {
     mime_type: String,
 }
 
+#[derive(Deserialize)]
+struct BlobCidRow {
+    cid: String,
+}
+
 // --- blocks / sequencer / repo ---------------------------------------------
 
 #[async_trait]
@@ -917,6 +922,33 @@ impl BlobStore for DoStore {
             .map_err(|e| StorageError::Pool(format!("r2 read: {e}")))?;
 
         Ok(Some((meta.mime_type, bytes)))
+    }
+
+    async fn list_blobs(
+        &self,
+        did: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Vec<String>, StorageError> {
+        // Listed from the metadata rows, not from R2: the rows are what decide
+        // ownership, and an R2 prefix scan would also surface objects left
+        // behind by a crash between the put and the metadata insert.
+        //
+        // ORDER BY cid is load-bearing -- the cursor is the previous page's
+        // last CID, so an unstable order would drop or repeat blobs.
+        let rows: Vec<BlobCidRow> = match cursor {
+            Some(cur) => self.exec(
+                "SELECT cid FROM blob_refs WHERE did = ? AND cid > ? ORDER BY cid ASC LIMIT ?",
+                vec![s(did), s(cur), i(limit as i64)],
+            )?,
+            None => self.exec(
+                "SELECT cid FROM blob_refs WHERE did = ? ORDER BY cid ASC LIMIT ?",
+                vec![s(did), i(limit as i64)],
+            )?,
+        }
+        .to_array()
+        .map_err(sql_err)?;
+        Ok(rows.into_iter().map(|r| r.cid).collect())
     }
 }
 

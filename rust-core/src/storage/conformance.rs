@@ -439,6 +439,57 @@ macro_rules! storage_conformance_tests {
                 );
             }
 
+            // --- blobs ----------------------------------------------------
+
+            #[tokio::test]
+            async fn list_blobs_paginates_in_cid_order_and_is_did_scoped() {
+                let (s, _g) = $setup().await;
+                // Inserted out of order on purpose: the contract is CID order,
+                // not insertion order, because the cursor depends on it.
+                for cid in ["bafyc", "bafya", "bafyd", "bafyb"] {
+                    s.put_blob("did:plc:one", cid, "image/png", 3, vec![1, 2, 3])
+                        .await
+                        .unwrap();
+                }
+                // A second account's blob must never appear in the first's list.
+                s.put_blob("did:plc:two", "bafya", "image/png", 3, vec![9])
+                    .await
+                    .unwrap();
+
+                let all = s.list_blobs("did:plc:one", 50, None).await.unwrap();
+                assert_eq!(all, vec!["bafya", "bafyb", "bafyc", "bafyd"]);
+
+                let page1 = s.list_blobs("did:plc:one", 2, None).await.unwrap();
+                assert_eq!(page1, vec!["bafya", "bafyb"]);
+
+                // The cursor is exclusive: the page must resume after it, not
+                // repeat it.
+                let page2 = s
+                    .list_blobs("did:plc:one", 2, Some(page1.last().unwrap()))
+                    .await
+                    .unwrap();
+                assert_eq!(page2, vec!["bafyc", "bafyd"]);
+
+                let page3 = s
+                    .list_blobs("did:plc:one", 2, Some(page2.last().unwrap()))
+                    .await
+                    .unwrap();
+                assert!(page3.is_empty(), "walking past the end yields nothing");
+
+                let other = s.list_blobs("did:plc:two", 50, None).await.unwrap();
+                assert_eq!(other, vec!["bafya"], "listing must be scoped to its DID");
+            }
+
+            #[tokio::test]
+            async fn list_blobs_is_empty_for_an_account_with_none() {
+                let (s, _g) = $setup().await;
+                assert!(s
+                    .list_blobs("did:plc:nobody", 50, None)
+                    .await
+                    .unwrap()
+                    .is_empty());
+            }
+
             // --- keys -----------------------------------------------------
 
             #[tokio::test]

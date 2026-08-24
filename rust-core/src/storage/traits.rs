@@ -258,6 +258,21 @@ pub trait BlobStore: Send + Sync {
         did: &str,
         cid: &str,
     ) -> Result<Option<(String, Vec<u8>)>, StorageError>;
+
+    /// CIDs of an account's blobs, in ascending CID order.
+    ///
+    /// Ordered rather than arbitrary because that ordering *is* the pagination:
+    /// `cursor` is the last CID of the previous page, exclusive. An unordered
+    /// implementation would silently drop or repeat blobs across pages.
+    ///
+    /// This backs `com.atproto.sync.listBlobs`, which is how a relay discovers
+    /// which blobs it must fetch to mirror an account.
+    async fn list_blobs(
+        &self,
+        did: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Vec<String>, StorageError>;
 }
 
 /// Everything a PDS needs from persistence, in one object-safe bundle.
