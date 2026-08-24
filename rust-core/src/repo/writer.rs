@@ -8,7 +8,7 @@ use cid::Cid;
 use ipld_core::ipld::Ipld;
 use tokio::sync::Mutex;
 
-use crate::firehose::CommitBody;
+use crate::firehose::{CommitBody, RepoOp};
 use crate::repo::RepoError;
 use crate::storage::{BlockStoreAdapter, StorageBackend};
 
@@ -328,7 +328,7 @@ impl RepoWriter {
         // Build the #commit body. seq=0 is a placeholder — Plan 05's backfill path
         // decodes this blob and injects the real seq from repo_seq.seq at stream time.
         // The broadcast publish below injects the real seq before sending on the wire.
-        use crate::firehose::{encode_message_frame, FirehoseEvent, RepoOp};
+        use crate::firehose::{encode_message_frame, FirehoseEvent};
         let ops = vec![RepoOp {
             action: action.to_string(),
             path: key.clone(),
@@ -384,6 +384,252 @@ impl RepoWriter {
         ))
     }
 
+    /// Apply several writes as **one** signed commit.
+    ///
+    /// This is what `com.atproto.repo.applyWrites` promises: the batch lands
+    /// whole or not at all, and the network sees a single `#commit` carrying
+    /// every op. Looping over [`Self::apply_one_parts`] would satisfy neither —
+    /// a failure part-way through leaves earlier writes already signed and
+    /// federated, and consumers would receive N events at N revs with no way to
+    /// tell a batch from unrelated actions moments apart.
+    ///
+    /// It cannot be built on `Repository::add_raw` and friends either. Each of
+    /// those opens the MST at `latest_commit.data` — the last *committed* root —
+    /// so a second call starts from the same base as the first and its root
+    /// silently omits the first change. Committing that root loses a record with
+    /// no error and a valid signature. The tree is therefore opened once here
+    /// and every op applied to it in turn.
+    ///
+    /// Because atrium keeps its commit schema private, the commit is built and
+    /// signed directly. The layout is atproto's and matches what
+    /// `CommitBuilder` produces: `dag-cbor{did, version, data, rev, prev}` is
+    /// the signing preimage, and the stored block is that map plus `sig`. The
+    /// tests read the result back with atrium to confirm it, rather than
+    /// trusting this comment.
+    pub async fn apply_many_parts(
+        &self,
+        ops: Vec<WriteOp>,
+    ) -> Result<(Vec<WriteOutcome>, CommitBody), RepoError> {
+        use atrium_api::types::string::Tid;
+        use atrium_api::types::LimitedU32;
+        use atrium_repo::blockstore::{AsyncBlockStoreWrite, DAG_CBOR, SHA2_256};
+        use atrium_repo::mst;
+
+        if ops.is_empty() {
+            return Err(RepoError::Repo("applyWrites with no writes".into()));
+        }
+
+        let _guard = self.write_lock.lock().await;
+        let mut diff = DiffBlockStore::wrap(BlockStoreAdapter::new(self.store.clone()));
+
+        let maybe_root = self.store.load_repo_root(self.did.as_str()).await?;
+        let had_prior_root = maybe_root.is_some();
+
+        // Establish the commit to chain from and the MST to start from. Scoped
+        // so the Repository's borrow of `diff` ends before the ops need it.
+        let (prev_cid, base_mst) = {
+            let repo = match maybe_root {
+                Some(root) => Repository::open(&mut diff, root)
+                    .await
+                    .map_err(|e| RepoError::Repo(e.to_string()))?,
+                None => {
+                    let builder = Repository::create(&mut diff, self.did.clone())
+                        .await
+                        .map_err(|e| RepoError::Repo(e.to_string()))?;
+                    let sig = self
+                        .signing_key
+                        .sign(&builder.bytes())
+                        .map_err(|e| RepoError::Crypto(e.to_string()))?;
+                    builder
+                        .finalize(sig)
+                        .await
+                        .map_err(|e| RepoError::Repo(e.to_string()))?
+                }
+            };
+            (repo.root(), repo.commit().data())
+        };
+
+        // Records are encoded and stored first, in one pass, because the MST
+        // borrows the blockstore for as long as it is open and cannot be
+        // interleaved with block writes.
+        struct Prepared {
+            action: &'static str,
+            key: String,
+            cid: Option<Cid>,
+        }
+        let mut prepared: Vec<Prepared> = Vec::with_capacity(ops.len());
+        for op in &ops {
+            match op {
+                WriteOp::Create { key, record } | WriteOp::Update { key, record } => {
+                    let bytes = serde_ipld_dagcbor::to_vec(record)
+                        .map_err(|e| RepoError::Repo(format!("encode record: {e}")))?;
+                    let cid = diff
+                        .write_block(DAG_CBOR, SHA2_256, &bytes)
+                        .await
+                        .map_err(|e| RepoError::Repo(e.to_string()))?;
+                    prepared.push(Prepared {
+                        action: if matches!(op, WriteOp::Create { .. }) {
+                            "create"
+                        } else {
+                            "update"
+                        },
+                        key: key.clone(),
+                        cid: Some(cid),
+                    });
+                }
+                WriteOp::Delete { key } => prepared.push(Prepared {
+                    action: "delete",
+                    key: key.clone(),
+                    cid: None,
+                }),
+            }
+        }
+
+        // One tree, every op applied in order. This is the whole point.
+        let new_data = {
+            let mut tree = mst::Tree::open(&mut diff, base_mst);
+            for p in &prepared {
+                match (p.action, p.cid) {
+                    ("create", Some(cid)) => tree.add(&p.key, cid).await,
+                    ("update", Some(cid)) => tree.update(&p.key, cid).await,
+                    _ => tree.delete(&p.key).await,
+                }
+                .map_err(|e| RepoError::Repo(format!("mst {} {}: {e}", p.action, p.key)))?;
+            }
+            tree.root()
+        };
+
+        // atrium's commit schema is private, so the block is built here. Field
+        // order matters: it is the signing preimage, and a verifier re-encodes
+        // the decoded struct to check the signature.
+        #[derive(serde::Serialize)]
+        struct UnsignedCommit {
+            did: atrium_api::types::string::Did,
+            version: i64,
+            data: Cid,
+            rev: Tid,
+            prev: Option<Cid>,
+        }
+        #[derive(serde::Serialize)]
+        struct SignedCommit {
+            did: atrium_api::types::string::Did,
+            version: i64,
+            data: Cid,
+            rev: Tid,
+            prev: Option<Cid>,
+            #[serde(with = "serde_bytes")]
+            sig: Vec<u8>,
+        }
+
+        let rev = Tid::now(LimitedU32::MIN);
+        let unsigned = UnsignedCommit {
+            did: self.did.clone(),
+            version: 3,
+            data: new_data,
+            rev: rev.clone(),
+            prev: Some(prev_cid),
+        };
+        let preimage = serde_ipld_dagcbor::to_vec(&unsigned)
+            .map_err(|e| RepoError::Repo(format!("encode commit: {e}")))?;
+        let sig = self
+            .signing_key
+            .sign(&preimage)
+            .map_err(|e| RepoError::Crypto(e.to_string()))?;
+        let signed = SignedCommit {
+            did: unsigned.did,
+            version: unsigned.version,
+            data: unsigned.data,
+            rev: unsigned.rev,
+            prev: unsigned.prev,
+            sig,
+        };
+        let commit_bytes = serde_ipld_dagcbor::to_vec(&signed)
+            .map_err(|e| RepoError::Repo(format!("encode signed commit: {e}")))?;
+        let commit_cid = diff
+            .write_block(DAG_CBOR, SHA2_256, &commit_bytes)
+            .await
+            .map_err(|e| RepoError::Repo(e.to_string()))?;
+
+        let new_cids: Vec<Cid> = diff.blocks().collect();
+        let inner = diff.into_inner();
+        let mut blocks = Vec::with_capacity(new_cids.len());
+        for cid in new_cids {
+            let bytes = inner.read_block_bytes(cid).await?;
+            blocks.push((cid, bytes));
+        }
+
+        use iroh_car::{CarHeader, CarWriter};
+        let mut car_buf: Vec<u8> = Vec::new();
+        let mut car_writer = CarWriter::new(CarHeader::new_v1(vec![commit_cid]), &mut car_buf);
+        for (cid, bytes) in &blocks {
+            car_writer
+                .write(*cid, bytes)
+                .await
+                .map_err(|e| RepoError::Repo(e.to_string()))?;
+        }
+        car_writer
+            .finish()
+            .await
+            .map_err(|e| RepoError::Repo(e.to_string()))?;
+
+        let since: Option<String> = if had_prior_root {
+            #[derive(serde::Deserialize)]
+            struct CommitHeader {
+                rev: Tid,
+            }
+            let prev_bytes = inner.read_block_bytes(prev_cid).await?;
+            let prev_header: CommitHeader = serde_ipld_dagcbor::from_slice(&prev_bytes)
+                .map_err(|e| RepoError::Repo(format!("decode prev commit: {e}")))?;
+            Some(prev_header.rev.as_ref().to_string())
+        } else {
+            None
+        };
+
+        let rev_str = rev.as_ref().to_string();
+        let firehose_ops: Vec<RepoOp> = prepared
+            .iter()
+            .map(|p| RepoOp {
+                action: p.action.to_string(),
+                path: p.key.clone(),
+                cid: p.cid,
+            })
+            .collect();
+        let mut body = CommitBody {
+            seq: 0,
+            rebase: false,
+            too_big: false,
+            repo: self.did.as_str().to_string(),
+            commit: commit_cid,
+            rev: rev_str.clone(),
+            since,
+            blocks: car_buf,
+            ops: firehose_ops,
+            blobs: vec![],
+            time: chrono::Utc::now().to_rfc3339(),
+            prev_data: None,
+        };
+        let event_body = serde_ipld_dagcbor::to_vec(&body)
+            .map_err(|e| RepoError::Repo(format!("encode event body: {e}")))?;
+
+        let seq = self
+            .store
+            .commit_blocks(blocks, self.did.as_str(), commit_cid, event_body)
+            .await?;
+        body.seq = seq;
+
+        let outcomes = prepared
+            .into_iter()
+            .map(|p| WriteOutcome {
+                action: p.action,
+                key: p.key,
+                record_cid: p.cid,
+                commit_cid,
+                rev: rev_str.clone(),
+            })
+            .collect();
+        Ok((outcomes, body))
+    }
+
     /// Return the current MST root CID for the repo, by opening the repo from
     /// the stored root and reading `repo.commit().data()`. Returns None if no
     /// commits have been written yet.
@@ -415,6 +661,8 @@ mod tests {
     use std::str::FromStr;
 
     const SIGNING_SCALAR: [u8; 32] = [0x11u8; 32];
+    /// Matches the DID `writer_with_store` builds its writer with.
+    const TEST_DID: &str = "did:web:example.com";
 
     fn post(text: &str) -> Ipld {
         let mut m = BTreeMap::new();
@@ -744,6 +992,147 @@ mod tests {
     /// `apply_one_parts` commits but stays off the wire: the caller owns
     /// sequencing, so nothing is broadcast and the returned parts describe the
     /// commit that was written.
+    /// The trap this whole method exists for: two creates in one batch must
+    /// BOTH survive. Applying each op from the last committed root would leave
+    /// only the second, with a valid signature and no error.
+    #[tokio::test]
+    async fn apply_many_keeps_every_write_in_one_commit() {
+        let (writer, store, _rx) = writer_with_store().await;
+
+        let (outcomes, body) = writer
+            .apply_many_parts(vec![
+                WriteOp::Create {
+                    key: "app.bsky.feed.post/3kaaaa".to_string(),
+                    record: post("first"),
+                },
+                WriteOp::Create {
+                    key: "app.bsky.feed.post/3kbbbb".to_string(),
+                    record: post("second"),
+                },
+            ])
+            .await
+            .expect("apply_many_parts");
+
+        assert_eq!(outcomes.len(), 2);
+        // One commit, not two: every outcome shares it.
+        assert_eq!(outcomes[0].commit_cid, outcomes[1].commit_cid);
+        assert_eq!(outcomes[0].rev, outcomes[1].rev);
+        // One firehose event carrying both ops.
+        assert_eq!(body.ops.len(), 2);
+
+        // Both records must be readable. This is the assertion that fails if the
+        // MST is re-opened per op.
+        let a = crate::repo::get_record(store.clone(), TEST_DID, "app.bsky.feed.post/3kaaaa")
+            .await
+            .expect("get a")
+            .expect("first record must survive the batch");
+        let b = crate::repo::get_record(store, TEST_DID, "app.bsky.feed.post/3kbbbb")
+            .await
+            .expect("get b")
+            .expect("second record must survive the batch");
+        assert_eq!(a.value["text"], "first");
+        assert_eq!(b.value["text"], "second");
+    }
+
+    /// The commit is hand-built, so atrium -- the code a reader uses -- must be
+    /// able to open it and verify the signature. If the field order or preimage
+    /// were wrong this is where it shows, rather than at a relay.
+    #[tokio::test]
+    async fn hand_built_commit_verifies_and_reopens() {
+        use atrium_crypto::keypair::Did as _;
+
+        let (writer, store, _rx) = writer_with_store().await;
+        let (_outcomes, body) = writer
+            .apply_many_parts(vec![WriteOp::Create {
+                key: "app.bsky.feed.post/3kaaaa".to_string(),
+                record: post("verify me"),
+            }])
+            .await
+            .expect("apply_many_parts");
+
+        // The frame a relay would receive must pass signature verification.
+        let frame = crate::firehose::encode_message_frame("#commit", &body);
+        let decoded = crate::firehose::decode_commit_frame(&frame).expect("decode");
+        let did_key = writer.signing_key.did();
+        crate::firehose::verify_commit_sig(&decoded, &did_key)
+            .await
+            .expect("hand-built commit must verify against the account's signing key");
+
+        // And atrium must be able to re-open the repo at that commit.
+        let root = store
+            .load_repo_root(TEST_DID)
+            .await
+            .expect("root")
+            .expect("exists");
+        assert_eq!(root, decoded.commit, "stored root must be the new commit");
+        let entry = crate::repo::get_record(store, TEST_DID, "app.bsky.feed.post/3kaaaa")
+            .await
+            .expect("get")
+            .expect("record readable through atrium after a hand-built commit");
+        assert_eq!(entry.value["text"], "verify me");
+    }
+
+    /// A batch that mixes kinds must apply all of them, and delete must really
+    /// remove rather than leave a tombstone the reader still returns.
+    #[tokio::test]
+    async fn apply_many_handles_create_update_and_delete_together() {
+        let (writer, store, _rx) = writer_with_store().await;
+        writer
+            .create_record("app.bsky.feed.post/3kold", post("to be changed"))
+            .await
+            .expect("seed 1");
+        writer
+            .create_record("app.bsky.feed.post/3kgone", post("to be removed"))
+            .await
+            .expect("seed 2");
+
+        let (outcomes, body) = writer
+            .apply_many_parts(vec![
+                WriteOp::Update {
+                    key: "app.bsky.feed.post/3kold".to_string(),
+                    record: post("changed"),
+                },
+                WriteOp::Delete {
+                    key: "app.bsky.feed.post/3kgone".to_string(),
+                },
+                WriteOp::Create {
+                    key: "app.bsky.feed.post/3knew".to_string(),
+                    record: post("added"),
+                },
+            ])
+            .await
+            .expect("apply_many_parts");
+
+        assert_eq!(outcomes.len(), 3);
+        assert_eq!(body.ops.len(), 3);
+        // A delete carries no record cid; the others must.
+        assert!(body
+            .ops
+            .iter()
+            .find(|o| o.action == "delete")
+            .unwrap()
+            .cid
+            .is_none());
+
+        let updated = crate::repo::get_record(store.clone(), TEST_DID, "app.bsky.feed.post/3kold")
+            .await
+            .expect("get")
+            .expect("updated record exists");
+        assert_eq!(updated.value["text"], "changed");
+        assert!(
+            crate::repo::get_record(store.clone(), TEST_DID, "app.bsky.feed.post/3kgone")
+                .await
+                .expect("get")
+                .is_none(),
+            "deleted record must be gone"
+        );
+        let added = crate::repo::get_record(store, TEST_DID, "app.bsky.feed.post/3knew")
+            .await
+            .expect("get")
+            .expect("created record exists");
+        assert_eq!(added.value["text"], "added");
+    }
+
     #[tokio::test]
     async fn apply_one_parts_does_not_publish() {
         let (writer, _store, mut rx) = writer_with_store().await;
