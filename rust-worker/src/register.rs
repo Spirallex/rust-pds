@@ -152,6 +152,7 @@ input[type=text], input[type=password], input[type=email] {
 }
 input:focus-visible { outline: 2px solid AccentColor; outline-offset: 1px; }
 .hint { font-size: .78rem; color: GrayText; margin: .3rem 0 0; min-height: 1.1em; }
+.opt  { color: GrayText; font-weight: normal; }
 .hint.ok  { color: color-mix(in srgb, green 75%, CanvasText); }
 .hint.bad { color: color-mix(in srgb, #d33 75%, CanvasText); }
 .actions { display: flex; gap: .6rem; margin-top: 1.25rem; }
@@ -213,8 +214,9 @@ pub fn registration_page(zone_suffix: &str) -> String {
       <input id="invite" name="invite" type="text" autocomplete="off"
              autocapitalize="none" spellcheck="false" required>
 
-      <label for="email">Email</label>
-      <input id="email" name="email" type="email" autocomplete="email" required>
+      <label for="email">Email <span class="opt">(optional)</span></label>
+      <input id="email" name="email" type="email" autocomplete="email">
+      <p class="hint">Only used for account recovery. Leave blank to skip.</p>
 
       <label for="password">Password</label>
       <input id="password" name="password" type="password"
@@ -320,7 +322,12 @@ pub fn registration_page(zone_suffix: &str) -> String {
       body: JSON.stringify({{
         handle: handle,
         inviteCode: document.getElementById('invite').value.trim(),
-        email: document.getElementById('email').value.trim(),
+        // Omitted when blank: the API takes email as optional, and sending ""
+        // would record an empty address as though one had been supplied.
+        // Braces are doubled because this page is built with format!.
+        ...(document.getElementById('email').value.trim()
+              ? {{ email: document.getElementById('email').value.trim() }}
+              : {{}}),
         password: document.getElementById('password').value
       }})
     }})

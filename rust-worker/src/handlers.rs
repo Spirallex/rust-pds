@@ -1226,3 +1226,215 @@ pub async fn list_blobs(
     };
     Response::from_json(&serde_json::json!({ "cids": cids, "cursor": next }))
 }
+
+// ---------------------------------------------------------------------------
+// putRecord / deleteRecord
+// ---------------------------------------------------------------------------
+
+/// Shared front half of a repo write: authenticate, validate, and reach the
+/// signing key.
+///
+/// Returns `Err(response)` for every client-visible rejection so each handler
+/// can pass it straight back.
+async fn write_preamble(
+    store: &std::sync::Arc<DoStore>,
+    bearer: Option<&str>,
+    jwt_secret: &[u8],
+    passphrase: &[u8],
+    input: &serde_json::Value,
+) -> Result<
+    std::result::Result<
+        (
+            String,
+            atrium_crypto::keypair::Secp256k1Keypair,
+            String,
+            String,
+        ),
+        Response,
+    >,
+> {
+    use atrium_crypto::keypair::Secp256k1Keypair;
+    use stelyph_core::auth::jwt::decode_jwt;
+    use stelyph_core::repo::util::{validate_collection, validate_rkey};
+    use stelyph_core::storage::crypto;
+
+    let Some(did) = bearer
+        .and_then(|t| decode_jwt(t, jwt_secret).ok())
+        .map(|c| c.sub)
+    else {
+        return Ok(Err(xrpc_err(
+            401,
+            "AuthenticationRequired",
+            "Invalid token.",
+        )?));
+    };
+    if input["repo"].as_str() != Some(did.as_str()) {
+        return Ok(Err(xrpc_err(
+            400,
+            "InvalidRequest",
+            "repo must match the authenticated DID.",
+        )?));
+    }
+    let Some(collection) = input["collection"].as_str().map(str::to_owned) else {
+        return Ok(Err(xrpc_err(
+            400,
+            "InvalidRequest",
+            "collection is required.",
+        )?));
+    };
+    if let Err(msg) = validate_collection(&collection) {
+        return Ok(Err(xrpc_err(400, "InvalidRequest", &msg)?));
+    }
+    // Unlike createRecord, rkey is required here: both methods address an
+    // existing record, and inventing one would silently create a second.
+    let Some(rkey) = input["rkey"].as_str().map(str::to_owned) else {
+        return Ok(Err(xrpc_err(400, "InvalidRequest", "rkey is required.")?));
+    };
+    if let Err(msg) = validate_rkey(&rkey) {
+        return Ok(Err(xrpc_err(400, "InvalidRequest", &msg)?));
+    }
+
+    let scalar = crypto::load_key(store.as_ref(), &format!("{did}#signing"), passphrase)
+        .await
+        .map_err(|e| Error::RustError(format!("load signing key: {e}")))?;
+    let key = Secp256k1Keypair::import(&scalar)
+        .map_err(|e| Error::RustError(format!("import signing key: {e}")))?;
+    Ok(Ok((did, key, collection, rkey)))
+}
+
+fn writer_for(
+    store: std::sync::Arc<DoStore>,
+    key: atrium_crypto::keypair::Secp256k1Keypair,
+    did: &str,
+) -> Result<stelyph_core::repo::RepoWriter> {
+    use atrium_api::types::string::Did;
+    use stelyph_core::repo::RepoWriter;
+
+    let did_typed =
+        Did::new(did.to_string()).map_err(|e| Error::RustError(format!("bad account DID: {e}")))?;
+    // Never fires: apply_one_parts does not publish, because the firehose here
+    // is the sequencer Durable Object rather than an in-process channel.
+    let (tx, _rx) = tokio::sync::broadcast::channel(1);
+    Ok(RepoWriter::new(store, key, did_typed, tx))
+}
+
+/// `POST /xrpc/com.atproto.repo.putRecord` — create or replace at a fixed rkey.
+///
+/// This is how a profile is written: `app.bsky.actor.profile/self` is a single
+/// record a client rewrites, so without it an account can never set a display
+/// name or avatar.
+///
+/// Existence decides create-vs-update rather than always updating: the MST's
+/// `update` requires the key to be present, so a blind update on a first write
+/// fails.
+pub async fn put_record(
+    store: std::sync::Arc<DoStore>,
+    bearer: Option<&str>,
+    jwt_secret: &[u8],
+    passphrase: &[u8],
+    body: &str,
+) -> Result<std::result::Result<Sequenced, Response>> {
+    use stelyph_core::repo::util::json_value_to_ipld;
+    use stelyph_core::repo::writer::WriteOp;
+
+    let Ok(input) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Ok(Err(xrpc_err(400, "InvalidRequest", "Malformed body.")?));
+    };
+    let (did, key, collection, rkey) =
+        match write_preamble(&store, bearer, jwt_secret, passphrase, &input).await? {
+            Err(resp) => return Ok(Err(resp)),
+            Ok(v) => v,
+        };
+
+    let record = input["record"].clone();
+    if record.is_null() {
+        return Ok(Err(xrpc_err(400, "InvalidRequest", "record is required.")?));
+    }
+    let Ok(ipld) = json_value_to_ipld(record) else {
+        return Ok(Err(xrpc_err(
+            400,
+            "InvalidRequest",
+            "record is not encodable as IPLD.",
+        )?));
+    };
+
+    let mst_key = format!("{collection}/{rkey}");
+    let exists = stelyph_core::repo::get_record(store.clone(), &did, &mst_key)
+        .await
+        .map_err(|e| Error::RustError(format!("lookup existing: {e}")))?
+        .is_some();
+
+    let writer = writer_for(store, key, &did)?;
+    let op = if exists {
+        WriteOp::Update {
+            key: mst_key,
+            record: ipld,
+        }
+    } else {
+        WriteOp::Create {
+            key: mst_key,
+            record: ipld,
+        }
+    };
+    let (_outcome, commit) = writer
+        .apply_one_parts(op)
+        .await
+        .map_err(|e| Error::RustError(format!("repo write failed: {e}")))?;
+
+    let record_cid = commit
+        .ops
+        .first()
+        .and_then(|o| o.cid)
+        .ok_or_else(|| Error::RustError("write yielded no record cid".into()))?;
+
+    Ok(Ok(Sequenced {
+        uri: format!("at://{did}/{collection}/{rkey}"),
+        cid: record_cid.to_string(),
+        body: commit,
+    }))
+}
+
+/// `POST /xrpc/com.atproto.repo.deleteRecord` — remove a record.
+///
+/// Deleting something already absent returns success with nothing sequenced.
+/// atproto treats delete as idempotent, and committing an empty change would
+/// put a no-op event on the firehose that every consumer must then ignore.
+pub async fn delete_record(
+    store: std::sync::Arc<DoStore>,
+    bearer: Option<&str>,
+    jwt_secret: &[u8],
+    passphrase: &[u8],
+    body: &str,
+) -> Result<std::result::Result<Option<Sequenced>, Response>> {
+    use stelyph_core::repo::writer::WriteOp;
+
+    let Ok(input) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Ok(Err(xrpc_err(400, "InvalidRequest", "Malformed body.")?));
+    };
+    let (did, key, collection, rkey) =
+        match write_preamble(&store, bearer, jwt_secret, passphrase, &input).await? {
+            Err(resp) => return Ok(Err(resp)),
+            Ok(v) => v,
+        };
+
+    let mst_key = format!("{collection}/{rkey}");
+    if stelyph_core::repo::get_record(store.clone(), &did, &mst_key)
+        .await
+        .map_err(|e| Error::RustError(format!("lookup existing: {e}")))?
+        .is_none()
+    {
+        return Ok(Ok(None));
+    }
+
+    let writer = writer_for(store, key, &did)?;
+    let (_outcome, commit) = writer
+        .apply_one_parts(WriteOp::Delete { key: mst_key })
+        .await
+        .map_err(|e| Error::RustError(format!("repo delete failed: {e}")))?;
+
+    Ok(Ok(Some(Sequenced {
+        uri: format!("at://{did}/{collection}/{rkey}"),
+        cid: String::new(),
+        body: commit,
+    })))
+}
