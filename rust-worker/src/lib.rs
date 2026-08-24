@@ -218,11 +218,28 @@ async fn dispatch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpRespo
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::to_string);
-    let prefetched_body: Option<String> = if matches!(
+    // Captured for the same reason as the token, and before the body stream is
+    // consumed: uploadBlob records this as the blob's mimeType, and a blob whose
+    // type is lost renders as a download prompt instead of an image.
+    let content_type = req
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    // Kept as bytes, not text: uploadBlob posts binary, and decoding it as UTF-8
+    // would fail before the request ever reached a handler. The blob ceiling
+    // applies only to that route, so an ordinary JSON body still cannot be used
+    // to push megabytes through the Worker.
+    let body_cap = if path.split('?').next().unwrap_or("") == "/xrpc/com.atproto.repo.uploadBlob" {
+        stelyph_core::blob::MAX_BLOB_BYTES
+    } else {
+        MAX_BODY
+    };
+    let prefetched_body: Option<Vec<u8>> = if matches!(
         method,
         http::Method::POST | http::Method::PUT | http::Method::PATCH
     ) {
-        Some(read_body(req).await?)
+        Some(read_body_bytes(req, body_cap).await?)
     } else {
         None
     };
@@ -243,6 +260,9 @@ async fn dispatch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpRespo
                 // trusted for routing: the token's `sub` decides which DO it
                 // reaches, and the DO re-checks that `repo` matches.
                 | "/xrpc/com.atproto.repo.createRecord"
+                // An upload names no account at all -- its body is raw bytes --
+                // so the token is the only thing that can say whose blob it is.
+                | "/xrpc/com.atproto.repo.uploadBlob"
         ) || auth_route.starts_with("/xrpc/app.bsky.")
             || auth_route.starts_with("/xrpc/chat.bsky.");
         if is_auth {
@@ -265,7 +285,7 @@ async fn dispatch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpRespo
     {
         if let Some(id) = prefetched_body
             .as_deref()
-            .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
             .and_then(|v| {
                 v.get("identifier")
                     .and_then(|i| i.as_str())
@@ -309,6 +329,10 @@ async fn dispatch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpRespo
     // always 401. The opaque forwarding request otherwise carries no headers.
     if let Some(b) = &bearer {
         headers.set("authorization", &format!("Bearer {b}"))?;
+    }
+    // Likewise the content type: the DO stores it as the blob's mimeType.
+    if let Some(ct) = &content_type {
+        headers.set("content-type", ct)?;
     }
     init.with_headers(headers);
 
@@ -485,18 +509,28 @@ fn is_signup_host(host: &str, zone_suffix: &str, configured: Option<&str>) -> bo
 const MAX_BODY: usize = 64 * 1024;
 
 async fn read_body(req: HttpRequest) -> Result<String> {
+    let buf = read_body_bytes(req, MAX_BODY).await?;
+    String::from_utf8(buf).map_err(|_| Error::RustError("request body was not UTF-8".into()))
+}
+
+/// Drain a request body into bytes, capped at `max`.
+///
+/// Bytes rather than text: `uploadBlob` posts arbitrary binary, so decoding
+/// every body as UTF-8 would reject a PNG outright. Only the handlers that
+/// actually parse JSON convert, and they do it themselves.
+async fn read_body_bytes(req: HttpRequest, max: usize) -> Result<Vec<u8>> {
     use futures_util::StreamExt;
 
     let mut body = req.into_body();
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = body.next().await {
         let chunk = chunk?;
-        if buf.len() + chunk.len() > MAX_BODY {
+        if buf.len() + chunk.len() > max {
             return Err(Error::RustError("request body too large".into()));
         }
         buf.extend_from_slice(&chunk);
     }
-    String::from_utf8(buf).map_err(|_| Error::RustError("request body was not UTF-8".into()))
+    Ok(buf)
 }
 
 fn json_error(status: u16, error: &str, message: &str) -> Result<Response> {
