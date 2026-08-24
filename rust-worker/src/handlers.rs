@@ -1137,3 +1137,92 @@ pub async fn get_repo(store: std::sync::Arc<DoStore>) -> Result<Response> {
     headers.set("atproto-repo-rev", &export.rev)?;
     Ok(resp)
 }
+// blobs
+// ---------------------------------------------------------------------------
+
+/// `POST /xrpc/com.atproto.repo.uploadBlob` — store bytes, return a blob ref.
+///
+/// The bytes are opaque: a blob is only *referenced* by a record, and that
+/// reference is made later by whatever `createRecord` call embeds the returned
+/// ref. So nothing is written to the repo here, and no commit or firehose event
+/// results.
+pub async fn upload_blob(
+    store: std::sync::Arc<DoStore>,
+    bearer: Option<&str>,
+    jwt_secret: &[u8],
+    mime_type: &str,
+    bytes: Vec<u8>,
+) -> Result<Response> {
+    use stelyph_core::auth::jwt::decode_jwt;
+    use stelyph_core::blob::{store_blob, BlobError};
+
+    // The owning DID comes from the token: an upload has no body field naming
+    // the account, and accepting one would let a caller fill someone else's
+    // blob quota.
+    let Some(did) = bearer
+        .and_then(|t| decode_jwt(t, jwt_secret).ok())
+        .map(|c| c.sub)
+    else {
+        return xrpc_err(401, "AuthenticationRequired", "Invalid token.");
+    };
+
+    match store_blob(store.as_ref(), &did, mime_type, bytes).await {
+        Ok(blob) => Response::from_json(&serde_json::json!({ "blob": blob.to_lex_json() })),
+        Err(BlobError::Empty) => xrpc_err(400, "InvalidRequest", "Blob is empty."),
+        Err(e @ BlobError::TooLarge(_)) => xrpc_err(413, "InvalidRequest", &e.to_string()),
+        Err(BlobError::Storage(e)) => Err(Error::RustError(format!("store blob: {e}"))),
+    }
+}
+
+/// `GET /xrpc/com.atproto.sync.getBlob` — raw bytes with the original type.
+///
+/// Unauthenticated by design: blobs are public once referenced, and a relay
+/// mirroring an account has no session. Ownership still scopes the lookup, so
+/// one account cannot serve another's blob by guessing a CID.
+pub async fn get_blob(store: std::sync::Arc<DoStore>, cid: &str) -> Result<Response> {
+    use stelyph_core::storage::BlobStore;
+
+    let Some(did) = sole_account_did(store.as_ref()).await? else {
+        return xrpc_err(404, "RepoNotFound", "No account on this host.");
+    };
+    let found = store
+        .get_blob(&did, cid)
+        .await
+        .map_err(|e| Error::RustError(format!("get_blob: {e}")))?;
+    let Some((mime_type, bytes)) = found else {
+        return xrpc_err(404, "BlobNotFound", "Blob not found.");
+    };
+    let mut resp = Response::from_bytes(bytes)?;
+    resp.headers_mut().set("content-type", &mime_type)?;
+    Ok(resp)
+}
+
+/// `GET /xrpc/com.atproto.sync.listBlobs` — the account's blob CIDs.
+///
+/// How a relay discovers which blobs it must fetch to mirror an account, since
+/// `getRepo` carries records but not the bytes they point at.
+pub async fn list_blobs(
+    store: std::sync::Arc<DoStore>,
+    limit: Option<usize>,
+    cursor: Option<&str>,
+) -> Result<Response> {
+    use stelyph_core::storage::BlobStore;
+
+    let Some(did) = sole_account_did(store.as_ref()).await? else {
+        return xrpc_err(404, "RepoNotFound", "No account on this host.");
+    };
+    // Clamped like listRecords: the caller does not get to choose how much work
+    // one request is.
+    let limit = limit.unwrap_or(500).clamp(1, 1000);
+    let cids = store
+        .list_blobs(&did, limit, cursor)
+        .await
+        .map_err(|e| Error::RustError(format!("list_blobs: {e}")))?;
+    // Only hand back a cursor on a full page; a short page is the end.
+    let next = if cids.len() == limit {
+        cids.last().cloned()
+    } else {
+        None
+    };
+    Response::from_json(&serde_json::json!({ "cids": cids, "cursor": next }))
+}

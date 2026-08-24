@@ -245,6 +245,47 @@ impl PdsDurableObject {
                     _ => xrpc_error(400, "InvalidRequest", "collection and rkey are required"),
                 }
             }
+            "/xrpc/com.atproto.repo.uploadBlob" => {
+                let bearer = bearer(&req)?;
+                let mime_type = req
+                    .headers()
+                    .get("content-type")?
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
+                let bytes = req.bytes().await?;
+                let store = std::sync::Arc::new(self.store()?);
+                h::upload_blob(
+                    store,
+                    bearer.as_deref(),
+                    &self.jwt_secret()?,
+                    &mime_type,
+                    bytes,
+                )
+                .await
+            }
+            "/xrpc/com.atproto.sync.getBlob" => {
+                let cid = url
+                    .query_pairs()
+                    .find(|(k, _)| k == "cid")
+                    .map(|(_, v)| v.into_owned());
+                match cid {
+                    Some(cid) => {
+                        let store = std::sync::Arc::new(self.store()?);
+                        h::get_blob(store, &cid).await
+                    }
+                    None => xrpc_error(400, "InvalidRequest", "cid is required"),
+                }
+            }
+            "/xrpc/com.atproto.sync.listBlobs" => {
+                let q = |k: &str| {
+                    url.query_pairs()
+                        .find(|(n, _)| n == k)
+                        .map(|(_, v)| v.into_owned())
+                };
+                let limit = q("limit").and_then(|l| l.parse::<usize>().ok());
+                let cursor = q("cursor");
+                let store = std::sync::Arc::new(self.store()?);
+                h::list_blobs(store, limit, cursor.as_deref()).await
+            }
             "/xrpc/com.atproto.sync.getLatestCommit" => {
                 let store = std::sync::Arc::new(self.store()?);
                 h::get_latest_commit(store).await
