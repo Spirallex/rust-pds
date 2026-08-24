@@ -245,6 +245,14 @@ impl PdsDurableObject {
                     _ => xrpc_error(400, "InvalidRequest", "collection and rkey are required"),
                 }
             }
+            "/xrpc/com.atproto.sync.getLatestCommit" => {
+                let store = std::sync::Arc::new(self.store()?);
+                h::get_latest_commit(store).await
+            }
+            "/xrpc/com.atproto.sync.getRepo" => {
+                let store = std::sync::Arc::new(self.store()?);
+                h::get_repo(store).await
+            }
             "/xrpc/com.atproto.repo.listRecords" => {
                 let q = |k: &str| {
                     url.query_pairs()
