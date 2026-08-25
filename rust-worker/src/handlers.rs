@@ -1453,3 +1453,190 @@ pub async fn delete_record(
         body: commit,
     })))
 }
+
+// ---------------------------------------------------------------------------
+// applyWrites
+// ---------------------------------------------------------------------------
+
+/// A batch write's outcome: one result per write, and the single commit that
+/// carried all of them.
+///
+/// Separate from [`Sequenced`] because that type describes one record; folding a
+/// batch into it would mean encoding a list inside a field named `uri`.
+pub struct BatchSequenced {
+    pub results: Vec<serde_json::Value>,
+    pub body: stelyph_core::firehose::CommitBody,
+}
+
+/// `POST /xrpc/com.atproto.repo.applyWrites` — several writes, one commit.
+///
+/// The batch is what the caller asked for and what the network must see: one
+/// signed commit carrying every op, so a partial failure cannot leave some
+/// writes federated and others not.
+pub async fn apply_writes(
+    store: std::sync::Arc<DoStore>,
+    bearer: Option<&str>,
+    jwt_secret: &[u8],
+    passphrase: &[u8],
+    body: &str,
+) -> Result<std::result::Result<BatchSequenced, Response>> {
+    use atrium_api::types::string::Did;
+    use atrium_crypto::keypair::Secp256k1Keypair;
+    use stelyph_core::auth::jwt::decode_jwt;
+    use stelyph_core::repo::util::{
+        json_value_to_ipld, tid_from_micros, validate_collection, validate_rkey,
+    };
+    use stelyph_core::repo::writer::WriteOp;
+    use stelyph_core::repo::RepoWriter;
+    use stelyph_core::storage::crypto;
+
+    let Some(did) = bearer
+        .and_then(|t| decode_jwt(t, jwt_secret).ok())
+        .map(|c| c.sub)
+    else {
+        return Ok(Err(xrpc_err(
+            401,
+            "AuthenticationRequired",
+            "Invalid token.",
+        )?));
+    };
+    let Ok(input) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Ok(Err(xrpc_err(400, "InvalidRequest", "Malformed body.")?));
+    };
+    if input["repo"].as_str() != Some(did.as_str()) {
+        return Ok(Err(xrpc_err(
+            400,
+            "InvalidRequest",
+            "repo must match the authenticated DID.",
+        )?));
+    }
+    let Some(writes) = input["writes"].as_array() else {
+        return Ok(Err(xrpc_err(
+            400,
+            "InvalidRequest",
+            "writes must be an array.",
+        )?));
+    };
+    if writes.is_empty() {
+        return Ok(Err(xrpc_err(
+            400,
+            "InvalidRequest",
+            "writes must not be empty.",
+        )?));
+    }
+
+    // Every write is validated before any is applied. The whole point of the
+    // batch is that it is atomic, so a bad entry at position 5 must not find
+    // entries 1-4 already committed.
+    let mut ops: Vec<WriteOp> = Vec::with_capacity(writes.len());
+    let mut uris: Vec<String> = Vec::with_capacity(writes.len());
+    for w in writes {
+        let kind = w["$type"].as_str().unwrap_or_default();
+        let Some(collection) = w["collection"].as_str() else {
+            return Ok(Err(xrpc_err(
+                400,
+                "InvalidRequest",
+                "each write needs a collection.",
+            )?));
+        };
+        if let Err(msg) = validate_collection(collection) {
+            return Ok(Err(xrpc_err(400, "InvalidRequest", &msg)?));
+        }
+        // Only a create may omit rkey; the others address an existing record.
+        let rkey = match w["rkey"].as_str() {
+            Some(rk) => {
+                if let Err(msg) = validate_rkey(rk) {
+                    return Ok(Err(xrpc_err(400, "InvalidRequest", &msg)?));
+                }
+                rk.to_owned()
+            }
+            None if kind.ends_with("#create") => tid_from_micros(Date::now().as_millis() * 1_000),
+            None => {
+                return Ok(Err(xrpc_err(
+                    400,
+                    "InvalidRequest",
+                    "rkey is required for update and delete.",
+                )?))
+            }
+        };
+        let key = format!("{collection}/{rkey}");
+        uris.push(format!("at://{did}/{key}"));
+
+        if kind.ends_with("#delete") {
+            ops.push(WriteOp::Delete { key });
+            continue;
+        }
+        let value = w["value"].clone();
+        if value.is_null() {
+            return Ok(Err(xrpc_err(
+                400,
+                "InvalidRequest",
+                "create and update need a value.",
+            )?));
+        }
+        let Ok(ipld) = json_value_to_ipld(value) else {
+            return Ok(Err(xrpc_err(
+                400,
+                "InvalidRequest",
+                "value is not encodable as IPLD.",
+            )?));
+        };
+        if kind.ends_with("#update") {
+            ops.push(WriteOp::Update { key, record: ipld });
+        } else if kind.ends_with("#create") {
+            ops.push(WriteOp::Create { key, record: ipld });
+        } else {
+            return Ok(Err(xrpc_err(
+                400,
+                "InvalidRequest",
+                "each write must be a create, update or delete.",
+            )?));
+        }
+    }
+
+    let scalar = crypto::load_key(store.as_ref(), &format!("{did}#signing"), passphrase)
+        .await
+        .map_err(|e| Error::RustError(format!("load signing key: {e}")))?;
+    let key = Secp256k1Keypair::import(&scalar)
+        .map_err(|e| Error::RustError(format!("import signing key: {e}")))?;
+    let did_typed =
+        Did::new(did.clone()).map_err(|e| Error::RustError(format!("bad account DID: {e}")))?;
+    let (tx, _rx) = tokio::sync::broadcast::channel(1);
+    let writer = RepoWriter::new(store, key, did_typed, tx);
+
+    let (outcomes, commit) = writer
+        .apply_many_parts(ops)
+        .await
+        .map_err(|e| Error::RustError(format!("batch write failed: {e}")))?;
+
+    // One commit means one thing to sequence, however many ops it carried.
+    // Each result carries a `$type` discriminator. The lexicon types `results`
+    // as a union, so a client validating the response rejects a bare
+    // `{uri, cid}` outright -- which reads to a user as "the post failed", even
+    // though the commit is already written and federated.
+    //
+    // A delete result has no uri or cid: there is no record left to point at.
+    let results: Vec<serde_json::Value> = outcomes
+        .iter()
+        .zip(uris.iter())
+        .map(|(o, uri)| match o.action {
+            "delete" => serde_json::json!({
+                "$type": "com.atproto.repo.applyWrites#deleteResult",
+            }),
+            action => serde_json::json!({
+                "$type": format!("com.atproto.repo.applyWrites#{action}Result"),
+                "uri": uri,
+                "cid": o.record_cid.map(|c| c.to_string()),
+                // Records are stored as sent; nothing here checks them against
+                // their lexicon, and saying "valid" would be a claim we cannot
+                // make. `unknown` is the value for exactly that case.
+                "validationStatus": "unknown",
+            }),
+        })
+        .collect();
+
+    Ok(Ok(BatchSequenced {
+        results,
+        body: commit,
+    }))
+}

@@ -296,6 +296,7 @@ async fn dispatch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpRespo
                 // the handler rejects a `repo` that disagrees with it.
                 | "/xrpc/com.atproto.repo.putRecord"
                 | "/xrpc/com.atproto.repo.deleteRecord"
+                | "/xrpc/com.atproto.repo.applyWrites"
         ) || auth_route.starts_with("/xrpc/app.bsky.")
             || auth_route.starts_with("/xrpc/chat.bsky.");
         if is_auth {

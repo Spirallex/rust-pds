@@ -245,6 +245,30 @@ impl PdsDurableObject {
                     _ => xrpc_error(400, "InvalidRequest", "collection and rkey are required"),
                 }
             }
+            "/xrpc/com.atproto.repo.applyWrites" => {
+                let bearer = bearer(&req)?;
+                let body = req.text().await?;
+                let store = std::sync::Arc::new(self.store()?);
+                match h::apply_writes(
+                    store,
+                    bearer.as_deref(),
+                    &self.jwt_secret()?,
+                    &self.key_passphrase()?,
+                    &body,
+                )
+                .await?
+                {
+                    Err(resp) => Ok(resp),
+                    Ok(batch) => {
+                        // One commit, so one enqueue -- however many writes it
+                        // carried. That is the whole point of the batch.
+                        if let Err(e) = self.enqueue_commit(&batch.body).await {
+                            console_error!("firehose enqueue failed: {e}");
+                        }
+                        Response::from_json(&serde_json::json!({ "results": batch.results }))
+                    }
+                }
+            }
             "/xrpc/com.atproto.repo.putRecord" => {
                 let bearer = bearer(&req)?;
                 let body = req.text().await?;
