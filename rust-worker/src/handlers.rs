@@ -1658,403 +1658,44 @@ pub async fn apply_writes(
 }
 
 // ---------------------------------------------------------------------------
-// zh-TW feed
+// appview routing
 // ---------------------------------------------------------------------------
 
-/// The feed URI this PDS serves itself instead of forwarding.
+/// Forward a request to this deployment's own appview.
 ///
-/// Not a real feed generator record: there is no separate service to run, and
-/// nothing else needs to resolve it. It is a name the client can pin, which
-/// this PDS recognises and answers.
-pub const ZH_TW_FEED_URI: &str = "at://did:web:taiwansky.social/app.bsky.feed.generator/zh-tw";
+/// Deliberately narrow. Everything `app.bsky.*` could be sent here and let the
+/// appview decide what it knows, but its fallback to Bluesky is unauthenticated,
+/// so routing a method it does not implement would silently drop viewer state —
+/// follow status, mutes, blocks, unread counts — for every user. Routing only
+/// what the appview genuinely serves keeps the rest on the authenticated path.
+///
+/// No service-auth token is minted: this appview does not verify one, and
+/// pretending otherwise would suggest a trust boundary that is not there. It is
+/// reachable on its own URL regardless; the PDS is a convenience, not a gate.
+pub async fn proxy_own_appview(appview_url: &str, nsid: &str, query: &str) -> Result<Response> {
+    use worker::send::SendFuture;
 
-/// Characters written differently in Simplified and Traditional Chinese.
-///
-/// The language tag cannot do this job: Bluesky's `lang=zh-TW` returns the whole
-/// `zh` family — measured, only 5 posts in 100 carry a `zh-TW` tag at all, and
-/// `lang=zh` returns byte-identical results. Most writers in Taiwan and in China
-/// alike tag plain `zh`, so telling the two apart means reading the characters.
-///
-/// Pairs are (simplified, traditional) and deliberately common: these appear in
-/// ordinary prose rather than in specialist vocabulary, so a short post still
-/// lands on one side or the other.
-const SCRIPT_PAIRS: &[(char, char)] = &[
-    // Only pairs whose simplified form is *never* written in Traditional text.
-    //
-    // That exclusion matters more than the list's length. `台` was in an earlier
-    // version paired against `臺`, and it was wrong: Taiwanese writers use `台灣`
-    // in ordinary prose and reserve `臺灣` for formal registers, so counting it
-    // as Simplified penalised exactly the posts this filter exists to keep.
-    //
-    // Deliberately absent for the same reason — each is valid Traditional with
-    // its own meaning, so its presence says nothing about script:
-    //   里 (公里, 里長)   干 (干涉)     面 (面對)    只 (只有)
-    //   云 (子曰詩云)     制 (制度)     表 (表面)    系 (系統)   谷 (山谷)
-    ('国', '國'),
-    ('学', '學'),
-    ('会', '會'),
-    ('时', '時'),
-    ('这', '這'),
-    ('过', '過'),
-    ('来', '來'),
-    ('后', '後'),
-    ('发', '發'),
-    ('样', '樣'),
-    ('还', '還'),
-    ('说', '說'),
-    ('对', '對'),
-    ('开', '開'),
-    ('买', '買'),
-    ('车', '車'),
-    ('见', '見'),
-    ('长', '長'),
-    ('门', '門'),
-    ('问', '問'),
-    ('间', '間'),
-    ('东', '東'),
-    ('马', '馬'),
-    ('鸟', '鳥'),
-    ('鱼', '魚'),
-    ('几', '幾'),
-    ('点', '點'),
-    ('电', '電'),
-    ('话', '話'),
-    ('语', '語'),
-    ('读', '讀'),
-    ('写', '寫'),
-    ('谢', '謝'),
-    ('欢', '歡'),
-    ('爱', '愛'),
-    ('体', '體'),
-    ('号', '號'),
-    ('钱', '錢'),
-    ('医', '醫'),
-    ('艺', '藝'),
-    ('丽', '麗'),
-    ('边', '邊'),
-    ('远', '遠'),
-    ('实', '實'),
-    ('无', '無'),
-    ('讨', '討'),
-    ('论', '論'),
-    ('应', '應'),
-    ('现', '現'),
-    ('协', '協'),
-    ('给', '給'),
-    ('经', '經'),
-    ('种', '種'),
-    ('员', '員'),
-    ('亚', '亞'),
-    ('丰', '豐'),
-    ('节', '節'),
-    ('让', '讓'),
-    ('热', '熱'),
-    ('际', '際'),
-    ('济', '濟'),
-    ('视', '視'),
-    ('军', '軍'),
-    ('级', '級'),
-    ('关', '關'),
-    ('闭', '閉'),
-    ('题', '題'),
-    ('产', '產'),
-    ('业', '業'),
-    ('务', '務'),
-    ('农', '農'),
-    ('图', '圖'),
-    ('书', '書'),
-    ('馆', '館'),
-    ('当', '當'),
-    ('虽', '雖'),
-    ('从', '從'),
-    ('们', '們'),
-    ('儿', '兒'),
-    ('妇', '婦'),
-    ('双', '雙'),
-    ('亲', '親'),
-    ('办', '辦'),
-    ('检', '檢'),
-    ('历', '歷'),
-    ('压', '壓'),
-    ('厂', '廠'),
-    ('广', '廣'),
-    ('场', '場'),
-    ('复', '復'),
-    ('习', '習'),
-    ('乡', '鄉'),
-    ('汉', '漢'),
-    ('认', '認'),
-    ('识', '識'),
-    ('设', '設'),
-    ('计', '計'),
-    ('记', '記'),
-    ('访', '訪'),
-    ('许', '許'),
-    ('证', '證'),
-    ('评', '評'),
-    ('该', '該'),
-    ('诉', '訴'),
-    ('课', '課'),
-    ('调', '調'),
-    ('请', '請'),
-    ('谁', '誰'),
-    ('课', '課'),
-    ('赛', '賽'),
-    ('贵', '貴'),
-    ('费', '費'),
-    ('资', '資'),
-    ('购', '購'),
-    ('贴', '貼'),
-    ('账', '賬'),
-    ('质', '質'),
-    ('赶', '趕'),
-    ('起', '起'),
-    ('运', '運'),
-    ('进', '進'),
-    ('连', '連'),
-    ('选', '選'),
-    ('适', '適'),
-    ('迟', '遲'),
-    ('达', '達'),
-    ('过', '過'),
-    ('还', '還'),
-    ('这', '這'),
-    ('边', '邊'),
-    ('阳', '陽'),
-    ('阴', '陰'),
-    ('陆', '陸'),
-    ('随', '隨'),
-    ('险', '險'),
-    ('难', '難'),
-    ('鸡', '雞'),
-    ('鲜', '鮮'),
-    ('龙', '龍'),
-    ('龟', '龜'),
-    ('齐', '齊'),
-    ('齿', '齒'),
-    ('声', '聲'),
-    ('壮', '壯'),
-    ('妆', '妝'),
-    ('举', '舉'),
-    ('义', '義'),
-    ('乐', '樂'),
-    ('习', '習'),
-    ('书', '書'),
-    ('买', '買'),
-    ('乱', '亂'),
-    ('争', '爭'),
-    ('亏', '虧'),
-];
+    let url = if query.is_empty() {
+        format!("{appview_url}/xrpc/{nsid}")
+    } else {
+        format!("{appview_url}/xrpc/{nsid}?{query}")
+    };
 
-/// Whether a character is Han (CJK ideographs).
-fn is_han(ch: char) -> bool {
-    matches!(ch as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0xF900..=0xFAFF)
-}
-
-/// Whether a character is Japanese kana.
-///
-/// Kana is the reliable tell for Japanese: a post tagged `zh` that contains
-/// hiragana or katakana is Japanese whose author also tagged Chinese, and kanji
-/// alone cannot distinguish the two.
-fn is_kana(ch: char) -> bool {
-    // Hiragana and katakana are contiguous, so one range covers both.
-    matches!(ch as u32, 0x3040..=0x30FF)
-}
-
-/// Whether text reads as Traditional Chinese rather than Simplified.
-///
-/// Three checks, each earning its place against what actually came back from a
-/// live `lang=zh-TW` search:
-///
-/// 1. **Some Han is required.** Posts tagged `zh` that are just a URL, `Truth`
-///    or `tem` are not Chinese content in any useful sense.
-/// 2. **Kana disqualifies.** Japanese posts routinely carry `zh` among their
-///    tags, and their kanji pass every Simplified/Traditional test.
-/// 3. **Then count script pairs.** A count rather than a rule, because real
-///    posts quote each other and spell names either way, so one stray
-///    Simplified character should not disqualify an otherwise Traditional post.
-///
-/// Han text with no distinguishing pair is kept: the tag already said `zh`, and
-/// excluding it would drop short Taiwanese posts whose script cannot be told.
-pub fn looks_traditional(text: &str) -> bool {
-    let mut simplified = 0usize;
-    let mut traditional = 0usize;
-    let mut han = false;
-
-    for ch in text.chars() {
-        if is_kana(ch) {
-            return false;
-        }
-        if is_han(ch) {
-            han = true;
-        }
-        for (s, t) in SCRIPT_PAIRS {
-            if ch == *s {
-                simplified += 1;
-            } else if ch == *t {
-                traditional += 1;
-            }
-        }
-    }
-
-    han && traditional >= simplified
-}
-
-/// `app.bsky.feed.getFeed` for [`ZH_TW_FEED_URI`].
-///
-/// Backed by the AppView's own search rather than an index of our own: search
-/// accepts `q=*` as a wildcard, so it can be read as a stream rather than
-/// queried for a term. It needs authentication — the public AppView refuses it —
-/// which is why this lives in the PDS, the only component holding a signing key
-/// to mint the service token.
-///
-/// Results are then filtered by script, because the language tag alone returns
-/// Simplified and Traditional alike.
-pub async fn zh_tw_feed(
-    store: &DoStore,
-    bearer: Option<&str>,
-    jwt_secret: &[u8],
-    passphrase: &[u8],
-    query: &str,
-) -> Result<Response> {
-    // Ask upstream for more than the caller wants: roughly half of `zh` posts
-    // are Simplified, so filtering a page of 30 would return a short page and
-    // the client would read it as the end of the feed.
-    let limit: usize = query_value(query, "limit")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30)
-        .clamp(1, 100);
-    let cursor = query_value(query, "cursor");
-    let mut upstream = format!("q=*&lang=zh-TW&sort=latest&limit={}", (limit * 3).min(100));
-    if let Some(c) = &cursor {
-        upstream.push_str(&format!("&cursor={c}"));
-    }
-
-    let resp = proxy_appview(
-        store,
-        bearer,
-        jwt_secret,
-        passphrase,
-        "app.bsky.feed.searchPosts",
-        &upstream,
-    )
+    let (status, body, ctype) = SendFuture::new(async move {
+        let mut init = worker::RequestInit::new();
+        init.with_method(worker::Method::Get);
+        let req = worker::Request::new_with_init(&url, &init)?;
+        let mut resp = worker::Fetch::Request(req).send().await?;
+        let ct = resp
+            .headers()
+            .get("content-type")?
+            .unwrap_or_else(|| "application/json".into());
+        let bytes = resp.bytes().await?;
+        Ok::<_, worker::Error>((resp.status_code(), bytes, ct))
+    })
     .await?;
 
-    let mut resp = resp;
-    let body = resp.text().await?;
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) else {
-        // Upstream said something we cannot read: hand it back rather than
-        // inventing an empty feed, so the failure stays visible.
-        return Response::from_bytes(body.into_bytes());
-    };
-    let Some(posts) = parsed.get("posts").and_then(|p| p.as_array()) else {
-        return Response::from_bytes(body.into_bytes());
-    };
-
-    let feed: Vec<serde_json::Value> = posts
-        .iter()
-        .filter(|p| {
-            p.pointer("/record/text")
-                .and_then(|t| t.as_str())
-                .map(looks_traditional)
-                .unwrap_or(true)
-        })
-        .take(limit)
-        .map(|p| serde_json::json!({ "post": p }))
-        .collect();
-
-    // Upstream's cursor is passed through untouched. It refers to search's own
-    // position, not ours, so rewriting it would break the next page — a short
-    // page here means we filtered, not that the stream ended.
-    let mut out = serde_json::json!({ "feed": feed });
-    if let Some(c) = parsed.get("cursor") {
-        out["cursor"] = c.clone();
-    }
-    Response::from_json(&out)
-}
-
-/// One value out of a raw query string.
-fn query_value(query: &str, key: &str) -> Option<String> {
-    query.split('&').find_map(|pair| {
-        let (k, v) = pair.split_once('=')?;
-        (k == key).then(|| v.to_string())
-    })
-}
-
-#[cfg(test)]
-mod zh_tw_tests {
-    use super::looks_traditional;
-
-    #[test]
-    fn traditional_text_is_kept() {
-        assert!(looks_traditional("這個國家的學生會說國語"));
-        assert!(looks_traditional("臺灣的天氣很好，發財了"));
-    }
-
-    #[test]
-    fn simplified_text_is_rejected() {
-        assert!(!looks_traditional("这个国家的学生会说国语"));
-        assert!(!looks_traditional("台湾的天气很好，发财了"));
-    }
-
-    /// Real posts quote each other and spell names either way, so one stray
-    /// character must not decide the whole post.
-    #[test]
-    fn a_mixed_post_goes_with_the_majority() {
-        assert!(looks_traditional("這個國家的學生說國語，偶爾写错字"));
-        assert!(!looks_traditional("这个国家的学生说国语，偶爾寫對"));
-    }
-
-    /// Short Han posts carry no distinguishing characters. Keeping them is
-    /// deliberate: the language tag already said zh, and dropping them would
-    /// lose a lot of genuinely Taiwanese content.
-    #[test]
-    fn undecidable_han_text_is_kept() {
-        assert!(looks_traditional("早安 ☀️"));
-        assert!(looks_traditional("今天 #minecraft"));
-    }
-
-    /// Seen live: posts tagged `zh` that contain no Chinese at all.
-    #[test]
-    fn text_without_han_is_rejected() {
-        assert!(!looks_traditional("Truth"));
-        assert!(!looks_traditional("tem"));
-        assert!(!looks_traditional("youtube.com/shorts/5u0pK"));
-        assert!(!looks_traditional(""));
-    }
-
-    /// `台灣` is how Taiwanese writers normally spell it; `臺灣` is the formal
-    /// register. Treating `台` as Simplified penalised the very posts this
-    /// filter exists to keep, so the pair was removed.
-    #[test]
-    fn taiwanese_spelling_of_taiwan_is_not_penalised() {
-        assert!(looks_traditional("台灣的天氣"));
-        assert!(looks_traditional("臺灣的天氣"));
-        assert!(looks_traditional("我在台北"));
-    }
-
-    /// Characters that are valid Traditional in their own right must not count
-    /// as Simplified: 里 (公里), 干 (干涉), 面 (面對), 只 (只有), 制 (制度).
-    #[test]
-    fn shared_characters_do_not_count_as_simplified() {
-        assert!(looks_traditional("走了三公里，只有他一個人面對制度"));
-    }
-
-    /// The gap the audit found: high-frequency Simplified characters that were
-    /// simply missing from the table.
-    #[test]
-    fn newly_covered_simplified_characters_are_caught() {
-        assert!(!looks_traditional("世界的实然无需讨论，应然无力讨论"));
-        assert!(!looks_traditional("现在有中文配音了，开大声音"));
-        assert!(!looks_traditional("过去 30 分钟的话题"));
-    }
-
-    /// Also seen live: Japanese posts tagged `ja,zh,en`. Their kanji pass every
-    /// Simplified/Traditional test, so kana is what tells them apart.
-    #[test]
-    fn japanese_is_rejected_even_when_tagged_zh() {
-        assert!(!looks_traditional("これオススメだよって言われて"));
-        assert!(!looks_traditional("またブルスカを病気の記録にしている"));
-        // Kanji-only Japanese is genuinely ambiguous and not claimed here.
-    }
+    let mut resp = Response::from_bytes(body)?.with_status(status);
+    resp.headers_mut().set("content-type", &ctype)?;
+    Ok(resp)
 }

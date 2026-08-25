@@ -504,22 +504,25 @@ impl PdsDurableObject {
                 let bearer = bearer(&req)?;
                 let store = self.store()?;
 
-                // One feed this PDS serves itself. Recognised here rather than
-                // forwarded, because the AppView has never heard of it.
-                if nsid == "app.bsky.feed.getFeed"
-                    && url
-                        .query_pairs()
-                        .any(|(k, v)| k == "feed" && v == h::ZH_TW_FEED_URI)
+                // Feeds this deployment's own appview serves. Matched by feed
+                // URI rather than by method: `getFeed` still has to reach
+                // Bluesky for every other feed a user has pinned.
+                // A feed URI names its generator's DID, which is not the host
+                // the appview is served from -- ours answers on a workers.dev
+                // URL while identifying as did:web:appview.<zone>. Matching the
+                // URL against the URI silently never fires, so the DID is
+                // configured separately and matched on.
+                if let (Some(appview), Some(did)) = (self.own_appview_url(), self.own_appview_did())
                 {
-                    return h::zh_tw_feed(
-                        &store,
-                        bearer.as_deref(),
-                        &self.jwt_secret()?,
-                        &self.key_passphrase()?,
-                        &query,
-                    )
-                    .await;
+                    if nsid == "app.bsky.feed.getFeed"
+                        && url
+                            .query_pairs()
+                            .any(|(k, v)| k == "feed" && v.starts_with(&format!("at://{did}/")))
+                    {
+                        return h::proxy_own_appview(&appview, &nsid, &query).await;
+                    }
                 }
+
                 h::proxy_appview(
                     &store,
                     bearer.as_deref(),
@@ -577,6 +580,30 @@ impl PdsDurableObject {
         });
         crate::call_do(&stub, "/enqueue", payload).await?;
         Ok(())
+    }
+
+    /// URL of this deployment's own appview, if it runs one.
+    ///
+    /// Absent means no appview: every `app.bsky.*` call then goes to Bluesky,
+    /// which is the correct behaviour for a PDS running alone.
+    fn own_appview_url(&self) -> Option<String> {
+        self.env
+            .var("PDS_APPVIEW_URL")
+            .ok()
+            .map(|v| v.to_string())
+            .filter(|v| !v.is_empty())
+    }
+
+    /// DID this deployment's appview identifies as.
+    ///
+    /// Separate from its URL: a `did:web` names a hostname that need not be the
+    /// one serving the requests, and the feed URIs it publishes carry the DID.
+    fn own_appview_did(&self) -> Option<String> {
+        self.env
+            .var("PDS_APPVIEW_DID")
+            .ok()
+            .map(|v| v.to_string())
+            .filter(|v| !v.is_empty())
     }
 
     fn jwt_secret(&self) -> Result<Vec<u8>> {
