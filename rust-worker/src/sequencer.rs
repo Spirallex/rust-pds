@@ -38,6 +38,10 @@ use stelyph_core::firehose::{encode_message_frame, CommitBody, RepoOp};
 /// Fixed name of the single sequencer instance.
 pub const SEQUENCER_DO_NAME: &str = "__sequencer__";
 
+/// Queue binding the internal indexer consumes. Optional — see
+/// `publish_to_indexer`.
+const FIREHOSE_QUEUE_BINDING: &str = "FIREHOSE";
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS seq_counter (id INTEGER PRIMARY KEY, next INTEGER NOT NULL);
 INSERT OR IGNORE INTO seq_counter (id, next) VALUES (0, 1);
@@ -74,6 +78,13 @@ struct EnqueueOp {
     path: String,
     #[serde(default)]
     cid: Option<String>,
+    /// The record as JSON, absent on delete.
+    ///
+    /// Carried here so a consumer never has to decode the CAR to learn what was
+    /// written. The blocks are still in the frame for the wire protocol, but an
+    /// internal indexer wants the record, not the block that encodes it.
+    #[serde(default)]
+    record: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -90,11 +101,12 @@ struct FrameRow {
 #[durable_object]
 pub struct SequencerDurableObject {
     state: State,
+    env: Env,
 }
 
 impl DurableObject for SequencerDurableObject {
-    fn new(state: State, _env: Env) -> Self {
-        Self { state }
+    fn new(state: State, env: Env) -> Self {
+        Self { state, env }
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
@@ -133,14 +145,14 @@ impl SequencerDurableObject {
         match path.as_str() {
             "/enqueue" => {
                 let body: EnqueueReq = req.json().await?;
-                self.enqueue(body)
+                self.enqueue(body).await
             }
             // Test-only: inject a synthetic commit to exercise the sequencer end
             // to end while the write path that would feed it for real is not yet
             // on the Worker. Reachable only via the front Worker's admin path.
             "/_test-inject" => {
                 let body: EnqueueReq = req.json().await?;
-                self.enqueue(body)
+                self.enqueue(body).await
             }
             _ => Response::error("unknown sequencer endpoint", 404),
         }
@@ -151,7 +163,7 @@ impl SequencerDurableObject {
     /// **Await-free.** The seq read, its bump, and the log append are one
     /// indivisible step; nothing suspends between them, so the global order is
     /// total and gap-free.
-    fn enqueue(&self, ev: EnqueueReq) -> Result<Response> {
+    async fn enqueue(&self, ev: EnqueueReq) -> Result<Response> {
         let sql = self.sql()?;
 
         // Allocate seq.
@@ -209,7 +221,7 @@ impl SequencerDurableObject {
             "INSERT INTO firehose_log (seq, repo, frame, created_at) VALUES (?, ?, ?, ?)",
             vec![
                 SqlStorageValue::from(seq),
-                SqlStorageValue::from(ev.repo),
+                SqlStorageValue::from(ev.repo.clone()),
                 SqlStorageValue::from(frame.clone()),
                 SqlStorageValue::from(now_iso()),
             ],
@@ -222,7 +234,56 @@ impl SequencerDurableObject {
             let _ = ws.send_with_bytes(&frame);
         }
 
+        // Hand the commit to the internal indexer.
+        //
+        // A queue rather than a second websocket: the appview is request-shaped
+        // like everything else here, and the sequencer's `seq` is already the
+        // replay cursor, so nothing needs a long-lived connection between our
+        // own components.
+        //
+        // Published after the frame is logged and fanned out, and a failure is
+        // logged rather than returned: the commit is durable and already on the
+        // wire by this point, so failing the caller would suggest the write did
+        // not happen. The cost is an index that lags, which is recoverable by
+        // replaying from `seq`; the cost of the alternative is a client retrying
+        // a write that already succeeded.
+        if let Err(e) = self.publish_to_indexer(seq, &ev).await {
+            console_error!("indexer publish failed at seq {seq}: {e}");
+        }
+
         Response::from_json(&serde_json::json!({ "ok": true, "seq": seq }))
+    }
+
+    /// Send one commit to the `firehose-events` queue.
+    ///
+    /// Absent binding is not an error: a deployment that runs no appview simply
+    /// has no queue, and the PDS must not start failing writes because of it.
+    async fn publish_to_indexer(&self, seq: i64, ev: &EnqueueReq) -> Result<()> {
+        let Ok(queue) = self.env.queue(FIREHOSE_QUEUE_BINDING) else {
+            return Ok(());
+        };
+        let msg = serde_json::json!({
+            "seq": seq,
+            "repo": ev.repo,
+            "rev": ev.rev,
+            "ops": ev.ops.iter().map(|o| serde_json::json!({
+                "action": o.action,
+                "path": o.path,
+                "cid": o.cid,
+                "record": o.record,
+            })).collect::<Vec<_>>(),
+        });
+        // Sent as a JSON string, deliberately.
+        //
+        // `Queue::send` serialises through serde_wasm_bindgen, which turns a
+        // serde_json::Value::Object into a JS `Map` rather than a plain object.
+        // The consumer then sees no fields at all -- `event.ops is not
+        // iterable`, with every message dead-lettered and nothing indexed.
+        // Encoding to a string here makes the wire format explicit and
+        // independent of how any binding chooses to map Rust types into JS.
+        let payload = serde_json::to_string(&msg)
+            .map_err(|e| Error::RustError(format!("encode indexer message: {e}")))?;
+        queue.send(payload).await
     }
 
     /// Accept a firehose WebSocket. Backfill from `cursor`, then stay connected

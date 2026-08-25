@@ -122,3 +122,11 @@ port = 8787
 
 [observability]
 enabled = true
+
+# --- Queues ----------------------------------------------------------------
+# The internal path to the appview. Optional: publish_to_indexer treats a
+# missing binding as "no appview deployed" rather than an error, so a PDS that
+# runs alone keeps working.
+[[queues.producers]]
+binding = "FIREHOSE"
+queue = "firehose-events"
