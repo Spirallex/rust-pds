@@ -498,11 +498,44 @@ fn query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
         if k == key {
-            Some(v.replace('+', " ").to_string())
+            Some(percent_decode(&v.replace('+', " ")))
         } else {
             None
         }
     })
+}
+
+/// Percent-decode a query value.
+///
+/// Without this a caller that encodes a DID — `did%3Aplc%3A…`, which is legal
+/// and what a URL builder produces by default — never resolves to an account,
+/// and every repo-scoped read 404s. The colon in a DID makes this the common
+/// case rather than an edge one.
+///
+/// Invalid escapes are left as written rather than dropped: a stray `%` in a
+/// handle should fail to match a record, not silently become a different
+/// string that might match another.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok());
+            if let Some(b) = hex {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    // Percent-encoding carries arbitrary bytes; anything that is not valid
+    // UTF-8 was not a string we could have matched anyway.
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Handles are created under this suffix, e.g. `pds.example.net`.
@@ -956,6 +989,38 @@ async fn create_account(env: &Env, zone_suffix: &str, body: &str) -> Result<Resp
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A DID contains colons, so an encoded one is the common case, not an
+    /// exotic one. Before this decoded, every such read 404'd.
+    #[test]
+    fn query_param_decodes_percent_escapes() {
+        let q = "did=did%3Aplc%3Aabc123&cid=bafy";
+        assert_eq!(query_param(q, "did").as_deref(), Some("did:plc:abc123"));
+        assert_eq!(query_param(q, "cid").as_deref(), Some("bafy"));
+    }
+
+    #[test]
+    fn query_param_still_handles_plus_and_plain_values() {
+        let q = "handle=alice.example.com&q=hello+world";
+        assert_eq!(
+            query_param(q, "handle").as_deref(),
+            Some("alice.example.com")
+        );
+        assert_eq!(query_param(q, "q").as_deref(), Some("hello world"));
+    }
+
+    /// A malformed escape is left alone rather than dropped: turning `%zz` into
+    /// something else could match a record the caller never asked for.
+    #[test]
+    fn query_param_leaves_invalid_escapes_intact() {
+        assert_eq!(query_param("a=100%zz", "a").as_deref(), Some("100%zz"));
+        assert_eq!(
+            query_param("a=trailing%", "a").as_deref(),
+            Some("trailing%")
+        );
+    }
+
     use super::resolve_handle_target;
 
     const ZONE: &str = "pds.spirallex.com";

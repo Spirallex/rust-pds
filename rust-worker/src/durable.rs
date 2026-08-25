@@ -503,6 +503,23 @@ impl PdsDurableObject {
                 let query = url.query().unwrap_or("").to_string();
                 let bearer = bearer(&req)?;
                 let store = self.store()?;
+
+                // One feed this PDS serves itself. Recognised here rather than
+                // forwarded, because the AppView has never heard of it.
+                if nsid == "app.bsky.feed.getFeed"
+                    && url
+                        .query_pairs()
+                        .any(|(k, v)| k == "feed" && v == h::ZH_TW_FEED_URI)
+                {
+                    return h::zh_tw_feed(
+                        &store,
+                        bearer.as_deref(),
+                        &self.jwt_secret()?,
+                        &self.key_passphrase()?,
+                        &query,
+                    )
+                    .await;
+                }
                 h::proxy_appview(
                     &store,
                     bearer.as_deref(),
