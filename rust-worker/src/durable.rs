@@ -262,7 +262,7 @@ impl PdsDurableObject {
                     Ok(batch) => {
                         // One commit, so one enqueue -- however many writes it
                         // carried. That is the whole point of the batch.
-                        if let Err(e) = self.enqueue_commit(&batch.body).await {
+                        if let Err(e) = self.enqueue_commit(&batch.body, &batch.records).await {
                             console_error!("firehose enqueue failed: {e}");
                         }
                         Response::from_json(&serde_json::json!({ "results": batch.results }))
@@ -284,7 +284,10 @@ impl PdsDurableObject {
                 {
                     Err(resp) => Ok(resp),
                     Ok(sequenced) => {
-                        if let Err(e) = self.enqueue_commit(&sequenced.body).await {
+                        if let Err(e) = self
+                            .enqueue_commit(&sequenced.body, &sequenced.records)
+                            .await
+                        {
                             console_error!("firehose enqueue failed: {e}");
                         }
                         Response::from_json(&serde_json::json!({
@@ -311,7 +314,10 @@ impl PdsDurableObject {
                     // Nothing to delete: success, but no commit and so no event.
                     Ok(None) => Response::from_json(&serde_json::json!({})),
                     Ok(Some(sequenced)) => {
-                        if let Err(e) = self.enqueue_commit(&sequenced.body).await {
+                        if let Err(e) = self
+                            .enqueue_commit(&sequenced.body, &sequenced.records)
+                            .await
+                        {
                             console_error!("firehose enqueue failed: {e}");
                         }
                         Response::from_json(&serde_json::json!({}))
@@ -423,7 +429,10 @@ impl PdsDurableObject {
                         // wrote it twice. The cost is a firehose gap, which is
                         // the same failure mode an in-process dropped broadcast
                         // already has upstream.
-                        if let Err(e) = self.enqueue_commit(&sequenced.body).await {
+                        if let Err(e) = self
+                            .enqueue_commit(&sequenced.body, &sequenced.records)
+                            .await
+                        {
                             console_error!("firehose enqueue failed: {e}");
                         }
                         Response::from_json(&serde_json::json!({
@@ -517,16 +526,25 @@ impl PdsDurableObject {
     /// frame: each account is its own Durable Object with its own local
     /// sequence, and a frame stamped with that local number would be wrong on a
     /// stream that merges every account (see `sequencer.rs`).
-    async fn enqueue_commit(&self, body: &stelyph_core::firehose::CommitBody) -> Result<()> {
+    async fn enqueue_commit(
+        &self,
+        body: &stelyph_core::firehose::CommitBody,
+        records: &[Option<serde_json::Value>],
+    ) -> Result<()> {
         let stub = crate::sequencer_stub(&self.env)?;
+        // Records ride alongside their op so the indexer never decodes the CAR.
+        // Zipped rather than indexed: a length mismatch drops the extra instead
+        // of pairing a record with the wrong op, which would mis-index silently.
         let ops: Vec<serde_json::Value> = body
             .ops
             .iter()
-            .map(|op| {
+            .zip(records.iter().chain(std::iter::repeat(&None)))
+            .map(|(op, record)| {
                 serde_json::json!({
                     "action": op.action,
                     "path": op.path,
                     "cid": op.cid.map(|c| c.to_string()),
+                    "record": record,
                 })
             })
             .collect();

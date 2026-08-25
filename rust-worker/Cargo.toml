@@ -21,7 +21,7 @@ crate-type = ["cdylib"]
 # isolate for its whole duration (see stelyph_core::task).
 stelyph-core = { path = "../rust-core", default-features = false, features = ["lean-auth"] }
 
-worker = { version = "0.8", features = ["http", "d1"] }
+worker = { version = "0.8", features = ["http", "d1", "queue"] }
 worker-macros = { version = "0.8", features = ["http"] }
 http = "1"
 js-sys = "0.3"

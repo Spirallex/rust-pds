@@ -904,6 +904,12 @@ pub struct Sequenced {
     pub uri: String,
     pub cid: String,
     pub body: stelyph_core::firehose::CommitBody,
+    /// The record as JSON, in the same order as `body.ops`, `None` for a delete.
+    ///
+    /// Carried so the internal indexer receives what was written rather than
+    /// having to decode the CAR to find out. The CAR is the wire format for the
+    /// network; an indexer on the other side of a queue wants the record.
+    pub records: Vec<Option<serde_json::Value>>,
 }
 
 /// `POST /xrpc/com.atproto.repo.createRecord` — a signed write into the caller's
@@ -1026,6 +1032,7 @@ pub async fn create_record(
         uri: format!("at://{did}/{collection}/{rkey}"),
         cid: record_cid.to_string(),
         body: commit,
+        records: vec![Some(input["record"].clone())],
     }))
 }
 
@@ -1406,6 +1413,7 @@ pub async fn put_record(
         uri: format!("at://{did}/{collection}/{rkey}"),
         cid: record_cid.to_string(),
         body: commit,
+        records: vec![Some(input["record"].clone())],
     }))
 }
 
@@ -1451,6 +1459,7 @@ pub async fn delete_record(
         uri: format!("at://{did}/{collection}/{rkey}"),
         cid: String::new(),
         body: commit,
+        records: vec![None],
     })))
 }
 
@@ -1466,6 +1475,8 @@ pub async fn delete_record(
 pub struct BatchSequenced {
     pub results: Vec<serde_json::Value>,
     pub body: stelyph_core::firehose::CommitBody,
+    /// See [`Sequenced::records`].
+    pub records: Vec<Option<serde_json::Value>>,
 }
 
 /// `POST /xrpc/com.atproto.repo.applyWrites` — several writes, one commit.
@@ -1530,6 +1541,7 @@ pub async fn apply_writes(
     // entries 1-4 already committed.
     let mut ops: Vec<WriteOp> = Vec::with_capacity(writes.len());
     let mut uris: Vec<String> = Vec::with_capacity(writes.len());
+    let mut records: Vec<Option<serde_json::Value>> = Vec::with_capacity(writes.len());
     for w in writes {
         let kind = w["$type"].as_str().unwrap_or_default();
         let Some(collection) = w["collection"].as_str() else {
@@ -1564,6 +1576,7 @@ pub async fn apply_writes(
 
         if kind.ends_with("#delete") {
             ops.push(WriteOp::Delete { key });
+            records.push(None);
             continue;
         }
         let value = w["value"].clone();
@@ -1583,8 +1596,10 @@ pub async fn apply_writes(
         };
         if kind.ends_with("#update") {
             ops.push(WriteOp::Update { key, record: ipld });
+            records.push(Some(w["value"].clone()));
         } else if kind.ends_with("#create") {
             ops.push(WriteOp::Create { key, record: ipld });
+            records.push(Some(w["value"].clone()));
         } else {
             return Ok(Err(xrpc_err(
                 400,
@@ -1637,6 +1652,7 @@ pub async fn apply_writes(
 
     Ok(Ok(BatchSequenced {
         results,
+        records,
         body: commit,
     }))
 }
