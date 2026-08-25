@@ -1610,14 +1610,28 @@ pub async fn apply_writes(
         .map_err(|e| Error::RustError(format!("batch write failed: {e}")))?;
 
     // One commit means one thing to sequence, however many ops it carried.
+    // Each result carries a `$type` discriminator. The lexicon types `results`
+    // as a union, so a client validating the response rejects a bare
+    // `{uri, cid}` outright -- which reads to a user as "the post failed", even
+    // though the commit is already written and federated.
+    //
+    // A delete result has no uri or cid: there is no record left to point at.
     let results: Vec<serde_json::Value> = outcomes
         .iter()
         .zip(uris.iter())
-        .map(|(o, uri)| {
-            serde_json::json!({
+        .map(|(o, uri)| match o.action {
+            "delete" => serde_json::json!({
+                "$type": "com.atproto.repo.applyWrites#deleteResult",
+            }),
+            action => serde_json::json!({
+                "$type": format!("com.atproto.repo.applyWrites#{action}Result"),
                 "uri": uri,
                 "cid": o.record_cid.map(|c| c.to_string()),
-            })
+                // Records are stored as sent; nothing here checks them against
+                // their lexicon, and saying "valid" would be a claim we cannot
+                // make. `unknown` is the value for exactly that case.
+                "validationStatus": "unknown",
+            }),
         })
         .collect();
 
