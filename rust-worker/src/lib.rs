@@ -43,31 +43,57 @@ async fn fetch(req: HttpRequest, env: Env, ctx: Context) -> Result<HttpResponse>
     // cross-origin XRPC call. Answer it here, before routing, or every call 404s
     // at the preflight and never reaches the real endpoint.
     if req.method() == http::Method::OPTIONS {
+        // Echo whatever headers the preflight asks about. A fixed list breaks
+        // the moment a client sends one that is not on it, and the browser then
+        // refuses the request before it is ever sent -- which surfaces as an
+        // opaque "Failed to fetch" rather than anything a server log would show.
+        let requested = req
+            .headers()
+            .get("access-control-request-headers")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let mut r = http::Response::new(worker::Body::empty());
         *r.status_mut() = http::StatusCode::NO_CONTENT;
-        add_cors(r.headers_mut());
+        add_cors(r.headers_mut(), requested.as_deref());
         return Ok(r);
     }
     let mut resp = dispatch(req, env, ctx).await?;
     // Stamp CORS on every real response so the browser accepts it.
-    add_cors(resp.headers_mut());
+    add_cors(resp.headers_mut(), None);
     Ok(resp)
 }
 
 /// Permissive CORS — atproto PDS endpoints are public reads and token-gated
 /// writes, so `*` is the standard posture (bsky.social answers the same).
-fn add_cors(h: &mut http::HeaderMap) {
-    use http::header::HeaderValue;
+///
+/// `requested` is the preflight's `Access-Control-Request-Headers`, echoed back
+/// when present. Reflecting is safe here precisely because the origin is `*`
+/// and credentials are never allowed: the browser sends no cookies, so allowing
+/// a header grants a caller nothing it could not already send with curl. What
+/// it buys is not breaking every time the client adds a header -- `x-bsky-topics`
+/// is what broke feeds, and a fixed list would have broken again on the next one.
+fn add_cors(h: &mut http::HeaderMap, requested: Option<&str>) {
+    use http::header::{HeaderName, HeaderValue};
+
+    /// Sent when a preflight names no headers, so a client that asks for
+    /// nothing still gets the ones every atproto call needs.
+    const BASE_HEADERS: &str = "content-type,authorization,atproto-accept-labelers,atproto-proxy";
+
     h.insert("access-control-allow-origin", HeaderValue::from_static("*"));
     h.insert(
         "access-control-allow-methods",
         HeaderValue::from_static("GET,POST,OPTIONS"),
     );
+    let allow = match requested {
+        // A header name is a restricted token, but the value arrives from the
+        // network, so it is validated rather than trusted: an unparsable one
+        // falls back instead of poisoning the response.
+        Some(v) => HeaderValue::from_str(v).unwrap_or(HeaderValue::from_static(BASE_HEADERS)),
+        None => HeaderValue::from_static(BASE_HEADERS),
+    };
     h.insert(
-        "access-control-allow-headers",
-        HeaderValue::from_static(
-            "content-type,authorization,atproto-accept-labelers,atproto-proxy",
-        ),
+        HeaderName::from_static("access-control-allow-headers"),
+        allow,
     );
     h.insert("access-control-max-age", HeaderValue::from_static("86400"));
 }

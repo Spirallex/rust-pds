@@ -551,14 +551,20 @@ pub async fn get_session(
     }))
 }
 
-/// Proxy an `app.bsky.*` / `chat.bsky.*` request to the Bluesky AppView.
+/// Proxy an `app.bsky.*` or `chat.bsky.*` request to the service that serves it.
 ///
 /// These are AppView methods, not PDS methods — the PDS's job is to forward them
 /// with an inter-service auth token so the AppView knows, and trusts, which
 /// account is asking. The token is a short-lived ES256K JWT signed by the
-/// account's own signing key (iss = account DID, aud = AppView DID, lxm = the
-/// method), which the AppView verifies against the account's DID document. This
-/// is what lets a self-hosted PDS use the shared Bluesky AppView.
+/// account's own signing key (iss = account DID, aud = the target's DID, lxm =
+/// the method), which the target verifies against the account's DID document.
+/// This is what lets a self-hosted PDS use the shared Bluesky services.
+///
+/// **`chat.bsky.*` does not live on the AppView.** Direct messages are served by
+/// a separate service with its own DID, so sending them to the AppView returns
+/// `501 MethodNotImplemented` for every call — which is what made DMs fail.
+/// The audience matters as much as the URL: a token minted for the AppView's DID
+/// would be rejected by the chat service even if it reached the right host.
 pub async fn proxy_appview(
     store: &DoStore,
     bearer: Option<&str>,
@@ -575,6 +581,15 @@ pub async fn proxy_appview(
 
     const APPVIEW_DID: &str = "did:web:api.bsky.app";
     const APPVIEW_URL: &str = "https://api.bsky.app";
+    const CHAT_DID: &str = "did:web:api.bsky.chat";
+    const CHAT_URL: &str = "https://api.bsky.chat";
+
+    // Chat is its own service; everything else is the AppView.
+    let (target_did, target_url) = if nsid.starts_with("chat.bsky.") {
+        (CHAT_DID, CHAT_URL)
+    } else {
+        (APPVIEW_DID, APPVIEW_URL)
+    };
 
     // Resolve the caller from the access token, and load their signing key.
     let Some(did) = bearer
@@ -590,13 +605,13 @@ pub async fn proxy_appview(
         .map_err(|e| Error::RustError(format!("import key: {e}")))?;
 
     let now = worker::Date::now().as_millis() / 1000;
-    let token = mint_service_auth_jwt_at(&key, &did, APPVIEW_DID, Some(nsid), now + 60, now)
+    let token = mint_service_auth_jwt_at(&key, &did, target_did, Some(nsid), now + 60, now)
         .map_err(|e| Error::RustError(format!("mint service auth: {e}")))?;
 
     let url = if query.is_empty() {
-        format!("{APPVIEW_URL}/xrpc/{nsid}")
+        format!("{target_url}/xrpc/{nsid}")
     } else {
-        format!("{APPVIEW_URL}/xrpc/{nsid}?{query}")
+        format!("{target_url}/xrpc/{nsid}?{query}")
     };
 
     // Fetch the AppView with the minted token and relay the body back.
