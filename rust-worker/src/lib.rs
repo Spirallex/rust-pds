@@ -184,6 +184,16 @@ async fn dispatch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpRespo
         }
     }
 
+    // `/_stelyph/*` on an account object is internal: provisioning, wiping,
+    // health. The Worker reaches those paths by building its own request to the
+    // stub (`call_pds_do`), never through the forwarder below -- which passes
+    // the client's path through unchanged, so without this an unauthenticated
+    // `POST alice.<zone>/_stelyph/delete-account` reached alice's object and
+    // wiped it. The admin routes above are matched first and are unaffected.
+    if path.starts_with("/_stelyph/") {
+        return json_error(404, "NotFound", "Not found.")?.try_into();
+    }
+
     // --- firehose: one PDS-wide subscribeRepos, served by the sequencer ----
     // Every account's events merge into a single ordered stream. A relay
     // connects here (a WebSocket upgrade), and the request goes to the one
